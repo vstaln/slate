@@ -4683,6 +4683,36 @@ impl Render for CanvasView {
                     }),
                 )
                 .child({
+                    // A sibling stacked above a browser widget would be
+                    // covered by the native webview child — X11 children
+                    // always paint above the parent's pixels. Hide the child
+                    // while a higher-z widget overlaps its page area (frame
+                    // header + 30px nav row ≈ 66px above the page); the
+                    // widget's own chrome stays live.
+                    let clip = if widget.kind.as_deref() == Some("browser") {
+                        let page = canvas::Rect::from_min_max(
+                            Pos2::new(rect.min.x, rect.min.y + 66.0 * zoom),
+                            rect.max,
+                        );
+                        let occluded = self.canvas.widgets.values().any(|o| {
+                            o.id != widget.id
+                                && (o.maximized || o.z > widget.z)
+                                && {
+                                    let r = widget_screen_rect(o, &view, viewport_size);
+                                    r.min.x < page.max.x
+                                        && r.max.x > page.min.x
+                                        && r.min.y < page.max.y
+                                        && r.max.y > page.min.y
+                                }
+                        });
+                        if occluded {
+                            Bounds::default()
+                        } else {
+                            browser_clip
+                        }
+                    } else {
+                        browser_clip
+                    };
                     let body = widget_body(
                         &widget,
                         &self.snapshots,
@@ -4690,7 +4720,7 @@ impl Render for CanvasView {
                         self.prefs.terminals_flipped,
                         self.browser_editing.as_deref(),
                         &self.browser_address,
-                        browser_clip,
+                        clip,
                         cx,
                     );
                     // Non-terminal panes scroll their content natively —
