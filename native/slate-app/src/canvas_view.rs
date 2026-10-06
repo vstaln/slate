@@ -205,6 +205,9 @@ pub struct CanvasView {
     name_copied_at: Option<(String, Instant)>,
     /// The `/` command bar's text buffer while it is open.
     command_bar: Option<String>,
+    /// The shell's suggestion-highlight index — ↑/↓ in command mode and
+    /// the listbox's `aria-selected` row. Resets when the query changes.
+    command_suggestion: usize,
     /// The bar's mode select — `command` runs widget invocations, `message`
     /// writes the line into the picked terminal (the shell's command-mode
     /// dropdown and its `text + "\r"` write).
@@ -275,14 +278,25 @@ fn widget_alias(name: &str) -> Option<&'static str> {
 /// parseWidgetInvocation with prefix `any`: first word is the alias (an
 /// optional `/`, `.` or `@` prefix is stripped), the rest of the line is
 /// the widget's initial command. Returns `(kind, initialCommand)`.
-fn parse_widget_invocation(input: &str) -> Option<(&'static str, String)> {
+fn parse_widget_invocation(input: &str, prefix: &str) -> Option<(&'static str, String)> {
     let value = input.trim();
     if value.is_empty() {
         return None;
     }
     let first = value.split_whitespace().next()?;
-    let bare = match first.chars().next() {
-        Some('/') | Some('.') | Some('@') => &first[1..],
+    let sigil = first
+        .chars()
+        .next()
+        .filter(|c| matches!(c, '/' | '.' | '@'));
+    // `prefix !== 'any'` requires the invocation to open with that exact
+    // sigil — `/` typed while commandPrefix is `.` is just a message.
+    if prefix != "any"
+        && sigil.map(|c| c.to_string()).as_deref() != Some(prefix)
+    {
+        return None;
+    }
+    let bare = match sigil {
+        Some(_) => &first[1..],
         _ => first,
     };
     let kind = widget_alias(&bare.to_lowercase())?;
@@ -422,6 +436,12 @@ impl CanvasView {
             .unwrap_or_default();
 
         let agent_picks = slate_app::agent_picks::AgentPicks::load();
+        let settings = slate_app::settings::Settings::load();
+        // `targetTerminalId` — the command bar's remembered target.
+        let command_target = settings
+            .extra("targetTerminalId")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         let mut spawned = 0usize;
         let mut relaunch: Vec<PendingCommand> = Vec::new();
         for widget in canvas.widgets.values() {
@@ -487,8 +507,9 @@ impl CanvasView {
             agent_menu: None,
             name_copied_at: None,
             command_bar: None,
+            command_suggestion: 0,
             command_message: false,
-            command_target: None,
+            command_target,
             pending_commands: Vec::new(),
             journal_mtime: None,
             focus_sent: None,
@@ -1220,6 +1241,10 @@ impl CanvasView {
         }
         if let Some(id) = action.strip_prefix("target:") {
             self.command_target = Some(id.to_owned());
+            // The shell's `updateSettings({ targetTerminalId })` — the pick
+            // survives restarts through the unmanaged-key passthrough.
+            self.settings.set_extra("targetTerminalId", json!(id));
+            self.settings.save();
             cx.notify();
             return;
         }
@@ -1232,6 +1257,9 @@ impl CanvasView {
         }
         if let Some(mode) = action.strip_prefix("mode:") {
             self.command_message = mode == "message";
+            // Mode change resets the suggestion highlight — the shell's
+            // `setSuggestionIndex(0)` effect on `[suggestionQuery, mode, …]`.
+            self.command_suggestion = 0;
             if self.command_bar.is_none() {
                 self.command_bar = Some(String::new());
             }
@@ -2024,6 +2052,67 @@ impl CanvasView {
 
     fn view(&self) -> canvas::View {
         canvas::View::new(&self.canvas.camera, Pos2::ZERO)
+    }
+
+    /// The command bar's `activeTerminalId`: the configured target while
+    /// that terminal still lives, else the topmost one — the shell's
+    /// `terminals[0]?.id` fallback on its z-descending list.
+    fn command_target_terminal(&self) -> Option<String> {
+        if let Some(target) = self
+            .command_target
+            .as_deref()
+            .filter(|id| self.snapshots.iter().any(|s| &s.id == *id))
+        {
+            return Some(target.to_owned());
+        }
+        self.canvas
+            .widgets
+            .values()
+            .filter(|w| is_terminal_kind(w.kind.as_deref()))
+            .filter(|w| self.snapshots.iter().any(|s| s.id == w.id))
+            .max_by(|a, b| a.z.total_cmp(&b.z))
+            .map(|w| w.id.clone())
+    }
+
+    /// The suggestion listbox's contents — the shell gated it to command
+    /// mode (`mode !== 'command'` returned `[]`).
+    fn command_suggestions(&self) -> Vec<(String, String, String)> {
+        if self.command_message {
+            return Vec::new();
+        }
+        toolbar_suggestions(
+            self.command_bar.as_deref().unwrap_or_default(),
+            self.settings.command_prefix(),
+        )
+    }
+
+    /// `chooseSuggestion` — fill the input with `prefix + kind + " "` and
+    /// keep it open for the rest of the line.
+    fn adopt_suggestion(&mut self) {
+        let suggestions = self.command_suggestions();
+        let Some((kind, _, _)) = suggestions
+            .get(self.command_suggestion.min(suggestions.len().saturating_sub(1)))
+        else {
+            return;
+        };
+        let kind = kind.clone();
+        let prefix = self
+            .command_bar
+            .as_deref()
+            .and_then(|b| b.trim_start().chars().next())
+            .filter(|c| matches!(c, '/' | '.' | '@'))
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| {
+                // `typedPrefix || (commandPrefix === 'any' ? '/' : p)`.
+                let prefix = self.settings.command_prefix();
+                if prefix == "any" {
+                    "/".to_owned()
+                } else {
+                    prefix.to_owned()
+                }
+            });
+        self.command_bar = Some(format!("{prefix}{kind} "));
+        self.command_suggestion = 0;
     }
 
     /// Transient toast — the shell's `notice` state: cap hits, control-route
@@ -4210,7 +4299,7 @@ impl Render for CanvasView {
                 } else {
                     toolbar_suggestions(&buffer, self.settings.command_prefix())
                 },
-                suggestion_sel: 0,
+                suggestion_sel: self.command_suggestion,
                 enabled: true,
             };
             root = root.child(
@@ -4774,11 +4863,16 @@ impl CanvasView {
                     self.command_bar = None;
                 }
                 "tab" => {
-                    // The mode select: Command runs an invocation, Message
-                    // writes the line into a picked terminal.
-                    self.command_message = !self.command_message;
-                    if self.command_message && self.command_target.is_none() {
-                        self.command_target = self.snapshots.first().map(|snap| snap.id.clone());
+                    // Tab adopts the highlighted suggestion while the
+                    // listbox is up (the input's `chooseSuggestion`); only
+                    // with nothing suggested does it toggle the mode.
+                    if !self.command_suggestions().is_empty() {
+                        self.adopt_suggestion();
+                    } else {
+                        self.command_message = !self.command_message;
+                        if self.command_message && self.command_target.is_none() {
+                            self.command_target = self.command_target_terminal();
+                        }
                     }
                 }
                 "up" | "down" if self.command_message => {
@@ -4798,21 +4892,70 @@ impl CanvasView {
                         self.command_target = Some(ids[next].clone());
                     }
                 }
+                "up" | "down" => {
+                    // The listbox's suggestionIndex — same modulo walk.
+                    let len = self.command_suggestions().len();
+                    if len > 0 {
+                        let at = self.command_suggestion.min(len - 1);
+                        self.command_suggestion = if keystroke.key.as_str() == "up" {
+                            (at + len - 1) % len
+                        } else {
+                            (at + 1) % len
+                        };
+                    }
+                }
                 "enter" => {
+                    // A highlighted suggestion whose name isn't yet the
+                    // typed token is adopted, not run — `submitCommand`'s
+                    // `typedName !== picked` branch.
+                    let typed = self
+                        .command_bar
+                        .as_deref()
+                        .and_then(|b| {
+                            b.trim_start()
+                                .split_whitespace()
+                                .next()
+                                .map(|t| t.trim_start_matches(['/', '.', '@']).to_lowercase())
+                        })
+                        .unwrap_or_default();
+                    let suggestions = self.command_suggestions();
+                    let picked = suggestions
+                        .get(self.command_suggestion.min(suggestions.len().saturating_sub(1)))
+                        .map(|(kind, _, _)| kind.as_str());
+                    if picked.is_some_and(|kind| kind != typed) {
+                        self.adopt_suggestion();
+                        cx.notify();
+                        cx.stop_propagation();
+                        return;
+                    }
                     let buffer = self.command_bar.take().unwrap_or_default();
+                    // `if (!value) return` — an empty submit kept the input
+                    // and its text; reopen with the buffer untouched.
+                    if buffer.trim().is_empty() {
+                        self.command_bar = Some(buffer);
+                        cx.notify();
+                        cx.stop_propagation();
+                        return;
+                    }
+                    let target = self.command_target_terminal();
                     if self.command_message {
-                        // `text + "\r"` into the picked terminal — the
-                        // message mode's whole job.
-                        if let Some(target) = self.command_target.as_deref() {
-                            let line = format!("{buffer}\r");
-                            let _ = self.manager.write_text(target, &line, false);
+                        // Message mode writes the text verbatim — no
+                        // trailing `\r` (`mode === 'message' ? command : …`).
+                        if let Some(target) = target.as_deref() {
+                            let _ = self.manager.write_text(target, &buffer, false);
                         }
                         self.command_message = false;
-                    } else if let Some((kind, initial)) = parse_widget_invocation(&buffer) {
+                    } else if let Some((kind, initial)) =
+                        parse_widget_invocation(&buffer, self.settings.command_prefix())
+                    {
                         self.create_widget_from_command(kind, &initial, viewport, cx);
+                    } else if let Some(target) = target.as_deref() {
+                        // A non-invocation line in command mode is terminal
+                        // input — the original's `${command}\r` write.
+                        let _ = self.manager.write_text(target, &buffer, true);
                     } else {
-                        // A miss keeps the bar open so a typo can be fixed —
-                        // the shell's disabled submit did the same.
+                        // Nothing to receive it — a miss keeps the bar open
+                        // so a typo can be fixed, like the disabled submit.
                         self.command_bar = Some(buffer);
                     }
                 }
@@ -4820,6 +4963,9 @@ impl CanvasView {
                     if let Some(buffer) = self.command_bar.as_mut() {
                         buffer.pop();
                     }
+                    // A new query resets the highlight — the shell's
+                    // `setSuggestionIndex(0)` on suggestionQuery change.
+                    self.command_suggestion = 0;
                 }
                 _ => {
                     if !mods.control && !mods.alt && !mods.platform {
@@ -4838,6 +4984,7 @@ impl CanvasView {
                         if let (Some(text), Some(buffer)) = (text, self.command_bar.as_mut()) {
                             buffer.push_str(&text);
                         }
+                        self.command_suggestion = 0;
                     }
                 }
             }
@@ -5233,7 +5380,8 @@ impl CanvasView {
                     self.commit_strokes();
                 }
             }
-            "n" | "N" if !mods.control && !mods.alt && !mods.platform => {
+            "t" | "T" | "n" | "N" if !mods.control && !mods.alt && !mods.platform => {
+                // The shell bound both letters to `orcspace:new-terminal`.
                 self.spawn_terminal(viewport, cx);
             }
             "+" | "=" => {
