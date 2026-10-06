@@ -8,6 +8,7 @@ pub mod actors;
 pub mod agent_picks;
 pub mod arrange;
 pub mod attachments;
+pub mod browser;
 pub mod canvas;
 pub mod canvas_store;
 pub mod cli;

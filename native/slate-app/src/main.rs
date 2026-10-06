@@ -4,6 +4,7 @@
 pub mod canvas_view;
 pub mod cli_run;
 pub mod engine;
+pub mod webview;
 pub mod views_browser;
 pub mod views_calendar;
 pub mod views_files;
@@ -27,28 +28,6 @@ use gpui::AppContext as _;
 use gpui::Focusable as _;
 use slate_app::ipc::persist_control_token;
 
-/// Browser-tab shims. They live on the bin crate because `views_browser`
-/// does; the wry-backed element is gone with the gpui migration.
-#[allow(dead_code)]
-pub fn next_webview_id() -> usize {
-    static NEXT_WV_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
-    NEXT_WV_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-}
-
-#[allow(dead_code)]
-pub fn drain_closed_webviews() -> Vec<usize> {
-    Vec::new()
-}
-
-/// The Browser tab's element: a placeholder div. The vendored wry element was
-/// dropped with the rgpui→gpui migration (it pinned gtk 0.18 and was already
-/// off by default); the tab renders this until a new embed lands.
-#[allow(dead_code)]
-pub fn webview_element(id: usize, url: String) -> gpui::Div {
-    use gpui::ParentElement as _;
-    let _ = (id, url);
-    gpui::div().child("Browser - no embedded webview yet".to_string())
-}
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufWriter, Write};

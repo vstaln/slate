@@ -297,7 +297,7 @@ pub struct CanvasView {
     workspace_dir: Option<String>,
     snapshots: Vec<TerminalSnapshot>,
     /// Widget that owns the keyboard; `None` means the canvas itself does.
-    active: Option<String>,
+    pub(crate) active: Option<String>,
     /// Widget whose *frame* owns the keyboard — the shell's DOM focus on
     /// the frame element after a header or handle press. Arrows nudge it
     /// 1px (⇧16), Alt+arrows resize, Delete closes, Escape hands focus
@@ -360,6 +360,11 @@ pub struct CanvasView {
     /// double-click-on-title input. Keystrokes route here while it is set.
     renaming: Option<String>,
     rename_buffer: String,
+    /// The browser omnibox's editing state — the widget id whose address
+    /// field owns the keyboard, plus its edit buffer. Same shape as
+    /// `renaming`/`rename_buffer`; the pane sets it from its own click.
+    pub(crate) browser_editing: Option<String>,
+    pub(crate) browser_address: String,
     /// Terminal id whose agent-launch menu is open — WidgetFrame's pencil
     /// button opened a small picker next to the header.
     agent_menu: Option<String>,
@@ -834,6 +839,8 @@ impl CanvasView {
             pending_stroke: Vec::new(),
             renaming: None,
             rename_buffer: String::new(),
+            browser_editing: None,
+            browser_address: String::new(),
             agent_menu: None,
             name_copied_at: None,
             command_bar: None,
@@ -1088,6 +1095,49 @@ impl CanvasView {
                             .collect();
                         for id in stale {
                             view.close_widget(&id, cx);
+                        }
+                        // The GTK/X11 webview threads report back through
+                        // this mailbox — page-initiated navigations journal
+                        // the same `set` the omnibox writes, `window.open`
+                        // spawns a fresh browser widget (browser:onOpenTab).
+                        for event in crate::webview::drain_events() {
+                            match event {
+                                crate::webview::WebViewEvent::Navigated { widget, url } => {
+                                    view.widget_command(
+                                        &widget,
+                                        json!({ "op": "set", "state": { "url": url } }),
+                                        cx,
+                                    );
+                                }
+                                crate::webview::WebViewEvent::OpenTab { url, .. } => {
+                                    let id = view.fresh_id("browser");
+                                    let zoom = view.canvas.camera.zoom;
+                                    let center = Pos2::new(
+                                        ((view.viewport.x as f64 / 2.0 - view.canvas.camera.x)
+                                            / zoom) as f32,
+                                        ((view.viewport.y as f64 / 2.0 - view.canvas.camera.y)
+                                            / zoom) as f32,
+                                    );
+                                    view.create_widget_at(&id, "browser", "Browser", center);
+                                    view.widget_command(
+                                        &id,
+                                        json!({ "op": "browser_navigate", "url": url }),
+                                        cx,
+                                    );
+                                }
+                            }
+                        }
+                        // Journal-side removals never run close_widget —
+                        // drop webviews whose widgets vanished, and clear
+                        // an omnibox edit whose widget is gone.
+                        crate::webview::gc(
+                            &view.canvas.widgets.keys().cloned().collect(),
+                        );
+                        if let Some(editing) = &view.browser_editing {
+                            if !view.canvas.widgets.contains_key(editing) {
+                                view.browser_editing = None;
+                                view.browser_address.clear();
+                            }
                         }
                         // Renames land on the widget title and the journal —
                         // the names map is in-memory, so the title is the
@@ -2577,6 +2627,13 @@ impl CanvasView {
         self.term_cells.remove(id);
         self.startup_watch.remove(id);
         self.startup_notice.remove(id);
+        // Browser widgets own a native webview — it dies with the widget.
+        // A no-op for every other kind (no key registered).
+        crate::webview::remove_widget(id);
+        if self.browser_editing.as_deref() == Some(id) {
+            self.browser_editing = None;
+            self.browser_address.clear();
+        }
         // `vn` — widget dispose dropped the localStorage agent keys too.
         if self.agent_picks.launched.contains_key(id) || self.agent_picks.select.contains_key(id) {
             self.agent_picks.clear(id);
@@ -2910,6 +2967,57 @@ impl CanvasView {
             Some("file_copy_path") => {
                 if let Some(path) = action.get("path").and_then(Value::as_str) {
                     cx.write_to_clipboard(gpui::ClipboardItem::new_string(path.to_owned()));
+                }
+            }
+            // Browser pane ops — the omnibox submit and the chrome buttons.
+            // `state.url` is journaled so a restart reopens the same page;
+            // the wry element gets the matching message on its own thread.
+            Some("browser_navigate") => {
+                if let Some(raw) = action.get("url").and_then(Value::as_str) {
+                    match slate_app::browser::to_navigation_url(raw) {
+                        Some(url) => {
+                            self.widget_command(
+                                id,
+                                json!({ "op": "set", "state": { "url": url } }),
+                                cx,
+                            );
+                            crate::webview::navigate(id, &url);
+                            crate::webview::set_error(id, None);
+                        }
+                        None => {
+                            crate::webview::set_error(
+                                id,
+                                Some(format!("invalid address: {raw}")),
+                            );
+                        }
+                    }
+                }
+            }
+            Some("browser_nav") => match action.get("dir").and_then(Value::as_str) {
+                Some("back") => crate::webview::go_back(id),
+                Some("forward") => crate::webview::go_forward(id),
+                Some("reload") => crate::webview::reload(id),
+                Some("stop") => crate::webview::stop(id),
+                _ => {}
+            },
+            // The error banner's Home — back to the landing URL. The pane
+            // stops mounting the element there, so drop the native view.
+            Some("browser_home") => {
+                self.widget_command(
+                    id,
+                    json!({ "op": "set", "state": { "url": slate_app::browser::HOME_URL } }),
+                    cx,
+                );
+                crate::webview::remove_widget(id);
+            }
+            // Omnibox focus tracking — carried as a pane op so the buffer
+            // lives on CanvasView next to `rename_buffer`.
+            Some("browser_edit") => {
+                if action.get("editing").and_then(Value::as_bool).unwrap_or(false) {
+                    self.browser_editing = Some(id.to_owned());
+                } else if self.browser_editing.as_deref() == Some(id) {
+                    self.browser_editing = None;
+                    self.browser_address.clear();
                 }
             }
             _ => {}
@@ -3345,9 +3453,7 @@ fn widget_body(
         Some("browser") => div()
             .size_full()
             .text_size(font)
-            .text_color(rgb(theme::hex(theme::text::FAINT)))
-            .p_2()
-            .child("Browser — no embedded webview in this build".to_owned())
+            .child(crate::views_browser::browser_pane(widget, zoom, cx))
             .into_any_element(),
         Some("notes") => div()
             .size_full()
@@ -5862,6 +5968,49 @@ impl CanvasView {
                                 });
                         if let Some(text) = text {
                             self.rename_buffer.push_str(&text);
+                        }
+                    }
+                }
+            }
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
+
+        // The browser omnibox owns the keyboard while it is editing — the
+        // same shape as rename: Enter navigates, Escape reverts, Backspace
+        // edits, printable keys append.
+        if let Some(wid) = self.browser_editing.clone() {
+            match keystroke.key.as_str() {
+                "escape" => {
+                    self.browser_editing = None;
+                    self.browser_address.clear();
+                }
+                "enter" => {
+                    let url = std::mem::take(&mut self.browser_address);
+                    self.browser_editing = None;
+                    self.widget_command(
+                        &wid,
+                        json!({ "op": "browser_navigate", "url": url }),
+                        cx,
+                    );
+                }
+                "backspace" => {
+                    self.browser_address.pop();
+                }
+                _ => {
+                    if !mods.control && !mods.alt && !mods.platform {
+                        let text =
+                            keystroke
+                                .key_char
+                                .clone()
+                                .or_else(|| match keystroke.key.as_str() {
+                                    "space" => Some(" ".to_owned()),
+                                    k if k.chars().count() == 1 => Some(k.to_owned()),
+                                    _ => None,
+                                });
+                        if let Some(text) = text {
+                            self.browser_address.push_str(&text);
                         }
                     }
                 }
