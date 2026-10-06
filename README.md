@@ -1,3 +1,6 @@
+> [!IMPORTANT]
+> Remove this line to confirm you've reviewed this PR before submitting.
+
 # Slate 0.0.1
 
 One native Rust binary (`slate`). Five widgets: **terminal, planner, files, browser, orchestration**. No Electron, no Chromium, no Node in the binary. The single binary serves as both the desktop GUI window and the CLI command harness.
