@@ -258,6 +258,16 @@ pub struct CanvasView {
     /// The settings modal (`orcspace:open-settings` → the gear in the
     /// TitleBar/Toolbar) — `views_settings::settings_modal` renders over it.
     settings_open: bool,
+    /// The TitleBar git pill — the last background poll's `git status`
+    /// read (branch + dirty count), refreshed every `GIT_POLL_EVERY` like
+    /// the shell's 8s focused `refreshGit` timer.
+    git_chip: crate::views_titlebar::GitChip,
+    /// When the chip is next due — a click sets it to now so a press
+    /// repolls on the following tick.
+    git_next_poll: Instant,
+    /// One in-flight porcelain read at a time — a slow repo must never
+    /// stack subprocesses behind the tick.
+    git_polling: bool,
     counter: u64,
 }
 
@@ -672,6 +682,10 @@ impl CanvasView {
             settings,
             arrange_menu: false,
             settings_open: false,
+            // The shell's mount-time `refreshGit()` — due immediately.
+            git_chip: Default::default(),
+            git_next_poll: Instant::now(),
+            git_polling: false,
             counter: 0,
         };
         view.snapshots = view.manager.snapshots();
@@ -1022,6 +1036,44 @@ impl CanvasView {
                 if !alive {
                     break;
                 }
+                // The TitleBar git chip — the shell polled `git.status()`
+                // every 8s focused / 30s hidden; here it's one lazy read
+                // per `GIT_POLL_EVERY`, run on the background executor so
+                // a big repo's porcelain walk never stalls a frame.
+                let poll = this.update(cx, |view, _cx| {
+                    if view.git_polling || Instant::now() < view.git_next_poll {
+                        None
+                    } else {
+                        view.git_next_poll =
+                            Instant::now() + crate::views_titlebar::GIT_POLL_EVERY;
+                        match view.workspace_dir.clone() {
+                            Some(dir) => {
+                                view.git_polling = true;
+                                Some(dir)
+                            }
+                            None => None,
+                        }
+                    }
+                });
+                let Ok(poll) = poll else { break };
+                if let Some(dir) = poll {
+                    let chip = cx
+                        .background_executor()
+                        .spawn(async move {
+                            crate::views_titlebar::read_git_chip(std::path::Path::new(&dir))
+                        })
+                        .await;
+                    let alive = this
+                        .update(cx, |view, cx| {
+                            view.git_chip = chip;
+                            view.git_polling = false;
+                            cx.notify();
+                        })
+                        .is_ok();
+                    if !alive {
+                        break;
+                    }
+                }
             }
         })
         .detach();
@@ -1254,7 +1306,7 @@ impl CanvasView {
     pub(crate) fn titlebar_command(
         &mut self,
         action: &str,
-        _payload: Value,
+        payload: Value,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1265,6 +1317,48 @@ impl CanvasView {
                 let _ = self
                     .prefs
                     .save(&slate_app::ui_preferences::UiPreferences::path());
+            }
+            // `orcspace:canvas-undo`/`-redo` — the history pill's arrows
+            // pop the same rings Ctrl+Z/Ctrl+Shift+Z do.
+            "undo" => self.undo(false),
+            "redo" => self.undo(true),
+            // The WorkView tablist: Canvas is the only view this build
+            // renders, so the other tabs say so instead of switching.
+            "view" => {
+                if let Some(view) = payload.get("view").and_then(Value::as_str) {
+                    if view != "canvas" {
+                        self.notice(format!("{view} view isn't in this build — canvas only"));
+                    }
+                }
+            }
+            // `orcspace-flip-terminals` — localStorage in the shell, the
+            // persisted `terminalsFlipped` pref here; widget bodies draw
+            // the flip card while it's on.
+            "flip" => {
+                self.prefs.terminals_flipped = !self.prefs.terminals_flipped;
+                let _ = self
+                    .prefs
+                    .save(&slate_app::ui_preferences::UiPreferences::path());
+            }
+            // The git pill has no checkout panel in this build — a click
+            // repolls on the next tick and flashes the summary the
+            // original's tooltip carried.
+            "git" => {
+                self.git_next_poll = Instant::now();
+                let chip = &self.git_chip;
+                let text = if !chip.repo {
+                    "Git — not a repository".to_owned()
+                } else if chip.dirty == 0 {
+                    format!("{} — working tree clean", chip.branch)
+                } else {
+                    format!(
+                        "{} — {} changed file{}",
+                        chip.branch,
+                        chip.dirty,
+                        if chip.dirty == 1 { "" } else { "s" }
+                    )
+                };
+                self.notice(text);
             }
             "minimize" => window.minimize_window(),
             "maximize" => window.zoom_window(),
@@ -2870,12 +2964,68 @@ fn widget_body(
     widget: &Widget,
     snapshots: &[TerminalSnapshot],
     zoom: f32,
+    terminals_flipped: bool,
     cx: &mut Context<CanvasView>,
 ) -> AnyElement {
     let font = px(12.0 * zoom);
     match widget.kind.as_deref() {
         Some("terminal") | None => {
             let snapshot = snapshots.iter().find(|s| s.id == widget.id);
+            if terminals_flipped {
+                // `terminal-flip-card` — the shell swapped the xterm for a
+                // centred MessageSquareText + the last user prompt. The
+                // prompt feed doesn't exist natively, so the card carries
+                // the widget's title (the name the rename flow keeps
+                // fresh) and the PTY's cwd underneath.
+                let cwd = snapshot
+                    .map(|s| s.cwd.trim().to_owned())
+                    .filter(|cwd| !cwd.is_empty())
+                    .unwrap_or_else(|| "No user prompt yet".to_owned());
+                return div()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .overflow_hidden()
+                    .bg(rgb(theme::hex(theme::monochrome::BASE)))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .gap(px(6.0))
+                            .px_4()
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(10.0))
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .text_size(px(14.0 * zoom))
+                                            .text_color(rgb(theme::hex(theme::text::DIM)))
+                                            .child("◈"),
+                                    )
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .text_size(px((14.0 * zoom).clamp(13.0, 26.0)))
+                                            .font_weight(gpui::FontWeight::MEDIUM)
+                                            .text_color(rgb(theme::hex(theme::text::NORMAL)))
+                                            .child(widget.title.clone()),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.0 * zoom))
+                                    .text_color(rgb(theme::hex(theme::text::FAINT)))
+                                    .child(cwd),
+                            ),
+                    )
+                    .into_any_element();
+            }
             let mut body = div()
                 .size_full()
                 .p_1()
@@ -4141,7 +4291,13 @@ impl Render for CanvasView {
                     }),
                 )
                 .child({
-                    let body = widget_body(&widget, &self.snapshots, zoom, cx);
+                    let body = widget_body(
+                        &widget,
+                        &self.snapshots,
+                        zoom,
+                        self.prefs.terminals_flipped,
+                        cx,
+                    );
                     // Non-terminal panes scroll their content natively —
                     // the shell's `overflow-auto` lists. Terminals keep their
                     // own scrollback wheel path instead.
@@ -4994,9 +5150,10 @@ impl Render for CanvasView {
             );
         }
 
-        // The TitleBar — the shell's fixed 40px top strip (workspace name,
-        // arrange pick, window controls), floating over the canvas exactly
-        // like the Electron layer order: canvas → chrome.
+        // The TitleBar — the shell's fixed 40px top strip (history
+        // arrows, view tabs, flip, git chip, window controls), floating
+        // over the canvas exactly like the Electron layer order: canvas →
+        // chrome.
         if let Some(dir) = slate_app::workspace::current() {
             root = root.child(
                 div()
@@ -5006,8 +5163,14 @@ impl Render for CanvasView {
                     .right_0()
                     .h(px(canvas::TITLE_BAR_HEIGHT))
                     .child(crate::views_titlebar::titlebar_pane(
-                        std::path::Path::new(&dir),
-                        self.snapshots.len(),
+                        &crate::views_titlebar::TitlebarState {
+                            workspace_dir: std::path::Path::new(&dir),
+                            presence_count: self.snapshots.len(),
+                            can_undo: !self.undo_stack.is_empty(),
+                            can_redo: !self.redo_stack.is_empty(),
+                            terminals_flipped: self.prefs.terminals_flipped,
+                            git: &self.git_chip,
+                        },
                         cx,
                     )),
             );
