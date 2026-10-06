@@ -249,7 +249,7 @@ pub fn timer_pane(
         .p_2();
     col = col.child(
         div()
-            .font_family("monospace")
+            .font_family("Departure Mono")
             .text_size(px(28.0))
             .text_color(rgb(theme::hex(if over {
                 theme::status::DANGER

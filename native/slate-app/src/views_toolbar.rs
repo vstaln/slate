@@ -202,7 +202,7 @@ fn suggestion_row(
         })
         .child(
             div()
-                .font_family("monospace")
+                .font_family("Departure Mono")
                 .flex_none()
                 // text-accent — the dark theme's accent is plain white.
                 .text_color(rgb(theme::hex(theme::text::NORMAL)))
@@ -343,7 +343,7 @@ fn zoom_button(
         .items_center()
         .justify_center()
         .text_size(px(if mono { 10.0 } else { 12.0 }))
-        .when(mono, |el| el.font_family("monospace"))
+        .when(mono, |el| el.font_family("Departure Mono"))
         .text_color(rgb(theme::hex(theme::text::DIM)))
         .child(label);
     if enabled {

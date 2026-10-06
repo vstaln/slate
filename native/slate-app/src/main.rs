@@ -223,6 +223,18 @@ fn main() -> Result<()> {
     }
     let platform = gpui_platform::current_platform(headless);
     gpui::Application::with_platform(platform).run(|cx: &mut gpui::App| {
+        // Graysite brand faces, embedded so the build looks right on any
+        // machine without a fontconfig install: Plus Jakarta Sans is the UI
+        // family, Departure Mono the terminal/code face, Brygada 1918 the
+        // display face (splash wordmark).
+        if let Err(error) = cx.text_system().add_fonts(vec![
+            std::borrow::Cow::Borrowed(&include_bytes!("../assets/fonts/PlusJakartaSans-Variable.ttf")[..]),
+            std::borrow::Cow::Borrowed(&include_bytes!("../assets/fonts/Brygada1918-Regular.ttf")[..]),
+            std::borrow::Cow::Borrowed(&include_bytes!("../assets/fonts/Brygada1918-Italic.ttf")[..]),
+            std::borrow::Cow::Borrowed(&include_bytes!("../assets/fonts/DepartureMono-Regular.ttf")[..]),
+        ]) {
+            eprintln!("font registration failed: {error}");
+        }
         cx.open_window(
             gpui::WindowOptions {
                 titlebar: Some(gpui::TitlebarOptions {

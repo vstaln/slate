@@ -110,6 +110,10 @@ pub fn browser_pane(
     // would re-borrow CanvasView mid-render and panic.
     editing_id: Option<&str>,
     editing_buffer: &str,
+    // The chrome-free canvas region the native webview child is clipped to —
+    // X11 children don't respect GPUI masks, so the element intersects its
+    // bounds with this rect before moving the window.
+    clip: Bounds<Pixels>,
     cx: &mut Context<crate::canvas_view::CanvasView>,
 ) -> impl IntoElement {
     let wid = widget.id.clone();
@@ -410,6 +414,7 @@ pub fn browser_pane(
             } else {
                 crate::webview::WebView::for_url(&wid, url.clone())
                     .zoom(zoom)
+                    .clip(clip)
                     .size_full()
                     .into_any_element()
             }),

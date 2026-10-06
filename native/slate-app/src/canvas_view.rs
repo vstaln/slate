@@ -265,7 +265,7 @@ fn kbd_chip(label: &'static str) -> Div {
         .px_1()
         .py(px(0.5))
         .text_size(px(9.0))
-        .font_family("monospace")
+        .font_family("Departure Mono")
         .text_color(rgb(theme::hex(theme::text::DIM)))
         .border_1()
         .border_color(rgb(theme::hex(theme::hairline::FAINT)))
@@ -3223,21 +3223,21 @@ fn widget_screen_rect(widget: &Widget, view: &canvas::View, viewport: Vec2) -> c
 fn terminal_cells(w: f64, h: f64, zoom: f64) -> (u16, u16) {
     let body_w = (w * zoom - 2.0).max(40.0) as f32;
     let body_h = (h * zoom - theme::geometry::HEADER_HEIGHT as f64 * zoom).max(20.0) as f32;
-    let cols = (body_w / (8.4 * zoom as f32).max(2.0)).clamp(20.0, 500.0) as u16;
+    let cols = (body_w / (8.9 * zoom as f32).max(2.0)).clamp(20.0, 500.0) as u16;
     let rows = (body_h / (17.0 * zoom as f32).max(2.0)).clamp(4.0, 300.0) as u16;
     (cols, rows)
 }
 
 /// Pointer position → terminal cell. The rendered metrics, not the grid
-/// sizing's guesses: rows stack `h(font)` (12·zoom) apart and monospaced
-/// text advances ≈0.6em (7.2·zoom), so a click lands on the cell the glyph
-/// actually occupies. The 4px body padding (p_1) and 1px frame border come
-/// off the top-left first.
+/// sizing's guesses: rows stack `h(font)` (12·zoom) apart and Departure
+/// Mono advances 0.6364em (≈7.64·zoom at 12px), so a click lands on the
+/// cell the glyph actually occupies. The 4px body padding (p_1) and 1px
+/// frame border come off the top-left first.
 fn terminal_cell(rect: canvas::Rect, zoom: f32, pointer: Pos2) -> (u16, u16) {
     let zoom = zoom.max(0.1);
     let body_x = rect.min.x + 5.0;
     let body_y = rect.min.y + 1.0 + theme::geometry::HEADER_HEIGHT * zoom + 4.0;
-    let col = ((pointer.x - body_x) / (7.2 * zoom)).floor().max(0.0);
+    let col = ((pointer.x - body_x) / (7.64 * zoom)).floor().max(0.0);
     let row = ((pointer.y - body_y) / (12.0 * zoom)).floor().max(0.0);
     (col.min(999.0) as u16, row.min(999.0) as u16)
 }
@@ -3297,6 +3297,10 @@ fn widget_body(
     // mid-render would re-borrow the view and panic.
     browser_editing: Option<&str>,
     browser_address: &str,
+    // The canvas region free of floating chrome — the X11 webview child is
+    // not clipped by GPUI, so its bounds are intersected with this rect (and
+    // the paint-time content mask) before they're handed to wry.
+    browser_clip: Bounds<Pixels>,
     cx: &mut Context<CanvasView>,
 ) -> AnyElement {
     let font = px(12.0 * zoom);
@@ -3361,7 +3365,7 @@ fn widget_body(
             let mut body = div()
                 .size_full()
                 .p_1()
-                .font_family("monospace")
+                .font_family("Departure Mono")
                 .text_size(font)
                 .line_height(gpui::px(17.0 * zoom))
                 .text_color(rgb(theme::hex(theme::text::DIM)));
@@ -3408,11 +3412,11 @@ fn widget_body(
             // The drag-selection highlight — xterm's selectionBackground
             // rgba(120,160,255,0.35). Cells ride the body's p_1 padding, so
             // the overlay starts at the padding edge; the cell geometry is
-            // `terminal_cell`'s inverse (7.2·zoom cols, 12·zoom rows).
+            // `terminal_cell`'s inverse (7.64·zoom cols, 12·zoom rows).
             let mut container = div().size_full().relative().child(body);
             if let Some(snapshot) = snapshot {
                 if !snapshot.selection.is_empty() {
-                    let cell_w = px(7.2 * zoom);
+                    let cell_w = px(7.64 * zoom);
                     let cell_h = px(12.0 * zoom);
                     let mut overlay = div().absolute().left(px(4.0)).top(px(4.0));
                     for &(row, start, end) in &snapshot.selection {
@@ -3462,6 +3466,7 @@ fn widget_body(
                 zoom,
                 browser_editing,
                 browser_address,
+                browser_clip,
                 cx,
             ))
             .into_any_element(),
@@ -3583,6 +3588,9 @@ impl Render for CanvasView {
             .id("slate-canvas")
             .size_full()
             .relative()
+            // The UI face — graysite's Plus Jakarta Sans; descendants that
+            // want mono override with "Departure Mono".
+            .font_family("Plus Jakarta Sans")
             .overflow_hidden()
             .bg(rgb(theme::hex(theme::monochrome::BASE)))
             // draw and erase both take the shell's crosshair cursor.
@@ -4235,6 +4243,29 @@ impl Render for CanvasView {
             }
         }
 
+        // The X11 webview child can't be clipped by GPUI compositing, so
+        // browser panes get an explicit window-space clip: the viewport
+        // minus the floating title bar, left rail and status strip. While a
+        // full-window overlay (splash, settings) owns the screen the clip
+        // collapses and the element hides the child instead of bleeding
+        // over it.
+        let rail_w = if self.prefs.sidebar_open {
+            theme::geometry::SIDEBAR_EXPANDED
+        } else {
+            theme::geometry::RAIL_WIDTH
+        };
+        let browser_clip = if self.settings_open || splash_t.is_some() {
+            Bounds::default()
+        } else {
+            Bounds {
+                origin: point(px(rail_w), px(canvas::TITLE_BAR_HEIGHT)),
+                size: size(
+                    px((viewport_size.x - rail_w).max(0.0)),
+                    px((viewport_size.y - canvas::TITLE_BAR_HEIGHT - 24.0).max(0.0)),
+                ),
+            }
+        };
+
         // Widgets paint in z order so the last drawn is the topmost — and a
         // maximized widget is the shell's zIndex-200 overlay, so it always
         // sorts after everything not maximized.
@@ -4659,6 +4690,7 @@ impl Render for CanvasView {
                         self.prefs.terminals_flipped,
                         self.browser_editing.as_deref(),
                         &self.browser_address,
+                        browser_clip,
                         cx,
                     );
                     // Non-terminal panes scroll their content natively —
@@ -5647,7 +5679,7 @@ impl Render for CanvasView {
                             .child(
                                 div()
                                     .text_size(px(52.0))
-                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .font_family("Brygada 1918")
                                     .text_color(rgb(theme::hex(theme::text::NORMAL)))
                                     .child("Slate"),
                             ),

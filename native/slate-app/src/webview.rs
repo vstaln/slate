@@ -24,8 +24,12 @@
 //! Limitations versus the Electron `<webview>` this replaces:
 //!
 //! * The native child window is NOT clipped or z-ordered by GPUI: an
-//!   overlapping widget or a partially offscreen browser leaves the webview
-//!   painted on top. The bounds track pan/zoom/widget moves, nothing more.
+//!   overlapping widget still leaves the webview painted on top. What we
+//!   can and do fix is clipping: the element intersects its layout bounds
+//!   with the current `content_mask()` and a caller-supplied `clip` rect
+//!   (the canvas area under the floating title bar / beside the rail), so
+//!   a browser panned under the chrome no longer bleeds over it; fully
+//!   covered webviews are hidden via `set_visible`.
 //! * wry 0.57 exposes no load-failure or fullscreen hooks on Linux, so a
 //!   dead page reports `loading → finished` with no error text (the chrome's
 //!   error banner still covers URL validation and blocked navigations), and
@@ -520,6 +524,10 @@ mod x11_child_thread {
             id: usize,
             bounds: wry::Rect,
         },
+        SetVisible {
+            id: usize,
+            visible: bool,
+        },
         SetZoom {
             id: usize,
             zoom: f64,
@@ -601,6 +609,19 @@ mod x11_child_thread {
                                         if let Err(error) = webview.set_bounds(bounds) {
                                             log::error!(
                                                 "WebView #{}: set_bounds failed: {}",
+                                                id,
+                                                error
+                                            );
+                                        }
+                                    }
+                                });
+                            }
+                            ChildMessage::SetVisible { id, visible } => {
+                                WEBVIEWS.with(|webviews| {
+                                    if let Some(webview) = webviews.borrow().get(&id) {
+                                        if let Err(error) = webview.set_visible(visible) {
+                                            log::error!(
+                                                "WebView #{}: set_visible failed: {}",
                                                 id,
                                                 error
                                             );
@@ -794,6 +815,29 @@ mod x11_child_thread {
         std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
     static LAST_ZOOM: std::sync::LazyLock<Mutex<HashMap<usize, f64>>> =
         std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+    static LAST_VISIBLE: std::sync::LazyLock<Mutex<HashMap<usize, bool>>> =
+        std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    /// Show/hide the native child. Only meaningful once the webview exists —
+    /// a hidden-before-create webview gets its initial visibility from the
+    /// paint path that next creates it, so this is a no-op pre-create.
+    pub fn request_set_visible(id: usize, visible: bool) {
+        {
+            let created = CREATED.lock().unwrap_or_else(|poison| poison.into_inner());
+            if !created.contains(&id) {
+                return;
+            }
+        }
+        let mut last = LAST_VISIBLE
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if last.get(&id) == Some(&visible) {
+            return;
+        }
+        last.insert(id, visible);
+        drop(last);
+        send(ChildMessage::SetVisible { id, visible });
+    }
 
     pub fn request_set_bounds(id: usize, bounds: Bounds<Pixels>, scale_factor: f32) {
         let mut last = LAST_BOUNDS
@@ -850,6 +894,10 @@ mod x11_child_thread {
             .unwrap_or_else(|poison| poison.into_inner())
             .remove(&id);
         LAST_ZOOM
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(&id);
+        LAST_VISIBLE
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .remove(&id);
@@ -1088,6 +1136,11 @@ pub struct WebView {
     id: usize,
     content: WebViewContent,
     zoom: f32,
+    /// Window-space clip rect — the canvas content region the caller knows
+    /// floating chrome (title bar, rail, status strip) overlays. Intersected
+    /// with the paint-time `content_mask()` before the native child's bounds
+    /// are set, since X11 children are not clipped by GPUI compositing.
+    clip: Option<Bounds<Pixels>>,
     style: StyleRefinement,
 }
 
@@ -1107,6 +1160,7 @@ impl WebView {
             id: key_for(widget),
             content: WebViewContent::Url(url.into()),
             zoom: 1.0,
+            clip: None,
             style: Default::default(),
         }
     }
@@ -1116,6 +1170,15 @@ impl WebView {
     /// scaled it.
     pub fn zoom(mut self, zoom: f32) -> Self {
         self.zoom = zoom;
+        self
+    }
+
+    /// The window-space rect the native child is clipped to — the canvas
+    /// region not covered by floating chrome. Pass a degenerate rect while a
+    /// full-screen overlay (splash, settings) owns the window and the child
+    /// is hidden instead of bleeding over it.
+    pub fn clip(mut self, clip: Bounds<Pixels>) -> Self {
+        self.clip = Some(clip);
         self
     }
 }
@@ -1183,14 +1246,28 @@ impl Element for WebView {
                 gtk_thread::ensure_created(self.id, &self.content);
                 gtk_thread::maybe_sync_url(self.id, &self.content);
             } else {
+                // X11 children aren't composited: clip the layout bounds to
+                // the paint-time content mask (viewport, widget overflow)
+                // and the caller's chrome-free canvas region. A webview
+                // clipped to nothing hides rather than painting over the
+                // title bar, rail, splash or settings modal.
+                let mut clipped = bounds.intersect(&window.content_mask().bounds);
+                if let Some(clip) = self.clip {
+                    clipped = clipped.intersect(&clip);
+                }
+                if clipped.size.width <= px(1.0) || clipped.size.height <= px(1.0) {
+                    x11_child_thread::request_set_visible(self.id, false);
+                    return;
+                }
                 let scale_factor = window.scale_factor();
                 x11_child_thread::request_create(
                     self.id,
                     &self.content,
-                    to_wry_bounds(bounds, scale_factor),
+                    to_wry_bounds(clipped, scale_factor),
                     window,
                 );
-                x11_child_thread::request_set_bounds(self.id, bounds, scale_factor);
+                x11_child_thread::request_set_bounds(self.id, clipped, scale_factor);
+                x11_child_thread::request_set_visible(self.id, true);
                 x11_child_thread::request_zoom(self.id, f64::from(self.zoom));
                 x11_child_thread::maybe_sync_url(self.id, &self.content);
             }
