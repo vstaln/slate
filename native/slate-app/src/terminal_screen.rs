@@ -499,6 +499,7 @@ impl TerminalScreen {
                             && last.bg == bg
                             && last.bold == style.bold
                             && last.italic == style.italic
+                            && last.underline == style.underline
                         {
                             last.text.push_str(text);
                             continue;
@@ -510,6 +511,7 @@ impl TerminalScreen {
                         bg,
                         bold: style.bold || is_cursor,
                         italic: style.italic,
+                        underline: style.underline,
                         cursor: is_cursor,
                     });
                 }
@@ -1385,6 +1387,7 @@ pub struct StyledRun {
     pub bg: CellRgb,
     pub bold: bool,
     pub italic: bool,
+    pub underline: bool,
     /// True for the single run that is the cursor cell; its colours are
     /// already swapped, this flag only exists so a neighbour never merges
     /// into it.
@@ -1399,6 +1402,7 @@ struct CellStyle {
     bg: CellRgb,
     bold: bool,
     italic: bool,
+    underline: bool,
 }
 
 impl CellStyle {
@@ -1423,6 +1427,7 @@ impl CellStyle {
             bg,
             bold: cell.bold(),
             italic: cell.italic(),
+            underline: cell.underline(),
         }
     }
 }
