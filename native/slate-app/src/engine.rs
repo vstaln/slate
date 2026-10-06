@@ -3042,9 +3042,11 @@ async fn screenshot(
 }
 
 /// `GET /media/{name}` — the raw-bytes counterpart of http.rs `media_route`
-/// (which answers the JSON socket protocol). Same single-component name and
-/// the same image extension list, so a real HTTP client — an <img> in a
-/// widget, curl — gets the file itself with its Content-Type.
+/// (which answers the JSON socket protocol) and the port of the shell's
+/// `orc://media` handler. Same single-component name guard; the Content-Type
+/// is `mimeTypeForPath` over the full media table. Like the original's
+/// `ACTIVE_EXTS` downgrade, markup/script extensions are served as plain text
+/// with an attachment disposition so a fetched page can never execute.
 async fn serve_media(
     State(state): State<HttpState>,
     headers: HeaderMap,
@@ -3054,40 +3056,30 @@ async fn serve_media(
     let mut components = std::path::Path::new(&name).components();
     let single_name = matches!(components.next(), Some(std::path::Component::Normal(_)))
         && components.next().is_none();
-    let content_type = single_name
-        .then(|| {
-            match std::path::Path::new(&name)
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .unwrap_or("")
-                .to_ascii_lowercase()
-                .as_str()
-            {
-                "png" => Some("image/png"),
-                "jpg" | "jpeg" => Some("image/jpeg"),
-                "gif" => Some("image/gif"),
-                "webp" => Some("image/webp"),
-                "svg" => Some("image/svg+xml"),
-                "avif" => Some("image/avif"),
-                "bmp" => Some("image/bmp"),
-                "heic" => Some("image/heic"),
-                "tif" | "tiff" => Some("image/tiff"),
-                "ico" => Some("image/x-icon"),
-                _ => None,
-            }
-        })
-        .flatten();
-    let Some(content_type) = content_type else {
-        return Err(bad_request(
-            "media needs a single image file name".to_owned(),
-        ));
+    if !single_name {
+        return Err(bad_request("media needs a file name, not a path".to_owned()));
+    }
+    let extension = std::path::Path::new(&name)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let active = slate_app::attachments::is_active_extension(&extension);
+    let content_type = if active {
+        "text/plain; charset=utf-8"
+    } else {
+        slate_app::attachments::mime_type_for_extension(&extension)
     };
     let file = slate_app::ipc::user_data_dir().join("media").join(&name);
     let bytes = std::fs::read(&file).map_err(|_| bad_request(format!("no such media: {name}")))?;
-    Ok(axum::response::Response::builder()
+    let mut builder = axum::response::Response::builder()
         .header("content-type", content_type)
-        .body(axum::body::Body::from(bytes))
-        .unwrap())
+        .header("x-content-type-options", "nosniff")
+        .header("content-security-policy", "default-src 'none'; sandbox");
+    if active {
+        builder = builder.header("content-disposition", "attachment");
+    }
+    Ok(builder.body(axum::body::Body::from(bytes)).unwrap())
 }
 
 /// The windowed portion of a screenshot request: find the Slate window, crop
