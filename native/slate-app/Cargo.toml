@@ -55,6 +55,15 @@ default = []
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Linux only: the browser widget's embedded webview. `wry` builds the
+# WebKitGTK child view (`build_as_child` on X11) and `gtk` owns the event
+# loop it needs on a dedicated thread — the same pairing the vendored
+# element used at 2cf4566. Kept target-gated so other platforms neither
+# build it nor see it; the element falls back to empty bounds there.
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
+wry = "0.57"
+gtk = "0.18"
+
 # Windows only: listing a shell's children is what lets a terminal that has
 # stopped reading its input be interrupted without killing the shell along
 # with it. Already in the dependency graph via portable-pty; only the
