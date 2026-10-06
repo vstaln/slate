@@ -241,6 +241,13 @@ pub struct CanvasView {
     /// The mount-effect guard (`H.current`): each restored terminal
     /// relaunches its recorded agent once per app run.
     agent_relaunched: HashSet<String>,
+    /// Launch-failure watch per terminal — the shell's startupProbe: armed
+    /// when an agent command is typed, scanning output for the failure
+    /// signatures a dying agent leaves for STARTUP_WATCH_MS.
+    startup_watch: HashMap<String, StartupWatch>,
+    /// The shell's startupNotice state, per terminal — an error banner
+    /// pinned to the widget until dismissed or a new launch clears it.
+    startup_notice: HashMap<String, String>,
     /// `native-ui.json` — carries `orcspace-arrange-mode` and the
     /// `orcspace-arrange-free-layout` snapshot Free mode replays.
     prefs: slate_app::ui_preferences::UiPreferences,
@@ -259,6 +266,145 @@ struct PendingCommand {
     terminal_id: String,
     command: String,
     attempts: u8,
+    /// True for agent relaunches — once the line lands the terminal's
+    /// output is watched for a startup failure.
+    watch: bool,
+}
+
+/// The shell's STARTUP_WATCH_MS: a launch failure only counts inside this
+/// window — ordinary agent output can quote the same phrases.
+const STARTUP_WATCH: Duration = Duration::from_secs(30);
+/// The shell's STARTUP_TAIL_LIMIT — enough tail to hold a multi-line abort.
+const STARTUP_TAIL_LIMIT: usize = 4_000;
+
+struct StartupWatch {
+    command: String,
+    until: Instant,
+    /// Bytes of `TerminalSnapshot.output` already scanned. Scrollback trims
+    /// from the front, so a shrunk buffer rewinds the offset to zero.
+    scanned: usize,
+    tail: String,
+}
+
+/// `plainTerminalText` — escape sequences and stray controls out, runs of
+/// whitespace collapsed, so marker phrases survive ConPTY-style repaints.
+fn plain_terminal_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\u{1b}' => match chars.next() {
+                // OSC: terminated by BEL or ST.
+                Some(']') => {
+                    let mut escaped = false;
+                    for c in chars.by_ref() {
+                        if c == '\u{7}' || (escaped && c == '\\') {
+                            break;
+                        }
+                        escaped = c == '\u{1b}';
+                    }
+                }
+                // CSI: parameters and intermediates end at a final byte.
+                Some('[') => {
+                    for c in chars.by_ref() {
+                        if ('@'..='~').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                // Everything else is a two-byte ESC sequence.
+                Some(_) => {}
+                None => {}
+            },
+            '\u{0}'..='\u{8}' | '\u{b}' | '\u{c}' | '\u{e}'..='\u{1f}' | '\u{7f}' => {}
+            _ => out.push(c),
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// `executableName` — the first bare token of the launch command.
+fn executable_name(command: &str) -> String {
+    command
+        .trim_start()
+        .trim_start_matches(['"', '\''])
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches(['"', '\''])
+        .to_owned()
+}
+
+/// `startupFailureMessage` — a one-line explanation for the card, or None
+/// when the output says nothing about a failed launch. The console-title
+/// "shell is idle again" leg of the original probe is ConPTY-specific;
+/// Linux shells set no reliable OSC title, so only the marker scan ports.
+fn startup_failure_message(output: &str, command: &str) -> Option<String> {
+    let text = plain_terminal_text(output).to_lowercase();
+    let name = {
+        let name = executable_name(command);
+        if name.is_empty() {
+            "The command".to_owned()
+        } else {
+            name
+        }
+    };
+    const MEMORY_MARKERS: [&str; 7] = [
+        "memory full",
+        "memoryexhaustion",
+        "memory is exhausted",
+        "out of memory",
+        "not enough memory",
+        "insufficient memory",
+        "cannot allocate memory",
+    ];
+    // Rust's allocator prints the requested byte count — the original's two
+    // regexes, `memory allocation of \d+ bytes failed` and
+    // `failed to allocate \d+ bytes`.
+    let counted = |prefix: &str, suffix: &str| -> bool {
+        text.match_indices(prefix).any(|(at, _)| {
+            let rest = &text[at + prefix.len()..];
+            let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+            digits > 0 && rest[digits..].starts_with(suffix)
+        })
+    };
+    if MEMORY_MARKERS.iter().any(|marker| text.contains(marker))
+        || counted("memory allocation of ", " bytes failed")
+        || counted("failed to allocate ", " bytes")
+    {
+        return Some(format!(
+            "{name} could not start: the system ran out of memory. Close other sessions or free memory, then launch it again."
+        ));
+    }
+    const MISSING_MARKERS: [&str; 5] = [
+        "is not recognized as an internal or external command",
+        "is not recognized as the name of a cmdlet",
+        "не является внутренней или внешней командой",
+        "command not found",
+        "commandnotfoundexception",
+    ];
+    if MISSING_MARKERS.iter().any(|marker| text.contains(marker)) {
+        return Some(format!(
+            "{name} could not start: the command was not found on PATH."
+        ));
+    }
+    // Checked last: an out-of-memory abort also prints a crash banner, and
+    // "ran out of memory" is the more useful of the two.
+    const CRASH_MARKERS: [&str; 7] = [
+        "bun has crashed",
+        "panic(thread",
+        "illegal instruction at address",
+        "segmentation fault",
+        "access violation",
+        "fatal error in",
+        "core dumped",
+    ];
+    if CRASH_MARKERS.iter().any(|marker| text.contains(marker)) {
+        return Some(format!(
+            "{name} crashed on startup — its own runtime aborted, not Slate. Relaunch it; if it keeps crashing, update {name}."
+        ));
+    }
+    None
 }
 
 /// lib/commandInput.ts WIDGET_ALIASES: the word after a `/ . @` prefix (or
@@ -468,6 +614,7 @@ impl CanvasView {
                                 terminal_id: widget.id.clone(),
                                 command: (*command).to_owned(),
                                 attempts: 0,
+                                watch: true,
                             });
                         }
                     }
@@ -519,8 +666,10 @@ impl CanvasView {
             viewport: Vec2::new(0.0, 0.0),
             agent_picks,
             agent_relaunched: HashSet::new(),
+            startup_watch: HashMap::new(),
+            startup_notice: HashMap::new(),
             prefs: slate_app::ui_preferences::UiPreferences::load_or_default(),
-            settings: slate_app::settings::Settings::load(),
+            settings,
             arrange_menu: false,
             settings_open: false,
             counter: 0,
@@ -792,7 +941,14 @@ impl CanvasView {
                                 &pending.command,
                                 true,
                             ) {
-                                Ok(_) => {}
+                                Ok(_) => {
+                                    if pending.watch {
+                                        view.arm_startup_watch(
+                                            &pending.terminal_id,
+                                            &pending.command,
+                                        );
+                                    }
+                                }
                                 Err(error) => {
                                     if pending.attempts < 12
                                         && view.manager.snapshot(&pending.terminal_id).is_ok()
@@ -811,6 +967,7 @@ impl CanvasView {
                             }
                         }
                         view.pending_commands = deferred;
+                        view.poll_startup_watches();
                         // Status bar CPU%: two /proc/stat samples a tick
                         // apart — cheap enough to keep polling.
                         if let Some((idle, total)) = proc_stat_sample() {
@@ -931,7 +1088,70 @@ impl CanvasView {
                 terminal_id: id.to_owned(),
                 command: (*command).to_owned(),
                 attempts: 0,
+                watch: true,
             });
+        }
+    }
+
+    /// Arming the launch-failure watch — the shell's `createStartupProbe`
+    /// call in `launchAgent`. A new launch also clears a stale banner.
+    fn arm_startup_watch(&mut self, id: &str, command: &str) {
+        self.startup_notice.remove(id);
+        self.startup_watch.insert(
+            id.to_owned(),
+            StartupWatch {
+                command: command.to_owned(),
+                until: Instant::now() + STARTUP_WATCH,
+                scanned: 0,
+                tail: String::new(),
+            },
+        );
+    }
+
+    /// One pass over the armed watches, fed from the snapshots the tick
+    /// already refreshed — `watchStartupOutput` in the shell. A failure
+    /// verdict pins the banner; expiry or a dead PTY just drops the watch.
+    fn poll_startup_watches(&mut self) {
+        if self.startup_watch.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        self.startup_watch.retain(|_, watch| watch.until > now);
+        let ids: Vec<String> = self.startup_watch.keys().cloned().collect();
+        for id in ids {
+            let scanned = self
+                .startup_watch
+                .get(&id)
+                .map(|watch| watch.scanned)
+                .unwrap_or(0);
+            let Ok(snapshot) = self.manager.snapshot(&id) else {
+                self.startup_watch.remove(&id);
+                continue;
+            };
+            let output = snapshot.output;
+            let Some(watch) = self.startup_watch.get_mut(&id) else {
+                continue;
+            };
+            let mut start = if output.len() < scanned { 0 } else { scanned };
+            while start < output.len() && !output.is_char_boundary(start) {
+                start += 1;
+            }
+            watch.scanned = output.len();
+            watch.tail.push_str(&output[start..]);
+            // JS `slice(-4000)` counts UTF-16 units; bytes at a char
+            // boundary is close enough for a marker scan.
+            let over = watch.tail.len().saturating_sub(STARTUP_TAIL_LIMIT);
+            if over > 0 {
+                let mut cut = over;
+                while !watch.tail.is_char_boundary(cut) {
+                    cut += 1;
+                }
+                watch.tail.drain(..cut);
+            }
+            if let Some(message) = startup_failure_message(&watch.tail, &watch.command) {
+                self.startup_notice.insert(id.clone(), message);
+                self.startup_watch.remove(&id);
+            }
         }
     }
 
@@ -1992,6 +2212,7 @@ impl CanvasView {
                     terminal_id: id,
                     command: command.to_owned(),
                     attempts: 0,
+                    watch: false,
                 });
             }
             return;
@@ -2040,6 +2261,8 @@ impl CanvasView {
             self.pending_close = None;
         }
         self.term_cells.remove(id);
+        self.startup_watch.remove(id);
+        self.startup_notice.remove(id);
         // `vn` — widget dispose dropped the localStorage agent keys too.
         if self.agent_picks.launched.contains_key(id) || self.agent_picks.select.contains_key(id) {
             self.agent_picks.clear(id);
@@ -3952,6 +4175,49 @@ impl Render for CanvasView {
                 .child(header)
                 .child(body);
 
+            // The shell's startupNotice banner — pinned to the widget's top
+            // edge below the header, dismissable, until a fresh launch or a
+            // close clears it. Frame coordinates are screen-space.
+            if let Some(message) = self.startup_notice.get(&widget.id) {
+                let id_for_notice = widget.id.clone();
+                frame = frame.child(
+                    div()
+                        .id(format!("slate-startup-notice-{}", widget.id))
+                        .absolute()
+                        .left(px(6.0))
+                        .right(px(6.0))
+                        .top(px(header_h + 6.0))
+                        .flex()
+                        .flex_row()
+                        .items_start()
+                        .gap(px(8.0 * zoom))
+                        .bg(rgb(theme::hex(theme::monochrome::RAISED)))
+                        .border_1()
+                        .border_color(rgb(theme::hex(theme::hairline::SOFT)))
+                        .px(px(10.0 * zoom))
+                        .py(px(8.0 * zoom))
+                        .text_size(px(11.0 * zoom))
+                        .text_color(rgb(theme::hex(theme::text::NORMAL)))
+                        .child(div().flex_1().min_w_0().child(message.clone()))
+                        .child(
+                            div()
+                                .id(format!("slate-startup-dismiss-{}", widget.id))
+                                .flex_none()
+                                .cursor_pointer()
+                                .text_color(rgb(theme::hex(theme::text::FAINT)))
+                                .child("×".to_owned())
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _event, _window, cx| {
+                                        cx.stop_propagation();
+                                        this.startup_notice.remove(&id_for_notice);
+                                        cx.notify();
+                                    }),
+                                ),
+                        ),
+                );
+            }
+
             // The eight resize handles the Electron frame drew — thin edges,
             // small squares at the corners, all in unscaled screen px. A
             // maximized frame has none (`!widget.maximized && RESIZE_HANDLES`).
@@ -4055,10 +4321,14 @@ impl Render for CanvasView {
                                     if let Err(error) = this.agent_picks.save() {
                                         this.notice(format!("agent pick: {error}"));
                                     }
-                                    if let Err(error) =
-                                        this.manager.write_text(&menu_id, command, true)
-                                    {
-                                        this.notice(format!("agent launch: {error}"));
+                                    match this.manager.write_text(&menu_id, command, true) {
+                                        // The shell armed its startup probe
+                                        // the moment the agent command was
+                                        // typed — same here.
+                                        Ok(_) => this.arm_startup_watch(&menu_id, command),
+                                        Err(error) => {
+                                            this.notice(format!("agent launch: {error}"))
+                                        }
                                     }
                                     cx.notify();
                                 }),
