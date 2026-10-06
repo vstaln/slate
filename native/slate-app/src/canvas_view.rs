@@ -2603,6 +2603,9 @@ fn widget_body(
                         if run.italic {
                             span = span.italic();
                         }
+                        if run.underline {
+                            span = span.underline();
+                        }
                         line = line.child(span);
                     }
                     body = body.child(line);
