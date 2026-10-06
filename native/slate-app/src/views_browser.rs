@@ -106,6 +106,10 @@ fn chrome_button<'a>(
 pub fn browser_pane(
     widget: &Widget,
     zoom: f32,
+    // The canvas's omnibox edit state, passed in — `cx.entity().read(cx)`
+    // would re-borrow CanvasView mid-render and panic.
+    editing_id: Option<&str>,
+    editing_buffer: &str,
     cx: &mut Context<crate::canvas_view::CanvasView>,
 ) -> impl IntoElement {
     let wid = widget.id.clone();
@@ -119,9 +123,9 @@ pub fn browser_pane(
     let shown_url = status.url.clone().unwrap_or_else(|| url.clone());
     let home = is_home(&shown_url);
 
-    let editing = cx.entity().read(cx).browser_editing.as_deref() == Some(wid.as_str());
+    let editing = editing_id == Some(wid.as_str());
     let address = if editing {
-        cx.entity().read(cx).browser_address.clone()
+        editing_buffer.to_owned()
     } else {
         // `value={isHome ? '' : address}` — home shows the placeholder.
         if home { String::new() } else { shown_url.clone() }
