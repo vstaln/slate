@@ -3293,6 +3293,10 @@ fn widget_body(
     snapshots: &[TerminalSnapshot],
     zoom: f32,
     terminals_flipped: bool,
+    // The browser pane's slice of CanvasView state — `entity().read()`
+    // mid-render would re-borrow the view and panic.
+    browser_editing: Option<&str>,
+    browser_address: &str,
     cx: &mut Context<CanvasView>,
 ) -> AnyElement {
     let font = px(12.0 * zoom);
@@ -3453,7 +3457,13 @@ fn widget_body(
         Some("browser") => div()
             .size_full()
             .text_size(font)
-            .child(crate::views_browser::browser_pane(widget, zoom, cx))
+            .child(crate::views_browser::browser_pane(
+                widget,
+                zoom,
+                browser_editing,
+                browser_address,
+                cx,
+            ))
             .into_any_element(),
         Some("notes") => div()
             .size_full()
@@ -4647,6 +4657,8 @@ impl Render for CanvasView {
                         &self.snapshots,
                         zoom,
                         self.prefs.terminals_flipped,
+                        self.browser_editing.as_deref(),
+                        &self.browser_address,
                         cx,
                     );
                     // Non-terminal panes scroll their content natively —
