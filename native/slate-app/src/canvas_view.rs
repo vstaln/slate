@@ -6,6 +6,7 @@
 //! renderer's `canvasState.ts`/`canvasLayout.ts`/`tokens.ts`.
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui::prelude::FluentBuilder;
@@ -118,6 +119,172 @@ fn is_terminal_kind(kind: Option<&str>) -> bool {
 /// projection::MAX_POINTS_PER_STROKE — longer strokes are truncated here
 /// rather than written and then dropped by the sanitizer on replay.
 const MAX_STROKE_POINTS: usize = 10_000;
+
+/// StartupWordmark's fixed beats, in seconds since the first frame: the
+/// particle timeline runs to t=8, and the startup screen itself fades out
+/// over the following ~0.9s (`is-ready`'s 200ms delay + 900ms transition).
+const SPLASH_PARTICLES_END: f32 = 8.0;
+const SPLASH_DONE: f32 = 9.2;
+
+/// `smooth()` from StartupWordmark.tsx — smoothstep on a clamped [0,1].
+fn smooth01(value: f32) -> f32 {
+    let t = value.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// One react-bits `cloudPoint`: a unit-sphere position plus the four
+/// `random` seeds the draw loop reads, the per-dot stagger delay and its
+/// base radius.
+struct SplashPoint {
+    cloud: [f32; 3],
+    random: [f32; 4],
+    delay: f32,
+    radius: f32,
+}
+
+/// splitmix64 — the splash wants a stable field across frames, not crypto;
+/// this avoids pulling `rand` in for one overlay.
+struct SplashRng(u64);
+
+impl SplashRng {
+    fn next(&mut self) -> f32 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        ((z >> 40) as f32) / 16_777_216.0
+    }
+}
+
+/// particleCloud.ts `cloudPoint()` over `Math.min(2400, w*h/500)` dots —
+/// the rejection sample into the unit sphere scaled by `cbrt(rand)`,
+/// followed by the four `random` seeds, `delay = rand*2` and
+/// `radius = .3 + rand*.35`, in that order.
+fn splash_field(width: f32, height: f32) -> Vec<SplashPoint> {
+    let count = ((width * height) / 500.0).min(2400.0) as usize;
+    let mut rng = SplashRng(0x5A17_5A17_5A17_5EED);
+    (0..count)
+        .map(|_| {
+            let (x, y, z) = loop {
+                let x = rng.next() * 2.0 - 1.0;
+                let y = rng.next() * 2.0 - 1.0;
+                let z = rng.next() * 2.0 - 1.0;
+                let length = x * x + y * y + z * z;
+                if length <= 1.0 && length > 0.0 {
+                    break (x, y, z);
+                }
+            };
+            let radius = rng.next().cbrt();
+            SplashPoint {
+                cloud: [x * radius, y * radius, z * radius],
+                random: [rng.next(), rng.next(), rng.next(), rng.next()],
+                delay: rng.next() * 2.0,
+                radius: 0.3 + rng.next() * 0.35,
+            }
+        })
+        .collect()
+}
+
+/// StartupWordmark's per-dot draw loop, line for line: dots scattered over
+/// the viewport spiral into the wordmark point at (w/2, h*.47), burst
+/// outward at t≈5.9, and the whole field fades between t=6 and t=7.
+/// Painted as white rounded quads standing in for the DOM's filled arcs.
+fn paint_splash_particles(window: &mut Window, points: &[SplashPoint], t: f32) {
+    let viewport = window.viewport_size();
+    let width = f32::from(viewport.width);
+    let height = f32::from(viewport.height);
+    let cx = width / 2.0;
+    let cy = height * 0.47;
+    let fade = 1.0 - smooth01((t - 6.0) / 1.0);
+    if fade <= 0.0 {
+        return;
+    }
+    for p in points {
+        let r = p.random;
+        let travel = ((t - 1.0 - p.delay) / (6.5 - p.delay * 0.4)).clamp(0.0, 1.0);
+        let pull = smooth01(travel).powf(1.5);
+        // moveCloudPoint(cloud, t * .3) — the tiny idle drift on the
+        // scattered start position.
+        let drift_t = t * 0.3;
+        let cloud_x = p.cloud[0] + (drift_t * r[2] + 6.28 * r[3]).sin() * (0.015 + 0.06 * r[0]);
+        let cloud_y = p.cloud[1] + (drift_t * r[1] + 6.28 * r[0]).sin() * (0.015 + 0.06 * r[3]);
+        let sx = r[0] * width + cloud_x * 12.0;
+        let sy = r[1] * height + cloud_y * 12.0;
+        let angle = (sy - cy).atan2(sx - cx) + pull * (2.5 + r[3] * 2.0);
+        let burst = ((t - 5.9 - p.delay * 0.08) / 0.55).clamp(0.0, 1.0);
+        let distance = if burst > 0.0 {
+            (8.0 + r[2] * 55.0) * (1.0 + burst * burst * 125.0)
+        } else {
+            (sx - cx).hypot(sy - cy) * (1.0 - pull)
+        };
+        let x = cx + angle.cos() * distance;
+        let y = cy + angle.sin() * distance;
+        let alpha = smooth01(t / 1.5)
+            * if burst > 0.0 {
+                smooth01(burst * 7.0)
+            } else {
+                1.0 - smooth01((travel - 0.93) / 0.07)
+            }
+            * (0.25 + r[2] * 0.65)
+            * fade;
+        if alpha <= 0.004 {
+            continue;
+        }
+        let radius = p.radius * (1.0 + burst * 6.0);
+        let a = (alpha.clamp(0.0, 1.0) * 255.0).round() as u32;
+        window.paint_quad(
+            gpui::fill(
+                Bounds::new(
+                    point(px(x - radius), px(y - radius)),
+                    size(px((radius * 2.0).max(1.0)), px((radius * 2.0).max(1.0))),
+                ),
+                rgba(0xffff_ff00 | a),
+            )
+            .corner_radii(Corners::all(px(radius))),
+        );
+    }
+}
+
+/// A one-line tooltip body — stand-in for the shell's `title=` attribute
+/// on the kbd cheatsheet rows.
+struct TooltipLine(&'static str);
+
+impl Render for TooltipLine {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .text_xs()
+            .text_color(rgb(theme::hex(theme::text::NORMAL)))
+            .child(self.0)
+    }
+}
+
+/// A `kbd` cheatsheet chip — the bordered mono keycap in the empty card.
+fn kbd_chip(label: &'static str) -> Div {
+    div()
+        .px_1()
+        .py(px(0.5))
+        .text_size(px(9.0))
+        .font_family("monospace")
+        .text_color(rgb(theme::hex(theme::text::DIM)))
+        .border_1()
+        .border_color(rgb(theme::hex(theme::hairline::FAINT)))
+        .rounded_xl()
+        .child(label)
+}
+
+/// Chip plus its word under the row's shared `title=` tooltip, e.g.
+/// `<kbd>0</kbd> zoom` — "0 resets zoom only".
+fn kbd_hint(chip: &'static str, suffix: &'static str, tip: &'static str) -> Stateful<Div> {
+    div()
+        .id(tip)
+        .flex()
+        .items_center()
+        .gap(px(2.0))
+        .tooltip(move |_, cx| AnyView::from(cx.new(|_| TooltipLine(tip))))
+        .child(kbd_chip(chip))
+        .child(suffix)
+}
 
 pub struct CanvasView {
     pub(crate) focus: FocusHandle,
@@ -268,6 +435,14 @@ pub struct CanvasView {
     /// One in-flight porcelain read at a time — a slow repo must never
     /// stack subprocesses behind the tick.
     git_polling: bool,
+    /// Startup splash clock — the Electron `StartupWordmark` overlay.
+    /// `Some` holds the launch instant while the intro plays; `None` once
+    /// it finishes (~9.2s) or the first deliberate press dismisses it.
+    splash_started: Option<Instant>,
+    /// The particle field — react-bits `cloudPoint`s generated once the
+    /// viewport size is known (the count scales with it). `Rc` so the
+    /// paint closure can share it without a per-frame clone.
+    splash_points: Rc<Vec<SplashPoint>>,
     counter: u64,
 }
 
@@ -598,7 +773,6 @@ impl CanvasView {
             .extra("targetTerminalId")
             .and_then(Value::as_str)
             .map(str::to_owned);
-        let mut spawned = 0usize;
         let mut relaunch: Vec<PendingCommand> = Vec::new();
         for widget in canvas.widgets.values() {
             if is_terminal_kind(widget.kind.as_deref()) {
@@ -614,7 +788,6 @@ impl CanvasView {
                     )
                     .is_ok()
                 {
-                    spawned += 1;
                     if let Some(agent_id) = agent_picks.launched.get(&widget.id) {
                         if let Some((_, _, command)) = AGENT_LAUNCHERS
                             .iter()
@@ -686,6 +859,8 @@ impl CanvasView {
             git_chip: Default::default(),
             git_next_poll: Instant::now(),
             git_polling: false,
+            splash_started: Some(Instant::now()),
+            splash_points: Rc::new(Vec::new()),
             counter: 0,
         };
         view.snapshots = view.manager.snapshots();
@@ -693,15 +868,9 @@ impl CanvasView {
             view.agent_relaunched.insert(pending.terminal_id.clone());
             view.pending_commands.push(pending);
         }
-        if spawned == 0 && view.canvas.widgets.is_empty() {
-            // First run: the Electron app opened empty with a hint overlay;
-            // a live terminal is a better first screen and still one key (T)
-            // away from more.
-            let id = view.fresh_id("terminal");
-            view.create_widget_at(&id, "terminal", "Terminal", Pos2::new(80.0, 80.0));
-            let _ = view.manager.spawn(id.clone());
-            view.active = Some(id);
-        }
+        // First run: the Electron app opened empty and let the welcome card
+        // ("Your canvas is clear" + an Add terminal button) do the greeting —
+        // one key (T) or one click away from a shell.
 
         cx.spawn(async move |this, cx| {
             loop {
@@ -3190,6 +3359,31 @@ impl Render for CanvasView {
         let view = self.view();
         let zoom = view.zoom;
 
+        // The StartupWordmark intro: a particle overlay paints over
+        // everything for ~9.2s, driven off this render clock. Any
+        // deliberate input dismisses it (on_key plus the overlay's own
+        // mouse listeners); prefers-reduced-motion jumps straight to the
+        // end state, which in the original is an empty frame — gone.
+        let mut splash_t = None;
+        if let Some(started) = self.splash_started {
+            if cx.reduce_motion() {
+                self.splash_started = None;
+            } else {
+                let t = started.elapsed().as_secs_f32();
+                if t < SPLASH_DONE {
+                    splash_t = Some(t);
+                    if self.splash_points.is_empty() {
+                        self.splash_points =
+                            Rc::new(splash_field(viewport_size.x, viewport_size.y));
+                    }
+                    window.request_animation_frame();
+                } else {
+                    self.splash_started = None;
+                    self.splash_points = Rc::new(Vec::new());
+                }
+            }
+        }
+
         // PTYs follow their frame's rendered size, resized on change only.
         let mut sizes: Vec<(String, u16, u16)> = Vec::new();
         for widget in self.canvas.widgets.values() {
@@ -4613,13 +4807,18 @@ impl Render for CanvasView {
                             .gap_2()
                             .px_6()
                             .py_4()
-                            .bg(rgb(theme::hex(theme::monochrome::SURFACE)))
+                            // bg-bg-panel/80 — colorBgPanel (elevated) at
+                            // 80% alpha; the DOM version's backdrop-blur
+                            // has no gpui equivalent.
+                            .bg(rgba(0x181818cc))
                             .border_1()
                             .border_color(rgb(theme::hex(theme::hairline::SOFT)))
-                            .rounded_md()
+                            .rounded_xl()
+                            .shadow_xl()
                             .child(
                                 div()
                                     .text_sm()
+                                    .font_weight(gpui::FontWeight::MEDIUM)
                                     .text_color(rgb(theme::hex(theme::text::NORMAL)))
                                     .child("Your canvas is clear".to_owned()),
                             )
@@ -4628,7 +4827,7 @@ impl Render for CanvasView {
                                     .text_xs()
                                     .text_color(rgb(theme::hex(theme::text::FAINT)))
                                     .child(
-                                        "Use the command bar below: /terminal, .files, @planner, or plain terminal"
+                                        "Use the command bar below: /terminal, /chat, .files, @planner, or plain terminal"
                                             .to_owned(),
                                     ),
                             )
@@ -4637,28 +4836,39 @@ impl Render for CanvasView {
                                     .id("slate-empty-add-terminal")
                                     .px_3()
                                     .py_1()
-                                    .bg(rgb(theme::hex(theme::status::INFO)))
+                                    // bg-accent is plain white in the
+                                    // shell's tokens; text-bg sits on it.
+                                    .bg(rgb(theme::hex(theme::text::NORMAL)))
+                                    .hover(|s| s.bg(rgba(0xffff_ffe6)))
                                     .text_size(px(11.0))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
                                     .text_color(rgb(theme::hex(theme::monochrome::BASE)))
-                                    .rounded_md()
+                                    .rounded_xl()
                                     .cursor_pointer()
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(move |this, _e, _w, cx| {
-                                            this.spawn_terminal(viewport, cx);
                                             cx.stop_propagation();
+                                            this.spawn_terminal(viewport, cx);
                                         }),
                                     )
                                     .child("Add terminal".to_owned()),
                             )
                             .child(
                                 div()
-                                    .text_xs()
-                                    .text_color(rgb(theme::hex(theme::hairline::FAINT)))
-                                    .child(
-                                        "T N terminal · drag pan · scroll zoom · + - 0 · F fit · Home reset · d draw · e erase"
-                                            .to_owned(),
-                                    ),
+                                    .mt_1()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.0))
+                                    .text_size(px(10.0))
+                                    .text_color(rgb(theme::hex(theme::text::FAINT)))
+                                    .child(kbd_chip("T"))
+                                    .child(kbd_chip("N"))
+                                    .child(kbd_chip("+"))
+                                    .child(kbd_chip("-"))
+                                    .child(kbd_hint("0", " zoom", "0 resets zoom only"))
+                                    .child(kbd_hint("F", " fit", "F fits all widgets into view"))
+                                    .child(kbd_hint("Home", " view", "Home resets pan and zoom")),
                             ),
                     ),
             );
@@ -5180,6 +5390,144 @@ impl Render for CanvasView {
         if self.settings_open {
             root = root.child(crate::views_settings::settings_modal(&self.settings, cx));
         }
+
+        // The StartupWordmark screen — the last child so it sits over the
+        // title bar and rail, like the original's z-100000 startup-screen.
+        // `occlude` keeps the canvas inert underneath it; any deliberate
+        // press dismisses the intro early.
+        if let Some(t) = splash_t {
+            // `.is-ready`'s fade: the screen holds opaque until 200ms after
+            // the particles finish at t=8, then eases out over 900ms.
+            let screen = 1.0 - smooth01((t - 8.2) / 0.9);
+            let points = self.splash_points.clone();
+            let (width, height) = (viewport_size.x, viewport_size.y);
+            // The caption bits appear at t=2 (startup-loader-in 300ms 2s);
+            // the track sweeps on a 1600ms loop until the "ready" beat at
+            // t=7 leaves it full and static, like `.is-ready span`.
+            let loader_in = smooth01((t - 2.0) / 0.3);
+            let ready = t >= 7.0;
+            let track_w = (width * 0.6).min(280.0);
+            let sweep_w = track_w * 0.3;
+            let cycle = ((t - 2.0) / 1.6).max(0.0).fract();
+            // translateX(-100% → 334%) of the 30%-wide span, eased with the
+            // closest smoothstep stand-in for cubic-bezier(.65,0,.35,1).
+            let sweep_x = (-1.0 + 4.34 * smooth01(cycle)) * sweep_w;
+            // The cloud coalesces into the product name: it fades in
+            // through the burst (t≈5.9) and holds until the screen fades.
+            let word_alpha = smooth01((t - 5.6) / 0.8);
+            root = root.child(
+                div()
+                    .id("slate-startup")
+                    .absolute()
+                    .inset_0()
+                    .occlude()
+                    .opacity(screen)
+                    .bg(rgb(theme::hex(theme::monochrome::BASE)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _e, _w, cx| {
+                            this.splash_started = None;
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Middle,
+                        cx.listener(|this, _e, _w, cx| {
+                            this.splash_started = None;
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(|this, _e, _w, cx| {
+                            this.splash_started = None;
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    )
+                    .on_scroll_wheel(cx.listener(|_this, _e, _w, cx| {
+                        // The screen is modal while it plays — a wheel
+                        // press never reaches the pan/zoom handler.
+                        cx.stop_propagation();
+                    }))
+                    .child(
+                        gpui::canvas(
+                            move |_, _, _| (points.clone(), t),
+                            move |_bounds, (points, t), window, _cx| {
+                                if t < SPLASH_PARTICLES_END {
+                                    paint_splash_particles(window, &points, t);
+                                }
+                            },
+                        )
+                        .absolute()
+                        .inset_0(),
+                    )
+                    // The wordmark reveal at (w/2, h*.47) — the spot the
+                    // particles converge on.
+                    .child(
+                        div()
+                            .absolute()
+                            .left_0()
+                            .right_0()
+                            .top(px((height * 0.47 - 34.0).max(0.0)))
+                            .flex()
+                            .justify_center()
+                            .opacity(word_alpha)
+                            .child(
+                                div()
+                                    .text_size(px(52.0))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(rgb(theme::hex(theme::text::NORMAL)))
+                                    .child("Slate"),
+                            ),
+                    )
+                    // The caption — `.startup-track` under the wordmark box
+                    // plus `.startup-loading-label` beneath it.
+                    .child(
+                        div()
+                            .absolute()
+                            .left_0()
+                            .right_0()
+                            .top(px((height * 0.5 + 150.0).min(height - 60.0)))
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .opacity(loader_in)
+                            .child(
+                                div()
+                                    .relative()
+                                    .w(px(track_w))
+                                    .h(px(3.0))
+                                    .rounded_full()
+                                    .overflow_hidden()
+                                    .bg(rgb(theme::hex(theme::hairline::FAINT)))
+                                    .child(
+                                        div()
+                                            .absolute()
+                                            .left(px(if ready { 0.0 } else { sweep_x }))
+                                            .top_0()
+                                            .h_full()
+                                            .w(px(if ready { track_w } else { sweep_w }))
+                                            .rounded_full()
+                                            .bg(rgb(theme::hex(theme::text::NORMAL))),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .mt_3()
+                                    .text_xs()
+                                    .text_color(rgb(theme::hex(theme::text::FAINT)))
+                                    .child(if ready {
+                                        "Ready."
+                                    } else {
+                                        "Preparing your workspace…"
+                                    }),
+                            ),
+                    ),
+            );
+        }
         root
     }
 }
@@ -5188,6 +5536,19 @@ impl CanvasView {
     fn on_key(&mut self, event: &KeyDownEvent, viewport: Vec2, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
         let mods = &keystroke.modifiers;
+
+        // The startup splash owns input while it plays — the Electron shell
+        // set #root inert and let any deliberate press end the intro, but a
+        // keydown carrying Ctrl/Alt/Meta was ignored so a held modifier
+        // never skipped it. Either way the keystroke is swallowed.
+        if self.splash_started.is_some() {
+            if !(mods.control || mods.alt || mods.platform) {
+                self.splash_started = None;
+                self.splash_points = Rc::new(Vec::new());
+            }
+            cx.notify();
+            return;
+        }
 
         // Canvas history — the shell's keydown listener fired globally, so
         // ^Z/^⇧Z/^Y is undo/redo even over a focused terminal (the PTY never
