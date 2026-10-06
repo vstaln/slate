@@ -366,17 +366,11 @@ fn live_control() -> Option<(String, String)> {
 
 /// `POST /canvas/image`'s extension gate, mirrored client-side so the server
 /// path and the offline journal path reject the same files with the route's
-/// own message. Keep the list in step with the route's in http.rs.
+/// own message. The shared `classify_media` table keeps this in step with
+/// http.rs and `attachments::import_image`.
 fn check_image_path(path: &str) -> Result<(), String> {
-    let extension = std::path::Path::new(path)
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    if ![
-        "png", "jpg", "jpeg", "gif", "webp", "avif", "bmp", "svg", "heic", "tif", "tiff", "ico",
-    ]
-    .contains(&extension.as_str())
+    if slate_app::attachments::classify_media(std::path::Path::new(path))
+        != slate_app::attachments::MediaKind::Image
     {
         return Err(format!("{path} is not an image"));
     }
@@ -1155,9 +1149,6 @@ fn run_canvas(parsed: &slate_app::cli::Args) -> Result<(), String> {
                 .pick(&["kind"])
                 .or_else(|| parsed.positionals().get(2).cloned())
                 .ok_or("canvas place needs <kind> or --kind <kind>")?;
-            if kind == "browser" {
-                return Err("browser widgets are not supported in the native build".into());
-            }
             let image_path = parsed
                 .pick(&["path", "image", "file"])
                 .or_else(|| parsed.positionals().get(3).cloned());
@@ -1176,6 +1167,7 @@ fn run_canvas(parsed: &slate_app::cli::Args) -> Result<(), String> {
                 "calendar",
                 "links",
                 "image",
+                "browser",
             ];
             if !known.contains(&kind.as_str()) {
                 return Err(format!(

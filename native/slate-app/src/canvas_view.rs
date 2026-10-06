@@ -2166,10 +2166,15 @@ impl CanvasView {
         self.canvas.widgets.insert(id.to_owned(), widget);
     }
 
-    /// The shell's canvas `onDrop`: files land at the pointer's world point
-    /// in a 28px cascade. Images import into the media store and spawn an
-    /// `image` widget; other kinds opened a browser widget in the shell —
-    /// this build can't render those, so they get an honest notice instead.
+    /// The shell's canvas `onDrop`: every droppable file imports into the
+    /// media store and lands at the pointer's world point in a 28px cascade
+    /// (`CASCADE_PX`, counted over successfully placed files). The classified
+    /// kind picks the widget — `image` for image types, `browser` for the
+    /// other viewable kinds, which carry the media reference in their
+    /// journaled `state.media` (the port of the shell's `orcspace:open-media`
+    /// delivery persisted as `orcspace-browser-media:<id>` in localStorage).
+    /// A file with no viewer — `doc`, the shell's open-externally fallback —
+    /// gets the refusal notice instead.
     fn handle_file_drop(&mut self, paths: &ExternalPaths, cx: &mut Context<Self>) {
         let point = self
             .drop_point
@@ -2178,68 +2183,115 @@ impl CanvasView {
         let view_now = canvas::View::new(&self.canvas.camera, Pos2::ZERO);
         let drop = view_now.to_world(point);
         let media_dir = slate_app::ipc::user_data_dir().join("media");
-        let mut spawned = 0usize;
+        // The shell's `shortName`: notices never carry a name past 80 chars.
+        let short_name = |name: &str| -> String {
+            if name.chars().count() > 80 {
+                format!("{}…", name.chars().take(77).collect::<String>())
+            } else {
+                name.to_owned()
+            }
+        };
+        let mut placed = 0usize;
         for source in paths.paths() {
             if self.canvas.widgets.len() >= projection::MAX_WIDGETS {
                 self.notice("Canvas is full — close a widget before adding another.");
-                break;
+                continue;
             }
             let name = source
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "file".to_owned());
-            match slate_app::attachments::import_image(source, &media_dir) {
-                Ok(imported) => {
-                    // `addWidget` anchors spawns at `point - 16`.
-                    let at = Pos2::new(
-                        drop.x + spawned as f32 * 28.0 - 16.0,
-                        drop.y + spawned as f32 * 28.0 - 16.0,
-                    );
-                    let id = self.fresh_id("image");
-                    let (w, h) = self.spawn_size("image");
-                    let z = self
-                        .canvas
-                        .widgets
-                        .values()
-                        .map(|widget| widget.z)
-                        .fold(0.0, f64::max)
-                        + 1.0;
-                    let image_path = imported.to_string_lossy().into_owned();
-                    self.commit(
-                        "widget.create",
-                        &format!("widget:{id}"),
-                        json!({
-                            "id": id, "title": name, "kind": "image",
-                            "x": at.x as f64, "y": at.y as f64,
-                            "w": w, "h": h, "z": z, "maximized": false,
-                            "imagePath": image_path, "imageName": name,
-                        }),
-                    );
-                    self.canvas.widgets.insert(
-                        id.clone(),
-                        Widget {
-                            id,
-                            title: name.clone(),
-                            kind: Some("image".to_owned()),
-                            x: at.x as f64,
-                            y: at.y as f64,
-                            w,
-                            h,
-                            z,
-                            maximized: false,
-                            image_path: Some(image_path),
-                            image_name: Some(name),
-                            state: None,
-                            version: 1.0,
-                            updated_at: 0.0,
-                        },
-                    );
-                    spawned += 1;
+            let media_kind = slate_app::attachments::classify_media(source);
+            let Some(widget_kind) = media_kind.widget_kind() else {
+                self.notice(format!(
+                    "can't open \"{}\" — that file type isn't viewable",
+                    short_name(&name)
+                ));
+                continue;
+            };
+            let imported = match slate_app::attachments::import_media(source, &media_dir) {
+                Ok(imported) => imported,
+                Err(error) => {
+                    self.notice(format!("Failed to open file: {error}"));
+                    continue;
                 }
-                Err(_) => self.notice(format!(
-                    "can't open \"{name}\" — only images can be dropped in this build"
-                )),
+            };
+            let (w, h) = self.spawn_size(widget_kind);
+            // `placeWidget` → `addWidget`: the requested point is clamped
+            // into the visible world first, then stored at `point - 16`.
+            let mut at = Pos2::new(
+                drop.x + placed as f32 * 28.0,
+                drop.y + placed as f32 * 28.0,
+            );
+            if self.viewport.x > 0.0 {
+                at = canvas::clamp_to_visible_world(&self.canvas.camera, self.viewport, at, w, h);
             }
+            let at = Pos2::new(at.x - 16.0, at.y - 16.0);
+            let z = self
+                .canvas
+                .widgets
+                .values()
+                .map(|widget| widget.z)
+                .fold(0.0, f64::max)
+                + 1.0;
+            let id = self.fresh_id(widget_kind);
+            let store_name = imported
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| name.clone());
+            let image_path = (widget_kind == "image")
+                .then(|| imported.to_string_lossy().into_owned());
+            // For a browser widget the media reference rides in `state.media`
+            // — `{mediaUrl, path, name, kind}`, the shape the shell persisted
+            // under `orcspace-browser-media:<id>` after the open-media event.
+            let state = (widget_kind == "browser").then(|| {
+                json!({
+                    "media": {
+                        "mediaUrl": format!("orc://media/{store_name}"),
+                        "path": imported.to_string_lossy(),
+                        "name": name,
+                        "kind": media_kind.name(),
+                    }
+                })
+            });
+            let mut payload = json!({
+                "id": id, "title": name, "kind": widget_kind,
+                "x": at.x as f64, "y": at.y as f64,
+                "w": w, "h": h, "z": z, "maximized": false,
+            });
+            if let Some(path) = &image_path {
+                payload["imagePath"] = json!(path);
+                // `imageName` is the media-store name (`<sha256>.<ext>`), the
+                // same value `POST /canvas/image` records — the original file
+                // name already rides as the widget title.
+                payload["imageName"] = json!(store_name);
+            }
+            if let Some(state) = &state {
+                payload["state"] = state.clone();
+            }
+            let image_name = image_path.as_ref().map(|_| store_name.clone());
+            self.commit("widget.create", &format!("widget:{id}"), payload);
+            self.canvas.widgets.insert(
+                id.clone(),
+                Widget {
+                    id,
+                    title: name.clone(),
+                    kind: Some(widget_kind.to_owned()),
+                    x: at.x as f64,
+                    y: at.y as f64,
+                    w,
+                    h,
+                    z,
+                    maximized: false,
+                    image_path,
+                    image_name,
+                    state,
+                    version: 1.0,
+                    updated_at: 0.0,
+                },
+            );
+            placed += 1;
+            self.notice(format!("Opened \"{}\"", short_name(&name)));
         }
         cx.notify();
     }
@@ -2302,20 +2354,19 @@ impl CanvasView {
             return;
         };
         let media_dir = slate_app::ipc::user_data_dir().join("media");
-        if let Err(error) = std::fs::create_dir_all(&media_dir) {
-            self.notice(format!("Failed to save clipboard image: {error}"));
-            return;
-        }
-        let extension = image.format.extension();
-        let path = media_dir.join(format!(
-            "pasted-{}.{}",
-            uuid::Uuid::new_v4().simple(),
-            extension
-        ));
-        if let Err(error) = std::fs::write(&path, &image.bytes) {
-            self.notice(format!("Failed to save clipboard image: {error}"));
-            return;
-        }
+        // The shell's `saveClipboard` → `saveBytes`: content-addressed into
+        // the same media store drops use.
+        let path = match slate_app::attachments::save_bytes(
+            &image.bytes,
+            image.format.extension(),
+            &media_dir,
+        ) {
+            Ok(path) => path,
+            Err(error) => {
+                self.notice(format!("Failed to save clipboard image: {error}"));
+                return;
+            }
+        };
         if self.canvas.widgets.len() >= projection::MAX_WIDGETS {
             self.notice("Canvas is full — close a widget before adding another.");
             return;
@@ -5987,21 +6038,22 @@ impl CanvasView {
                                     }
                                 }
                                 ClipboardEntry::Image(image) if !image_saved => {
+                                    // `saveClipboard` → `saveBytes`: the
+                                    // clipboard image lands in the media
+                                    // store content-addressed, and its path
+                                    // attaches like a dropped file's.
                                     let media_dir = slate_app::ipc::user_data_dir().join("media");
-                                    if std::fs::create_dir_all(&media_dir).is_ok() {
-                                        let path = media_dir.join(format!(
-                                            "pasted-{}.{}",
-                                            uuid::Uuid::new_v4().simple(),
-                                            image.format.extension()
-                                        ));
-                                        if std::fs::write(&path, &image.bytes).is_ok() {
-                                            if let Ok(token) = slate_app::attachments::path_token(
-                                                &path.to_string_lossy(),
-                                            ) {
-                                                tokens.push_str(&token);
-                                            }
-                                            image_saved = true;
+                                    if let Ok(path) = slate_app::attachments::save_bytes(
+                                        &image.bytes,
+                                        image.format.extension(),
+                                        &media_dir,
+                                    ) {
+                                        if let Ok(token) = slate_app::attachments::path_token(
+                                            &path.to_string_lossy(),
+                                        ) {
+                                            tokens.push_str(&token);
                                         }
+                                        image_saved = true;
                                     }
                                 }
                                 _ => {}
