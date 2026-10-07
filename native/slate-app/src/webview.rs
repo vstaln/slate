@@ -245,6 +245,23 @@ pub fn go_forward(widget: &str) {
     let _ = widget;
 }
 
+/// Hide the widget's native child without unmounting — the canvas culls
+/// off-viewport widgets before their element's paint() ever runs, so the
+/// child would otherwise stay visible at its last bounds after a jump-cut
+/// (focus jump, arrange, zoom-fit). No-op when no webview exists yet.
+pub fn hide(widget: &str) {
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    if !is_wayland() {
+        // Lookup only — `key_for` would mint an id for a widget that never
+        // had a webview.
+        if let Some(id) = lock(&KEY_TO_ID).get(widget).copied() {
+            x11_child_thread::request_set_visible(id, false);
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+    let _ = widget;
+}
+
 /// The widget is gone — destroy the native webview and all bookkeeping.
 /// Called from `CanvasView::close_widget` and the journal-refold GC.
 pub fn remove_widget(widget: &str) {
@@ -316,11 +333,19 @@ fn navigation_allowed(id: usize, url: &str) -> bool {
         .unwrap_or_default();
     match scheme.as_str() {
         "http" | "https" => true,
-        "file" => lock(&STATUS)
-            .get(&id)
-            .and_then(|status| status.url.as_deref())
-            .map(|current| current.starts_with("file:"))
-            .unwrap_or(false),
+        // `SENT_URL` holds the last URL *we* asked the webview to load —
+        // matching it means this is a programmatic loadURL, which the
+        // original's will-navigate guard exempted outright (that's how the
+        // omnibox's file:// worked). Otherwise file: is only reachable from
+        // a file: page.
+        "file" => {
+            lock(&SENT_URL).get(&id).map(String::as_str) == Some(url)
+                || lock(&STATUS)
+                    .get(&id)
+                    .and_then(|status| status.url.as_deref())
+                    .map(|current| current.starts_with("file:"))
+                    .unwrap_or(false)
+        }
         _ => false,
     }
 }
@@ -357,6 +382,11 @@ fn wired_builder(
                     status.loading = true;
                     status.url = Some(url.clone());
                 });
+                // The webview is already loading this URL — record it as
+                // sent so `maybe_sync_url` doesn't re-navigate when the
+                // journaled state.url lands a tick later (every in-page link
+                // click used to load twice).
+                lock(&SENT_URL).insert(id, url.clone());
                 if let Some(widget) = widget_for(id) {
                     push_event(WebViewEvent::Navigated { widget, url });
                 }

@@ -46,16 +46,60 @@ fn is_home(url: &str) -> bool {
 }
 
 /// Widget's journaled URL, `HOME_URL` when never navigated — the original's
-/// `readUrl` default.
+/// `readUrl` default. Dropped media rides `state.media` (the shell's
+/// `orcspace-browser-media:<id>` record); its `path` becomes a `file:` URL
+/// so webkit renders image/video/audio/pdf/text inline — the MediaViewer's
+/// native counterpart.
 fn widget_url(widget: &Widget) -> String {
-    widget
-        .state
-        .as_ref()
+    let state = widget.state.as_ref();
+    if let Some(url) = state
         .and_then(|state| state.get("url"))
         .and_then(Value::as_str)
         .filter(|url| !url.is_empty())
-        .map(str::to_owned)
-        .unwrap_or_else(|| HOME_URL.to_owned())
+    {
+        return url.to_owned();
+    }
+    if let Some(path) = state
+        .and_then(|state| state.get("media"))
+        .and_then(|media| media.get("path"))
+        .and_then(Value::as_str)
+        .filter(|path| !path.is_empty())
+    {
+        return file_url(path);
+    }
+    HOME_URL.to_owned()
+}
+
+/// `file://` + percent-encoded path — the omnibox's path-to-URL half.
+fn file_url(path: &str) -> String {
+    let mut out = String::with_capacity(path.len() + 8);
+    out.push_str("file://");
+    for byte in path.bytes() {
+        match byte {
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'/'
+            | b'-'
+            | b'_'
+            | b'.'
+            | b'~'
+            | b'!'
+            | b'\''
+            | b'('
+            | b')'
+            | b'*'
+            | b'&'
+            | b'+'
+            | b','
+            | b';'
+            | b'='
+            | b'@'
+            | b':' => out.push(byte as char),
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
 }
 
 /// One chrome icon button — the original's `browser-icon-btn`.
@@ -205,7 +249,6 @@ pub fn browser_pane(
                 .items_center()
                 .gap(px(6.0 * zoom))
                 .px(px(8.0 * zoom))
-                .rounded_full()
                 .bg(rgb(theme::hex(theme::monochrome::BASE)))
                 .cursor_text()
                 .child(
@@ -296,7 +339,7 @@ pub fn browser_pane(
                         div()
                             .h_full()
                             .w(gpui::relative(1.0 / 3.0))
-                            .bg(rgb(theme::hex(theme::status::INFO))),
+                            .bg(rgb(theme::hex(theme::accent::SAND))),
                     ),
             )
         })
@@ -335,7 +378,6 @@ pub fn browser_pane(
                                     .id(("browser-retry", widget.z as u64))
                                     .px_2()
                                     .py(px(2.0))
-                                    .rounded_md()
                                     .text_size(px(10.0 * zoom))
                                     .text_color(rgb(theme::hex(theme::status::DANGER)))
                                     .bg(rgb(theme::hex(theme::monochrome::RAISED)))
@@ -361,7 +403,6 @@ pub fn browser_pane(
                                     .id(("browser-home", widget.z as u64))
                                     .px_2()
                                     .py(px(2.0))
-                                    .rounded_md()
                                     .text_size(px(10.0 * zoom))
                                     .text_color(rgb(theme::hex(theme::text::DIM)))
                                     .bg(rgb(theme::hex(theme::monochrome::RAISED)))

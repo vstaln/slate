@@ -786,6 +786,12 @@ impl TerminalScreen {
         self.mouse_mode != 0
     }
 
+    /// True while the emulator sits on the alternate buffer — a full-screen
+    /// program owns the terminal. The initial-command gate reads this.
+    pub fn alternate_screen(&self) -> bool {
+        self.screen().alternate_screen()
+    }
+
     /// True while DECSET 1016 is the active mouse encoding — reports then
     /// carry pixel coordinates, so `mouse_event` callers should pass the
     /// pointer's pixel position rather than a cell.

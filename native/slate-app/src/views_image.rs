@@ -91,7 +91,6 @@ pub fn image_pane(
                 .flex_1()
                 .min_h_0()
                 .overflow_hidden()
-                .rounded_md()
                 .border_1()
                 .border_color(rgb(theme::hex(theme::hairline::SOFT)))
                 .bg(rgb(theme::hex(theme::monochrome::BASE)))

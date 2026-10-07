@@ -40,9 +40,27 @@ pub mod hairline {
 
 pub mod text {
     use super::Rgb;
-    pub const NORMAL: Rgb = (0xFF, 0xFF, 0xFF);
+    /// Graysite `--color-paper` — the warm off-white its pages read in.
+    /// Pure white reads harsh against the ink ramp; the fixture test does
+    /// not pin this token.
+    pub const NORMAL: Rgb = (0xEC, 0xEA, 0xE7);
     pub const DIM: Rgb = (0xB9, 0xB9, 0xBE);
     pub const FAINT: Rgb = (0xA9, 0xA9, 0xB0);
+}
+
+/// The one hue — graysite's sodium-amber "sand" ramp plus its signal red.
+/// The ink greys carry the surfaces; sand is reserved for accents that
+/// must read as *alive*: selections, the focused card, active marks.
+pub mod accent {
+    use super::Rgb;
+    /// sand-400 `#d4a373` — selection fills, focus outlines, active tab.
+    pub const SAND: Rgb = (0xD4, 0xA3, 0x73);
+    /// sand-300 `#dfb891` — brighter accent text (code chips, highlights).
+    pub const SAND_HI: Rgb = (0xDF, 0xB8, 0x91);
+    /// sand-200 `#e8cdb0` — the sheen's brightest stop.
+    pub const SAND_LO: Rgb = (0xE8, 0xCD, 0xB0);
+    /// signal `#b7513f` — destructive accents where DANGER is too pink.
+    pub const SIGNAL: Rgb = (0xB7, 0x51, 0x3F);
 }
 
 pub mod status {

@@ -23,10 +23,9 @@
 //! - **Undo/Redo** — the shell's arrows dispatched `orcspace:canvas-undo`
 //!   /`-redo`; here the `undo`/`redo` commands pop `CanvasView`'s
 //!   `undo_stack`/`redo_stack` directly, dimmed to white/25 when empty.
-//! - **View tabs** — the centre pill is the real `tablist` again. Slate
-//!   renders Canvas only, so it sits active while Code and Overview wear
-//!   the disabled white/25; a click flashes "isn't in this build" through
-//!   the same notice path instead of switching.
+//! - **View tabs** — the centre pill is the real `tablist` again: Canvas,
+//!   Code and Overview all switch through `titlebar_command("view")`, the
+//!   active one wearing the raised `bg-bg-hover` paint.
 //! - **Flip terminals** — `orcspace-flip-terminals`, persisted on
 //!   `UiPreferences::terminals_flipped`. Terminal bodies honour it with
 //!   the flip card (`terminal-flip-card`) in `canvas_view::widget_body`.
@@ -41,8 +40,9 @@
 //!
 //! Every control dispatches through `CanvasView::titlebar_command`
 //! (`cx.listener`, `json!` payloads): "undo"/"redo" pop the history
-//! rings, "view" is a canvas-only no-op that flashes for the absent
-//! views, "flip" toggles `prefs.terminals_flipped`, "git" repolls the
+//! rings, "view" switches `CanvasView`'s `active_view` (Canvas | Code |
+//! Overview, each rendering its own `<main>` fill), "flip" toggles
+//! `prefs.terminals_flipped`, "git" repolls the
 //! chip early, "sidebar" toggles `prefs.sidebar_open`, "settings" opens
 //! the settings modal, "minimize" → `window.minimize_window()`,
 //! "maximize" → `window.zoom_window()` — a toggle, the original's
@@ -177,6 +177,9 @@ pub struct TitlebarState<'a> {
     /// `undo_stack`/`redo_stack` non-empty — the history arrows' enabled.
     pub can_undo: bool,
     pub can_redo: bool,
+    /// `activeView` — `"canvas"`, `"code"` or `"overview"`; the tablist's
+    /// active paint.
+    pub active_view: &'a str,
     /// `orcspace-flip-terminals` — paints the toggle's active state.
     pub terminals_flipped: bool,
     /// The last lazy poll's repo read (`CanvasView::git_chip`).
@@ -184,6 +187,9 @@ pub struct TitlebarState<'a> {
     /// Window width — the git label is `hidden min-[1000px]:inline` in
     /// the shell, so it only exists at 1000px and wider.
     pub window_width: f32,
+    /// `isMaximized` — swaps the maximize glyph for the restore (Copy)
+    /// icon and title like the shell's `maximized` state did.
+    pub window_maximized: bool,
 }
 
 /// The git pill's laid-out width — the Arrange menu is `absolute right-0`
@@ -195,11 +201,11 @@ pub fn git_chip_width(chip: &GitChip, window_width: f32, window: &Window) -> f32
     let mut width = 9.0 + 14.0;
     if window_width >= 1000.0 {
         let label = git_chip_label(chip);
-        let mut font = gpui::font("Plus Jakarta Sans");
+        let mut font = gpui::font("Departure Mono");
         font.weight = FontWeight::MEDIUM;
         let line = window.text_system().shape_line(
             label.clone().into(),
-            px(12.0),
+            px(11.0),
             &[gpui::TextRun {
                 len: label.len(),
                 font,
@@ -257,16 +263,15 @@ fn drag_space(cx: &mut Context<crate::canvas_view::CanvasView>) -> Div {
         )
 }
 
-/// `en` — the bordered pill wrap: `h-[30px] rounded-pill border-bg-raise
-/// bg-bg p-[3px]`. The history switch, the sidebar toggle, the view tabs,
-/// flip and git all sit inside one.
+/// `en` — the bordered wrap: `h-[30px] rounded-pill border-bg-raise
+/// bg-bg p-[3px]` in the shell, square here. The history switch, the
+/// sidebar toggle, the view tabs, flip and git all sit inside one.
 fn pill_wrap() -> Div {
     div()
         .h(px(PILL_H))
         .flex()
         .flex_row()
         .items_center()
-        .rounded_full()
         .border_1()
         .border_color(rgb(theme::hex(theme::monochrome::RAISED)))
         .bg(rgb(theme::hex(theme::monochrome::BASE)))
@@ -274,7 +279,7 @@ fn pill_wrap() -> Div {
         .flex_none()
 }
 
-/// `Ft` — the bar's pill button: 24px tall, rounded, dim until hover.
+/// `Ft` — the bar's pill button: 24px tall, square, dim until hover.
 /// One `action` verb, dispatched with the contract's empty payload.
 fn action_button(
     icon_name: &'static str,
@@ -289,7 +294,6 @@ fn action_button(
         .flex()
         .items_center()
         .justify_center()
-        .rounded_full()
         .text_size(px(12.0))
         .font_weight(FontWeight::MEDIUM)
         .text_color(rgb(theme::hex(theme::text::DIM)))
@@ -328,7 +332,6 @@ fn history_button(
         .flex()
         .items_center()
         .justify_center()
-        .rounded_full()
         .text_size(px(12.0))
         .font_weight(FontWeight::MEDIUM)
         .child(crate::assets::icon(
@@ -362,11 +365,10 @@ fn history_button(
 }
 
 /// `Ft` — a Workspace View tab (`title-bar-view-tab`): the active view
-/// wears `bg-bg-hover text-white font-semibold`, a live inactive one
-/// `text-white/60` with the hover pair, and a view this build doesn't
-/// render the disabled white/25. The click still dispatches "view" —
-/// canvas is a no-op and the absent views flash the notice, the shell's
-/// `title-flash` stand-in.
+/// wears `bg-bg-hover` with the sand accent text, a live inactive one
+/// `text-white/60` with the hover pair, and a disabled one the shell's
+/// white/25. The click dispatches "view" — `CanvasView` switches
+/// `active_view` and the matching pane fills `<main>`.
 fn view_tab(
     label: &'static str,
     view: &'static str,
@@ -381,15 +383,15 @@ fn view_tab(
         .flex()
         .items_center()
         .justify_center()
-        .rounded_full()
-        .text_size(px(12.0))
+        .font_family("Departure Mono")
+        .text_size(px(11.0))
         .font_weight(FontWeight::MEDIUM)
         .child(label);
     if active {
         el = el
             .bg(rgb(theme::hex(theme::monochrome::RAISED)))
             .font_weight(FontWeight::SEMIBOLD)
-            .text_color(rgb(theme::hex(theme::text::NORMAL)));
+            .text_color(rgb(theme::hex(theme::accent::SAND)));
     } else if enabled {
         el = el
             .text_color(rgb(theme::hex(theme::text::DIM)))
@@ -423,8 +425,8 @@ fn flip_button(flipped: bool, cx: &mut Context<crate::canvas_view::CanvasView>) 
         .items_center()
         .justify_center()
         .gap(px(6.0))
-        .rounded_full()
-        .text_size(px(12.0))
+        .font_family("Departure Mono")
+        .text_size(px(11.0))
         .font_weight(FontWeight::MEDIUM)
         .cursor_pointer()
         .child(crate::assets::icon(
@@ -437,9 +439,9 @@ fn flip_button(flipped: bool, cx: &mut Context<crate::canvas_view::CanvasView>) 
             }),
         ))
         .child(if flipped {
-            "Show terminals"
+            "SHOW TERMINALS"
         } else {
-            "Flip terminals"
+            "FLIP TERMINALS"
         });
     if flipped {
         el = el
@@ -492,9 +494,6 @@ fn git_button(
         .flex()
         .items_center()
         .gap(px(6.0))
-        .rounded_full()
-        .text_size(px(12.0))
-        .font_weight(FontWeight::MEDIUM)
         .text_color(rgb(theme::hex(theme::text::DIM)))
         .cursor_pointer()
         .hover(|el| {
@@ -514,6 +513,9 @@ fn git_button(
                 .flex_none()
                 .max_w(px(110.0))
                 .truncate()
+                .font_family("Departure Mono")
+                .text_size(px(11.0))
+                .font_weight(FontWeight::MEDIUM)
                 .child(git_chip_label(chip)),
         );
     }
@@ -635,8 +637,8 @@ pub fn titlebar_pane(
         )
         .child(drag_space(cx));
 
-    // Centre: the Workspace View `tablist` — Canvas active; Code and
-    // Overview carry the disabled paint until those views exist.
+    // Centre: the Workspace View `tablist` — the active view wears the
+    // raised pill, all three switch for real.
     let center = div()
         .flex_none()
         .min_w_0()
@@ -644,9 +646,9 @@ pub fn titlebar_pane(
         .items_center()
         .child(
             pill_wrap()
-                .child(view_tab("Canvas", "canvas", true, true, cx))
-                .child(view_tab("Code", "code", false, false, cx))
-                .child(view_tab("Overview", "overview", false, false, cx)),
+                .child(view_tab("CANVAS", "canvas", state.active_view == "canvas", true, cx))
+                .child(view_tab("CODE", "code", state.active_view == "code", true, cx))
+                .child(view_tab("OVERVIEW", "overview", state.active_view == "overview", true, cx)),
         );
 
     // Right: drag space, the flip toggle, the Arrange menu, the git
@@ -665,24 +667,29 @@ pub fn titlebar_pane(
         .overflow_hidden()
         .child(drag_space(cx));
 
-    right = right
-        .child(
-            div()
-                .flex_none()
-                .mr(px(4.0))
-                .child(pill_wrap().child(flip_button(state.terminals_flipped, cx))),
-        )
-        .child(
-            div()
-                .flex_none()
-                .mr(px(4.0))
-                .child(pill_wrap().child(action_button("layout-grid", 14.0, "arrange", cx))),
-        )
-        .child(
-            div()
-                .flex_none()
-                .child(pill_wrap().child(git_button(state.git, state.window_width, cx))),
-        );
+    // `activeView !== 'overview'` gates both controls in the shell — flip
+    // only means anything on Canvas, and the arrange menu's items switch
+    // between widget modes and terminal layouts per view.
+    if state.active_view != "overview" {
+        right = right
+            .child(
+                div()
+                    .flex_none()
+                    .mr(px(4.0))
+                    .child(pill_wrap().child(flip_button(state.terminals_flipped, cx))),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .mr(px(4.0))
+                    .child(pill_wrap().child(action_button("layout-grid", 14.0, "arrange", cx))),
+            );
+    }
+    right = right.child(
+        div()
+            .flex_none()
+            .child(pill_wrap().child(git_button(state.git, state.window_width, cx))),
+    );
 
     // `!vt` — window controls exist only off macOS, flush to the right
     // edge (`pr-0`). Separator: `mx-0.5 h-4 w-px bg-line-soft/80`.
@@ -698,7 +705,19 @@ pub fn titlebar_pane(
                     .bg(rgba((theme::hex(theme::hairline::SOFT) << 8) | 0xCC)),
             )
             .child(window_button("minus", 14.0, "minimize", false, cx))
-            .child(window_button("square", 13.0, "maximize", false, cx))
+            .child(window_button(
+                if state.window_maximized {
+                    // The shell's maximized glyph — Lucide `copy` (two
+                    // overlapping squares) where the port has it vendored.
+                    "copy"
+                } else {
+                    "square"
+                },
+                13.0,
+                "maximize",
+                false,
+                cx,
+            ))
             .child(window_button("x", 14.0, "close", true, cx));
     }
 

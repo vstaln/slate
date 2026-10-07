@@ -46,7 +46,7 @@ fn excerpt(text: &str, max: usize) -> String {
 /// (the original's accent/amber/emerald/red/orange ladder).
 fn task_status(status: &str) -> (&'static str, theme::Rgb) {
     match status {
-        "ready" => ("ready", theme::status::INFO),
+        "ready" => ("ready", theme::accent::SAND),
         "dispatched" => ("running", theme::status::WARN),
         "completed" => ("done", theme::status::OK),
         "failed" => ("failed", theme::status::DANGER),
@@ -76,7 +76,6 @@ fn orc_button(
     div()
         .px_2()
         .py(px(1.0))
-        .rounded_md()
         .border_1()
         .border_color(rgb(theme::hex(theme::hairline::SOFT)))
         .cursor_pointer()
@@ -102,7 +101,6 @@ fn card() -> Div {
         .flex()
         .flex_col()
         .gap_1()
-        .rounded_md()
         .border_1()
         .border_color(rgb(theme::hex(theme::hairline::FAINT)))
         .bg(rgb(theme::hex(theme::monochrome::ELEVATED)))
@@ -345,7 +343,6 @@ fn run_row(
         .flex_row()
         .items_baseline()
         .gap_2()
-        .rounded_md()
         .px_1()
         .py(px(1.0))
         .cursor_pointer()
@@ -359,7 +356,7 @@ fn run_row(
                 .w(px(40.0))
                 .flex_none()
                 .text_color(rgb(theme::hex(if open {
-                    theme::status::INFO
+                    theme::accent::SAND
                 } else {
                     theme::text::FAINT
                 })))

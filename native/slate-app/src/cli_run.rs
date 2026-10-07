@@ -334,14 +334,20 @@ pub fn run() -> Result<(), String> {
 /// publishes to. Commands that only sometimes need the server (canvas focus)
 /// call this lazily so the rest of their surface works with the app closed.
 fn control() -> Result<(String, String), String> {
-    // `WORKSPACE_CONTROL_PORT` — the http override orc honoured before any
-    // socket path; a set port names a TCP control server instead.
-    let url = env::var("WORKSPACE_CONTROL_PORT")
+    // orc.mjs resolved SOCKET_PATH → URL → CONTROL_PORT. The port order
+    // matters here because nothing listens on TCP — a stale
+    // WORKSPACE_CONTROL_PORT must fall *behind* the socket the app is
+    // actually serving on, not ahead of it.
+    let url = env::var("SLATE_SOCKET_PATH")
         .ok()
         .filter(|s| !s.is_empty())
-        .map(|port| format!("http://127.0.0.1:{port}"))
-        .or_else(|| env::var("SLATE_SOCKET_PATH").ok().filter(|s| !s.is_empty()))
         .or_else(|| env::var("SLATE_URL").ok().filter(|s| !s.is_empty()))
+        .or_else(|| {
+            env::var("WORKSPACE_CONTROL_PORT")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(|port| format!("http://127.0.0.1:{port}"))
+        })
         .unwrap_or_else(|| slate_app::ipc::socket_path(slate_app::ipc::is_dev_environment()));
     let token = env::var("SLATE_TOKEN")
         .ok()
@@ -723,7 +729,7 @@ fn run_plan(parsed: &slate_app::cli::Args) -> Result<(), String> {
     let dir = slate_app::ipc::user_data_dir();
     let journal_path = dir.join("command-journal.ndjson");
     let doc_path = dir.join("workspace-planner.json");
-    let today = planner::today_utc();
+    let today = planner::today_local();
     let load_doc = |_: &()| -> Result<PlannerDocument, String> {
         let log = JournalLog::open(&journal_path).map_err(|e| e.to_string())?;
         PlannerDocument::recover(&doc_path, &log, &today)
@@ -782,6 +788,12 @@ fn run_plan(parsed: &slate_app::cli::Args) -> Result<(), String> {
             if !attachments.is_empty() {
                 payload["attachments"] = json!(attachments);
             }
+            // `createItem` stamped `order: nextOrder(day)` — max order among
+            // same-day items + 1 — so new tasks sort after their day-mates
+            // instead of all landing on 0.
+            let doc = load_doc(&())?;
+            let day = planner::safe_day(payload.get("day"), &today);
+            payload["order"] = json!(planner::next_order(doc.items.values(), day.as_deref()));
             let entry = journal
                 .commit("cli", "plan.create", "plan:new", payload)
                 .map_err(|e| e.to_string())?;
@@ -2706,14 +2718,13 @@ fn parse_response(response: &[u8]) -> Result<Value, String> {
 
 /// A second `slate --gui` hands off to the running instance — the shell's
 /// `requestSingleInstanceLock` + `second-instance` → `focusMainWindow`.
-/// Returns true when the running app acknowledged the raise.
-pub fn raise_existing_instance() -> bool {
-    let Ok((url, token)) = control() else {
-        return false;
-    };
-    request(&url, &token, "POST", "/raise", Some(json!({})))
-        .map(|_| ())
-        .is_ok()
+/// `dir` rides along when the invocation named a workspace path (the
+/// shell's `handleSecondInstanceArgs` → `setWorkspaceDir`). `Ok` means the
+/// running app acknowledged the raise; `Err` carries the refusal (a
+/// headless instance has no window to raise).
+pub fn raise_existing_instance(dir: Option<&str>) -> Result<(), String> {
+    let (url, token) = control()?;
+    request(&url, &token, "POST", "/raise", Some(json!({ "dir": dir }))).map(|_| ())
 }
 
 #[cfg(test)]

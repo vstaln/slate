@@ -24,6 +24,7 @@
 
 use crate::journal::JournalEntry;
 use indexmap::IndexMap;
+use serde::Deserialize;
 use serde_json::Value;
 
 pub const MAX_TITLE: usize = 200;
@@ -31,6 +32,34 @@ pub const MAX_NOTE: usize = 4_000;
 pub const MAX_PROJECT: usize = 80;
 pub const MAX_ATTACHMENT: usize = 1_024;
 pub const MAX_ATTACHMENTS: usize = 12;
+
+/// The kanban column an item lives in — `status` in the Electron store.
+/// `done` tracks `status == Done` but `Doing` is the information `done`
+/// alone cannot carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PlanStatus {
+    Todo,
+    Doing,
+    Done,
+}
+
+/// `safeStatus` from the Electron store: anything that is not exactly one of
+/// the three keys is treated as absent, never an error.
+fn lenient_status<'de, D>(deserializer: D) -> Result<Option<PlanStatus>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match Option::<String>::deserialize(deserializer)? {
+        Some(text) => match text.as_str() {
+            "todo" => Some(PlanStatus::Todo),
+            "doing" => Some(PlanStatus::Doing),
+            "done" => Some(PlanStatus::Done),
+            _ => None,
+        },
+        None => None,
+    })
+}
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -45,6 +74,12 @@ pub struct PlanItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub time: Option<String>,
     pub done: bool,
+    #[serde(
+        default,
+        deserialize_with = "lenient_status",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub status: Option<PlanStatus>,
     pub created_by: String,
     pub order: f64,
     pub created_at: f64,
@@ -242,9 +277,22 @@ pub fn normalize_day(value: Option<&Value>, today: &Today) -> Result<Option<Stri
     Ok(Some(format!("{year}-{month:02}-{day:02}")))
 }
 
-/// The forgiving variant used when reviving a stored item.
-fn safe_day(value: Option<&Value>, today: &Today) -> Option<String> {
+/// The forgiving variant used when reviving a stored item — and by emitters
+/// resolving the day a `plan.create` will land on before computing `order`.
+pub fn safe_day(value: Option<&Value>, today: &Today) -> Option<String> {
     normalize_day(value, today).unwrap_or(None)
+}
+
+/// `PlannerStore.nextOrder` — one past the highest `order` among items on the
+/// same day (`undefined`-day items pool together, like the original's `inbox`
+/// grouping). The reducer stores `payload.order` verbatim; the emitters —
+/// HTTP route, CLI, widget op — fill it from this the way `createItem` did.
+pub fn next_order<'a>(items: impl Iterator<Item = &'a PlanItem>, day: Option<&str>) -> f64 {
+    items
+        .filter(|item| item.day.as_deref() == day)
+        .map(|item| item.order)
+        .fold(-1.0, f64::max)
+        + 1.0
 }
 
 pub fn normalize_time(value: Option<&Value>) -> Option<String> {
@@ -302,6 +350,64 @@ fn truncate(value: &str, max: usize) -> String {
     value.chars().take(max).collect()
 }
 
+/// `safeStatus` on a journal payload — only a real string with a real value
+/// counts; `"weird"` or a number is absent, not `todo`.
+fn payload_status(value: Option<&Value>) -> Option<PlanStatus> {
+    match value?.as_str()? {
+        "todo" => Some(PlanStatus::Todo),
+        "doing" => Some(PlanStatus::Doing),
+        "done" => Some(PlanStatus::Done),
+        _ => None,
+    }
+}
+
+/// `resolveCreateStatus` from the Electron store: an explicit status decides
+/// `done`; otherwise `done === true` puts the item in Done, anything else —
+/// including `"true"`, `1`, missing — lands in Todo.
+fn resolve_create_status(payload: Option<&Value>) -> (bool, PlanStatus) {
+    let get = |key: &str| payload.and_then(|p| p.get(key));
+    if let Some(status) = payload_status(get("status")) {
+        return (status == PlanStatus::Done, status);
+    }
+    let done = matches!(get("done"), Some(Value::Bool(true)));
+    (done, if done { PlanStatus::Done } else { PlanStatus::Todo })
+}
+
+/// `resolveStatus` from the Electron store. An explicit status patch wins a
+/// same-call `done`; a `done` patch maps to a column — `done=false` pulls a
+/// Done item back to Todo but leaves a Doing item in Doing. With neither
+/// patch the existing pair survives, filling `status` from `done` the way
+/// `revive()` did for items that predate the field.
+fn resolve_status(
+    patch_done: Option<bool>,
+    patch_status: Option<PlanStatus>,
+    existing_done: bool,
+    existing_status: Option<PlanStatus>,
+) -> (bool, PlanStatus) {
+    if let Some(status) = patch_status {
+        return (status == PlanStatus::Done, status);
+    }
+    if let Some(done) = patch_done {
+        let status = if done {
+            PlanStatus::Done
+        } else {
+            match existing_status {
+                Some(PlanStatus::Doing) => PlanStatus::Doing,
+                _ => PlanStatus::Todo,
+            }
+        };
+        return (done, status);
+    }
+    (
+        existing_done,
+        existing_status.unwrap_or(if existing_done {
+            PlanStatus::Done
+        } else {
+            PlanStatus::Todo
+        }),
+    )
+}
+
 /// One journal entry applied to the planner. Mirrors `PlannerStore.reduce`.
 ///
 /// Returns `Err` when a `plan.update` carries a malformed day, which is what
@@ -342,6 +448,7 @@ pub fn reduce(
                 return Ok(next);
             }
             let attachments = normalize_attachments(get("attachments"));
+            let (done, status) = resolve_create_status(Some(payload));
             let item = PlanItem {
                 id: id.clone(),
                 title,
@@ -349,7 +456,8 @@ pub fn reduce(
                 project: normalize_project(get("project")),
                 day: safe_day(get("day"), today),
                 time: normalize_time(get("time")),
-                done: false,
+                done,
+                status: Some(status),
                 created_by: event.actor_id.clone(),
                 order: coerced_number(get("order")),
                 created_at: event.at as f64,
@@ -394,9 +502,17 @@ pub fn reduce(
                         normalize_time(Some(time))
                     };
                 }
-                if let Some(Value::Bool(done)) = get("done") {
-                    updated.done = *done;
-                }
+                let (done, status) = resolve_status(
+                    match get("done") {
+                        Some(Value::Bool(done)) => Some(*done),
+                        _ => None,
+                    },
+                    payload_status(get("status")),
+                    existing.done,
+                    existing.status,
+                );
+                updated.done = done;
+                updated.status = Some(status);
                 if let Some(order) = strict_number(get("order")) {
                     updated.order = order;
                 }
@@ -418,12 +534,19 @@ pub fn reduce(
         }
         "plan.toggle" => {
             if let Some(existing) = next.get(&target_id).cloned() {
-                let done = match get("done") {
-                    Some(Value::Bool(done)) => *done,
-                    _ => !existing.done,
+                let patch_done = match get("done") {
+                    Some(Value::Bool(done)) => Some(*done),
+                    _ => Some(!existing.done),
                 };
+                let (done, status) = resolve_status(
+                    patch_done,
+                    payload_status(get("status")),
+                    existing.done,
+                    existing.status,
+                );
                 let mut updated = existing.clone();
                 updated.done = done;
+                updated.status = Some(status);
                 updated.updated_at = event.at as f64;
                 updated.version = event
                     .version

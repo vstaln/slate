@@ -146,7 +146,6 @@ fn tool_button(
         .flex_none()
         .w(px(BTN))
         .h(px(BTN))
-        .rounded_xl() // rounded-panel — radiusPanel: 12px
         .flex()
         .items_center()
         .justify_center()
@@ -194,7 +193,6 @@ fn suggestion_row(
         .items_center()
         .gap_2()
         .w_full()
-        .rounded_xl()
         .px(px(10.0))
         .py_2()
         .text_size(px(11.0))
@@ -210,14 +208,15 @@ fn suggestion_row(
             div()
                 .font_family("Departure Mono")
                 .flex_none()
-                // text-accent — the dark theme's accent is plain white.
-                .text_color(rgb(theme::hex(theme::text::NORMAL)))
+                // text-accent — the one hue, graysite's sand.
+                .text_color(rgb(theme::hex(theme::accent::SAND)))
                 .child(format!("{prefix}{kind}")),
         )
         .child(
             div()
                 .ml_auto()
                 .min_w_0()
+                .font_family("Departure Mono")
                 .text_size(px(10.0))
                 .text_color(rgb(theme::hex(theme::text::FAINT)))
                 .truncate()
@@ -240,8 +239,9 @@ fn suggestion_row(
     row
 }
 
-/// One swatch (`h-5 w-5 rounded-pill border`) — the picked color gets the
-/// accent border (white in this theme) the original drew at `scale-110`.
+/// One swatch (`h-5 w-5 rounded-pill border` in the shell, square here) —
+/// the picked color gets the sand accent border the original drew at
+/// `scale-110`.
 /// Click emits `stroke:<n>`; the original also forced `tool = "draw"`,
 /// moot here because the row only exists while draw is active.
 fn swatch(
@@ -257,10 +257,9 @@ fn swatch(
         .flex_none()
         .w(px(SWATCH))
         .h(px(SWATCH))
-        .rounded_full()
         .border_1()
         .border_color(rgb(theme::hex(if selected {
-            theme::text::NORMAL // border-accent
+            theme::accent::SAND // border-accent
         } else {
             theme::hairline::FAINT // border-line
         })))
@@ -296,7 +295,6 @@ fn zoom_button(
         .h(px(ZOOM_BTN))
         .min_w(px(min_w))
         .px_1()
-        .rounded_xl()
         .flex()
         .items_center()
         .justify_center()
@@ -351,7 +349,6 @@ pub fn toolbar_pane(
         .flex_row()
         .items_center()
         .gap_1()
-        .rounded_xl()
         .border_1()
         .border_color(rgb(theme::hex(theme::hairline::FAINT)))
         .bg(rgba(GLASS))
@@ -390,7 +387,6 @@ pub fn toolbar_pane(
             .min_w(px(250.0))
             .flex()
             .flex_col()
-            .rounded_xl()
             .border_1()
             .border_color(rgb(theme::hex(theme::hairline::FAINT)))
             .bg(rgba(PANEL_95))
@@ -421,7 +417,6 @@ pub fn toolbar_pane(
             .flex_row()
             .items_center()
             .gap(px(6.0))
-            .rounded_xl()
             .border_1()
             .border_color(rgb(theme::hex(theme::hairline::FAINT)))
             .bg(rgba(0x121212E5)) // bg-bg-raise/90
@@ -450,6 +445,7 @@ pub fn toolbar_pane(
         let menu_label = |text: &'static str| {
             div()
                 .px_1()
+                .font_family("Departure Mono")
                 .text_size(px(10.0))
                 .font_weight(gpui::FontWeight::SEMIBOLD)
                 .text_color(rgb(theme::hex(theme::text::FAINT)))
@@ -470,8 +466,8 @@ pub fn toolbar_pane(
                 .flex_row()
                 .items_center()
                 .gap_2()
-                .rounded_xl()
                 .px_2()
+                .font_family("Departure Mono")
                 .text_size(px(11.0))
                 .text_color(rgb(theme::hex(theme::text::DIM)))
                 .child(
@@ -513,7 +509,6 @@ pub fn toolbar_pane(
             .flex()
             .flex_col()
             .gap_2()
-            .rounded_xl()
             .border_1()
             .border_color(rgb(theme::hex(theme::hairline::FAINT)))
             .bg(rgba(PANEL_95))
@@ -546,7 +541,7 @@ pub fn toolbar_pane(
                     .child(menu_row(
                         "slate-menu-settings",
                         "settings",
-                        "Settings".to_owned(),
+                        "SETTINGS".to_owned(),
                         "settings",
                         enabled,
                         cx,
@@ -575,12 +570,12 @@ pub fn toolbar_pane(
                 .flex()
                 .flex_col()
                 .gap_1()
-                .rounded_xl()
                 .bg(rgb(theme::hex(theme::monochrome::SURFACE))) // bg-bg-raise
                 .px_2()
                 .py(px(6.0))
                 .child(
                     div()
+                        .font_family("Departure Mono")
                         .text_size(px(10.0))
                         .text_color(rgb(theme::hex(theme::text::FAINT)))
                         .child(label),
@@ -590,6 +585,7 @@ pub fn toolbar_pane(
                         .h(px(24.0))
                         .min_w_0()
                         .truncate()
+                        .font_family("Departure Mono")
                         .text_size(px(11.0))
                         .text_color(rgb(theme::hex(theme::text::NORMAL)))
                         .child(value),
@@ -597,11 +593,11 @@ pub fn toolbar_pane(
         };
         let mut mode_block = select_block(
             "slate-menu-mode",
-            "Mode",
+            "MODE",
             if state.message_mode {
-                "Message".to_owned()
+                "MESSAGE".to_owned()
             } else {
-                "Command".to_owned()
+                "COMMAND".to_owned()
             },
         );
         if enabled {
@@ -638,7 +634,7 @@ pub fn toolbar_pane(
                 .clone()
                 .unwrap_or_else(|| state.terminals[at].1.clone())
         };
-        let mut terminal_block = select_block("slate-menu-terminal", "Terminal", title);
+        let mut terminal_block = select_block("slate-menu-terminal", "TERMINAL", title);
         if let (true, Some(next)) = (enabled, next) {
             terminal_block = terminal_block
                 .cursor_pointer()
@@ -678,15 +674,15 @@ pub fn toolbar_pane(
                 .flex_row()
                 .items_center()
                 .justify_between()
-                .rounded_xl()
                 .bg(rgb(theme::hex(theme::monochrome::SURFACE)))
                 .px_2()
                 .py_1()
                 .child(
                     div()
+                        .font_family("Departure Mono")
                         .text_size(px(10.0))
                         .text_color(rgb(theme::hex(theme::text::FAINT)))
-                        .child("Canvas zoom"),
+                        .child("CANVAS ZOOM"),
                 )
                 .child(
                     div()
@@ -745,8 +741,8 @@ pub fn toolbar_pane(
             .flex_row()
             .items_center()
             .gap_2()
-            .rounded_xl()
             .px_2()
+            .font_family("Departure Mono")
             .text_size(px(11.0))
             .text_color(rgb(theme::hex(theme::text::DIM)))
             .child(
@@ -758,7 +754,7 @@ pub fn toolbar_pane(
                         theme::hex(theme::text::FAINT),
                     )),
             )
-            .child("Clear all drawings");
+            .child("CLEAR ALL DRAWINGS");
         if enabled && state.has_strokes {
             clear_row = clear_row
                 .cursor_pointer()
@@ -808,6 +804,7 @@ pub fn toolbar_pane(
             .flex()
             .flex_row()
             .items_center()
+            .justify_center()
             .gap_1()
             .px_1()
             .text_size(px(11.0))
@@ -846,14 +843,13 @@ pub fn toolbar_pane(
         strip = strip.child(input);
     }
 
-    // ── `↵` submit — `h-7 w-7 rounded-pill`, gated on `canSubmit` ─────────
+    // ── `↵` submit — `h-7 w-7 rounded-pill` in the shell, square here ─────
     {
         let mut el = div()
             .id("slate-command-submit")
             .flex_none()
             .w(px(28.0))
             .h(px(28.0))
-            .rounded_full()
             .flex()
             .items_center()
             .justify_center()
@@ -908,14 +904,13 @@ pub fn toolbar_pane(
             cx,
         ));
 
-    // ── `⋯` — `toolbar-more`, `h-8 w-8 rounded-pill`, menu toggle ─────────
+    // ── `⋯` — `toolbar-more`, `h-8 w-8 rounded-pill`, square, menu toggle ──
     {
         let mut el = div()
             .id("slate-toolbar-more")
             .flex_none()
             .w(px(BTN))
             .h(px(BTN))
-            .rounded_full()
             .flex()
             .items_center()
             .justify_center()

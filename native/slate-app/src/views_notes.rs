@@ -80,13 +80,22 @@ fn add_note() -> Result<String, String> {
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let order = items.len() as f64;
+    // `NotesStore.nextOrder` — max+1 over surviving items, not `len`, which
+    // collides after a delete.
+    let order = items
+        .iter()
+        .filter_map(|item| item.get("order").and_then(Value::as_f64))
+        .fold(-1.0, f64::max)
+        + 1.0;
     let mut items = items;
+    // `color` is always resolved in the store — no category here, so the
+    // palette default applies (DEFAULT_NOTE_COLOR).
     items.push(json!({
         "id": id,
         "title": "New note",
         "body": "",
         "tags": [],
+        "color": format!("#{DEFAULT_COLOR:06x}"),
         "createdBy": "slate",
         "order": order,
         "createdAt": now,
@@ -229,7 +238,6 @@ fn note_card<'a>(
         .flex_row()
         .gap_2()
         .overflow_hidden()
-        .rounded_md()
         .py_1()
         .cursor_pointer()
         .when(expanded, |el| {
@@ -240,7 +248,6 @@ fn note_card<'a>(
         div()
             .w(px(3.0))
             .flex_none()
-            .rounded_full()
             .bg(rgb(row.color)),
     );
 
@@ -269,7 +276,6 @@ fn note_card<'a>(
             div()
                 .flex_none()
                 .px_1()
-                .rounded_md()
                 .text_xs()
                 .text_color(rgb(theme::hex(theme::text::FAINT)))
                 .hover(|el| {
@@ -321,7 +327,6 @@ fn note_card<'a>(
                     .flex_row()
                     .items_center()
                     .gap_1()
-                    .rounded_full()
                     .bg(rgb(theme::hex(theme::monochrome::RAISED)))
                     .px_2()
                     .child(div().size(px(5.0)).rounded_full().bg(rgb(row.color)))
@@ -384,7 +389,6 @@ pub fn notes_pane(
                 let wid = wid.clone();
                 div()
                     .px_1()
-                    .rounded_md()
                     .cursor_pointer()
                     .text_xs()
                     .text_color(rgb(theme::hex(theme::text::DIM)))

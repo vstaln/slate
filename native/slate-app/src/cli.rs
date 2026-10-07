@@ -126,25 +126,10 @@ impl Args {
                 index += 1;
                 continue;
             }
-            if matches!(
-                stripped,
-                "json"
-                    | "all"
-                    | "close"
-                    | "open"
-                    | "ready"
-                    | "wait"
-                    | "yes"
-                    | "tasks"
-                    | "messages"
-                    | "full"
-            ) {
-                args.flags.insert(camel(stripped), Value::Bool(true));
-                index += 1;
-                continue;
-            }
-            // A following token that is itself a flag means this one is a bare
-            // boolean, not a flag whose value happens to look like a flag.
+            // orc.mjs consumes the next token as this flag's value for ANY
+            // `--flag` — `slate reset --all junk` sets `all: "junk"` (and
+            // reset then fails 'invalid') rather than leaving `junk` as a
+            // positional. A following `--` token means bare boolean.
             let next = argv.get(index + 1);
             match next {
                 Some(value) if !value.starts_with("--") => {
@@ -362,9 +347,9 @@ pub fn plan(command: &str, args: &Args) -> CommandResult<Plan> {
         "terminal" | "term" => {
             let Some(action) = args.positionals().get(1).map(String::as_str) else {
                 // orc treats a bare `orc terminal` like any other unknown
-                // action rather than implying `list`.
+                // action rather than implying `list` — code `invalid`.
                 return Err(CommandError::new(
-                    ErrorCode::UnknownCommand,
+                    ErrorCode::Invalid,
                     "terminal: unknown action \"undefined\"",
                 ));
             };
@@ -998,6 +983,12 @@ const KNOWN_COMMANDS: &[&str] = &[
     "screenshot",
     "shot",
 ];
+
+/// True when `word` is a real command or alias — `slate <path>` uses this
+/// so a directory named `canvas` in cwd does not hijack the verb.
+pub fn is_known_command(word: &str) -> bool {
+    KNOWN_COMMANDS.contains(&word)
+}
 
 /// Levenshtein distance, capped at a best match — the same "did you mean"
 /// slate.mjs prints for a mistyped command.

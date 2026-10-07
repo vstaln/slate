@@ -45,11 +45,18 @@ fn timers_path() -> std::path::PathBuf {
     slate_app::ipc::user_data_dir().join("workspace-timers.json")
 }
 
+/// Serializes the read-modify-write below: the file holds one map for every
+/// timer widget, so an unlocked RMW can drop a sibling's concurrent update.
+static TIMERS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Read-modify-write this widget's timer entry, preserving every other
 /// widget's state and any fields the pane does not model (the original's
 /// `isCustom`, `label`, …). Temp-file rename keeps a concurrent reader from
 /// meeting a truncated file.
 fn mutate_entry(widget_id: &str, mutate: impl FnOnce(&mut serde_json::Map<String, Value>, f64)) {
+    let _guard = TIMERS_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     let path = timers_path();
     let mut document = slate_app::ipc::read_store_recovered(&path)
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
@@ -122,7 +129,6 @@ fn timer_button(
     div()
         .px_2()
         .py(px(2.0))
-        .rounded_md()
         .border_1()
         .border_color(rgb(theme::hex(theme::hairline::SOFT)))
         .cursor_pointer()
@@ -177,14 +183,12 @@ fn progress_bar(fraction: f32, color: u32) -> impl IntoElement {
     div()
         .h(px(6.0))
         .w_full()
-        .rounded_full()
         .overflow_hidden()
         .bg(rgb(theme::hex(theme::monochrome::RAISED)))
         .child(
             div()
                 .h_full()
                 .w(relative(fraction.clamp(0.0, 1.0)))
-                .rounded_full()
                 .bg(rgb(color)),
         )
 }

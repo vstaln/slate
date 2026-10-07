@@ -2474,6 +2474,26 @@ fn planner_route(request: &Request, segments: &[String], deps: &mut RouteDeps<'_
                     }
                 }
             }
+            // `createItem` stamped `order: nextOrder(day)` — max order among
+            // same-day items + 1 — so new items sort after their day-mates.
+            {
+                let env = match environment(
+                    deps,
+                    "POST /planner",
+                    "the planner folds the journal",
+                ) {
+                    Ok(env) => env,
+                    Err(response) => return response,
+                };
+                if let Ok(items) = plan_items(env) {
+                    let day = crate::planner::safe_day(
+                        payload.get("day"),
+                        &crate::planner::today_local(),
+                    );
+                    payload["order"] =
+                        json!(crate::planner::next_order(items.iter(), day.as_deref()));
+                }
+            }
             // The TypeScript target was `plan:new` and the reducer minted the
             // id from the entry's stamp — keeping that means the committed
             // row is the id the fold will know it by.

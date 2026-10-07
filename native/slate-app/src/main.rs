@@ -8,12 +8,14 @@ pub mod engine;
 pub mod webview;
 pub mod views_browser;
 pub mod views_calendar;
+pub mod views_code;
 pub mod views_files;
 pub mod views_image;
 pub mod views_kanban;
 pub mod views_links;
 pub mod views_notes;
 pub mod views_orchestration;
+pub mod views_overview;
 pub mod views_planner;
 pub mod views_settings;
 pub mod views_sidebar;
@@ -38,9 +40,16 @@ use std::thread;
 fn main() -> Result<()> {
     env_logger::init();
     let args: Vec<String> = std::env::args().skip(1).collect();
-    // The app only starts when the args are nothing but app flags — any CLI
-    // verb (even next to `--headless`) still dispatches to cli_run.
-    let app_mode = args.iter().all(|arg| arg == "--gui" || arg == "--headless");
+    // `slate <path>` — the shell's `handleSecondInstanceArgs` scan: a lone
+    // existing path is a workspace handoff, never a CLI verb. Only a single
+    // non-flag token counts (a mixed argv is a CLI invocation) and known
+    // verbs win outright — the shell never had the collision because `orc`
+    // was a separate binary.
+    let workspace_arg = workspace_dir_arg(&args);
+    // The app only starts when the args are nothing but app flags or a
+    // workspace path — any CLI verb still dispatches to cli_run.
+    let app_mode = args.iter().all(|arg| arg == "--gui" || arg == "--headless")
+        || workspace_arg.is_some();
     let headless = app_mode
         && (args.iter().any(|arg| arg == "--headless")
             || std::env::var_os("SLATE_HEADLESS").is_some());
@@ -143,15 +152,28 @@ fn main() -> Result<()> {
         .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
     let manager = TerminalManager::new(token.clone());
     let _manager_keepalive = manager.clone();
+    // Known before the platform is built and needed by `/raise` sooner: a
+    // headless instance must refuse raises or a second `slate` exits
+    // believing a window came forward.
+    manager.set_headless(headless);
     let control = match ControlServer::start(manager.clone(), token.clone()) {
         Ok(control) => control,
         Err(error) => {
             // Single-instance handoff, same as the shell's
             // requestSingleInstanceLock → second-instance → focusMainWindow:
             // ask the running window to raise, then leave quietly.
-            if error.contains("already running") && cli_run::raise_existing_instance() {
-                eprintln!("another Slate instance is already running — raised it");
-                return Ok(());
+            if error.contains("already running") {
+                match cli_run::raise_existing_instance(workspace_arg.as_deref()) {
+                    Ok(()) => {
+                        eprintln!("another Slate instance is already running — raised it");
+                        return Ok(());
+                    }
+                    Err(reason) => {
+                        return Err(anyhow::Error::msg(format!(
+                            "another Slate instance is already running but raised no window ({reason}) — stop it and retry"
+                        )));
+                    }
+                }
             }
             return Err(anyhow::Error::msg(error));
         }
@@ -164,6 +186,15 @@ fn main() -> Result<()> {
         eprintln!("cannot publish control token: {error}");
     }
     manager.set_control_socket(control.socket_path());
+    // Cold-start `slate <path>`: persist the workspace before `ensure()`
+    // can adopt the launch dir — the same `setWorkspaceDir` the running
+    // instance would have applied had it been up.
+    if let Some(dir) = workspace_arg {
+        let mut state = slate_app::workspace::WorkspaceState::load();
+        if state.set_workspace_dir(Some(dir)) {
+            state.save();
+        }
+    }
     // Workspace adoption runs once, here: after the single-instance
     // handoff above (a second instance has already returned, so it can
     // never retag the journal) and before the canvas fold inside
@@ -238,12 +269,30 @@ fn main() -> Result<()> {
         ]) {
             eprintln!("font registration failed: {error}");
         }
+        // gpui's implicit placement fell back to a ~300px box under this
+        // WM; size the first window to most of the primary display
+        // instead. A resize still wins after the window exists.
+        let window_bounds = cx
+            .primary_display()
+            .map(|display| {
+                let bounds = display.bounds();
+                let size = gpui::size(
+                    bounds.size.width * 0.8,
+                    bounds.size.height * 0.8,
+                );
+                let origin = gpui::point(
+                    bounds.origin.x + (bounds.size.width - size.width) / 2.0,
+                    bounds.origin.y + (bounds.size.height - size.height) / 2.0,
+                );
+                gpui::WindowBounds::Windowed(gpui::Bounds::new(origin, size))
+            });
         cx.open_window(
             gpui::WindowOptions {
                 titlebar: Some(gpui::TitlebarOptions {
                     title: Some("Slate".into()),
                     ..Default::default()
                 }),
+                window_bounds,
                 // WM_CLASS on X11: rofi's window mode and desktop-file
                 // matching both key off it, and an unset class is why the
                 // window used to group as nothing.
@@ -352,6 +401,39 @@ enum EngineEvent {
         id: Option<String>,
         error: Option<String>,
     },
+}
+
+/// `slate <path>` workspace resolution — the shell's
+/// `handleSecondInstanceArgs` candidate scan: a lone non-flag token that
+/// exists on disk resolves to itself (a directory) or its parent (a file).
+/// URLs and known CLI verbs are excluded; a mixed argv is a CLI
+/// invocation, not a handoff.
+fn workspace_dir_arg(args: &[String]) -> Option<String> {
+    let non_flags: Vec<&str> = args
+        .iter()
+        .filter(|arg| !arg.starts_with('-'))
+        .map(String::as_str)
+        .collect();
+    let [arg] = non_flags[..] else {
+        return None;
+    };
+    if arg.contains("://") || slate_app::cli::is_known_command(arg) {
+        return None;
+    }
+    let path = std::path::Path::new(arg);
+    if !path.exists() {
+        return None;
+    }
+    let dir = if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        path.parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(std::path::Path::new("."))
+            .to_path_buf()
+    };
+    let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
+    Some(dir.to_string_lossy().into_owned())
 }
 
 fn default_cols() -> u16 {
