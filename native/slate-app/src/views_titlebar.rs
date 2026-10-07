@@ -35,15 +35,9 @@
 //!   executor every `GIT_POLL_EVERY` like the shell's 8s focused poll.
 //!   The checkout panel isn't ported; a click repolls and flashes the
 //!   branch/dirty summary the original showed as a tooltip.
-//! - **Sidebar toggle** — kept in the left cluster where the shell's
-//!   code-view toggle sat; it's the only left chrome with a command.
-//! - **Arrange** — already ported, as the status bar's `arrange:` chip.
-//! - **Workspace name** — the `role="status"` slot's stand-in: the
-//!   original's transient flash text was the only left-side text, so the
-//!   folder name rides there as the title a native title bar shows.
-//! - **presence** — the count is `snapshots.len()` (live terminals); the
-//!   original's closest kin was the git dirty dot, so this renders the
-//!   same way — a status dot + dim count — and hides at `0`.
+//! - **Arrange** — the `LayoutGrid` button between flip and git; its menu
+//!   is `CanvasView`'s `arrange_menu` re-anchored under the bar, where
+//!   the shell's `top-[36px]` popover sat.
 //!
 //! Every control dispatches through `CanvasView::titlebar_command`
 //! (`cx.listener`, `json!` payloads): "undo"/"redo" pop the history
@@ -180,10 +174,6 @@ pub fn read_git_chip(dir: &std::path::Path) -> GitChip {
 /// What the bar needs from `CanvasView` — same role as
 /// `views_toolbar::ToolbarState`: plain data in, one element out.
 pub struct TitlebarState<'a> {
-    /// `workspace::current()` — its basename fills the title slot.
-    pub workspace_dir: &'a std::path::Path,
-    /// Live terminal count for the presence badge; `0` hides it.
-    pub presence_count: usize,
     /// `undo_stack`/`redo_stack` non-empty — the history arrows' enabled.
     pub can_undo: bool,
     pub can_redo: bool,
@@ -518,27 +508,11 @@ fn window_button(
         )
 }
 
-/// The bar. `state.workspace_dir`'s basename is the left title text (the
-/// full path only standing in when the basename is empty, e.g. `/`);
-/// everything else the shell drew is covered in the module doc.
+/// The bar. Everything the shell drew is covered in the module doc.
 pub fn titlebar_pane(
     state: &TitlebarState,
     cx: &mut Context<crate::canvas_view::CanvasView>,
 ) -> impl IntoElement {
-    let workspace_name = state
-        .workspace_dir
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .filter(|n| !n.is_empty())
-        .unwrap_or_else(|| {
-            let full = state.workspace_dir.to_string_lossy().into_owned();
-            if full.is_empty() {
-                "Slate".to_owned()
-            } else {
-                full
-            }
-        });
-
     // `title-bar-shell`: grid 1fr|auto|1fr → flex with equal flex-1
     // sides, which centres the middle column the same way. `pl-2`, macOS
     // grows it to 78px for the traffic lights (the bundle's `vt` branch).
@@ -561,9 +535,9 @@ pub fn titlebar_pane(
             }),
         );
 
-    // Left: `title-bar-history-switch` (Undo/Redo) then the sidebar
-    // toggle in the code-view pill's slot, the `role="status"` title
-    // text, and the drag spacer.
+    // Left: `title-bar-history-switch` (Undo/Redo), then the drag
+    // spacer — the shell's flash text only sits here while a notice is
+    // live, and that slot renders through `notice` instead.
     let left = div()
         .flex_1()
         .min_w_0()
@@ -576,26 +550,6 @@ pub fn titlebar_pane(
             pill_wrap()
                 .child(history_button("←", "undo", state.can_undo, cx))
                 .child(history_button("→", "redo", state.can_redo, cx)),
-        )
-        .child(pill_wrap().child(action_button("◧", "sidebar", cx)))
-        .child(
-            // `role="status"` — the flash slot. 13px medium, and it drags
-            // like a native title bar.
-            div()
-                .min_w_0()
-                .flex_none()
-                .text_size(px(13.0))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(rgb(theme::hex(theme::text::NORMAL)))
-                .truncate()
-                .child(workspace_name)
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|_this, _event, window, cx| {
-                        cx.stop_propagation();
-                        window.start_window_move();
-                    }),
-                ),
         )
         .child(drag_space(cx));
 
@@ -613,8 +567,8 @@ pub fn titlebar_pane(
                 .child(view_tab("Overview", "overview", false, false, cx)),
         );
 
-    // Right: drag space, live count, the flip toggle, the git pill,
-    // settings, divider, window controls — the shell's island order.
+    // Right: drag space, the flip toggle, the Arrange menu, the git
+    // pill, divider, window controls — the shell's island order.
     let mut right = div()
         .flex_1()
         .min_w_0()
@@ -624,32 +578,6 @@ pub fn titlebar_pane(
         .items_center()
         .justify_end()
         .child(drag_space(cx));
-
-    if state.presence_count > 0 {
-        right = right.child(
-            div()
-                .flex_none()
-                .h(px(BUTTON_H))
-                .px_2()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_1()
-                .child(
-                    div()
-                        .w(px(6.0))
-                        .h(px(6.0))
-                        .rounded_full()
-                        .bg(rgb(theme::hex(theme::status::OK))),
-                )
-                .child(
-                    div()
-                        .text_size(px(11.0))
-                        .text_color(rgb(theme::hex(theme::text::FAINT)))
-                        .child(format!("{} live", state.presence_count)),
-                ),
-        );
-    }
 
     right = right
         .child(
@@ -661,10 +589,15 @@ pub fn titlebar_pane(
         .child(
             div()
                 .flex_none()
+                .mr(px(4.0))
+                .child(pill_wrap().child(action_button("▦", "arrange", cx))),
+        )
+        .child(
+            div()
+                .flex_none()
                 .mx(px(4.0))
                 .child(pill_wrap().child(git_button(state.git, cx))),
-        )
-        .child(action_button("⚙", "settings", cx));
+        );
 
     // `!vt` — window controls exist only off macOS, flush to the right
     // edge (`pr-0`). Separator: `mx-0.5 h-4 w-px bg-line-soft/80`.

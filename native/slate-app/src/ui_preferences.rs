@@ -38,7 +38,7 @@ pub struct UiPreferences {
 impl Default for UiPreferences {
     fn default() -> Self {
         Self {
-            sidebar_open: true,
+            sidebar_open: false,
             auto_names: true,
             layout: CodeLayout::Auto,
             three_way_split: [0.5, 0.5],

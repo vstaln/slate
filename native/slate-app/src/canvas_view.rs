@@ -377,6 +377,8 @@ pub struct CanvasView {
     name_copied_at: Option<(String, Instant)>,
     /// The `/` command bar's text buffer while it is open.
     command_bar: Option<String>,
+    /// The toolbar's `⋯` overflow menu — workspace/target/zoom/strokes.
+    toolbar_overflow: bool,
     /// The shell's suggestion-highlight index — ↑/↓ in command mode and
     /// the listbox's `aria-selected` row. Resets when the query changes.
     command_suggestion: usize,
@@ -826,9 +828,11 @@ impl CanvasView {
             camera_dirty_at: None,
             menu: None,
             menu_sel: 0,
+            // The shell's `useState<CanvasTool>('select')` — select is the
+            // resting tool; every-false is the explicit `pan` tool.
             draw_mode: false,
             erase_mode: false,
-            select_mode: false,
+            select_mode: true,
             snap_guides: None,
             drop_point: None,
             notice: None,
@@ -844,6 +848,7 @@ impl CanvasView {
             agent_menu: None,
             name_copied_at: None,
             command_bar: None,
+            toolbar_overflow: false,
             command_suggestion: 0,
             command_message: false,
             command_target,
@@ -1550,6 +1555,12 @@ impl CanvasView {
                     }
                 }
             }
+            // The Arrange `LayoutGrid` button — opens the mode menu that
+            // used to ride the status bar chip; the popover anchors under
+            // the bar, the shell's `top-[36px]` drop.
+            "arrange" => {
+                self.arrange_menu = !self.arrange_menu;
+            }
             // `orcspace-flip-terminals` — localStorage in the shell, the
             // persisted `terminalsFlipped` pref here; widget bodies draw
             // the flip card while it's on.
@@ -1751,16 +1762,14 @@ impl CanvasView {
         cx: &mut Context<Self>,
     ) {
         if let Some(tool) = action.strip_prefix("tool:") {
-            // One tool at a time, the shell's single `tool` state; picking
-            // the active tool again turns it off.
-            let toggling = match tool {
-                "draw" => self.draw_mode,
-                "erase" => self.erase_mode,
-                _ => self.select_mode,
-            };
-            self.draw_mode = tool == "draw" && !toggling;
-            self.erase_mode = tool == "erase" && !toggling;
-            self.select_mode = tool == "select" && !toggling;
+            // The shell's single `tool` state — `pan` is all-false, and
+            // picking the active tool is a no-op, never an off-toggle.
+            self.draw_mode = tool == "draw";
+            self.erase_mode = tool == "erase";
+            self.select_mode = tool == "select";
+            if !self.draw_mode {
+                self.pending_stroke.clear();
+            }
             cx.notify();
             return;
         }
@@ -1788,6 +1797,37 @@ impl CanvasView {
             cx.notify();
             return;
         }
+        if action == "submit" {
+            // The `↵` button — `submitCommand`'s onSubmit without the
+            // keypress; identical to Enter.
+            self.submit_command_bar(self.viewport, cx);
+            cx.notify();
+            return;
+        }
+        if action == "overflow" {
+            self.toolbar_overflow = !self.toolbar_overflow;
+            cx.notify();
+            return;
+        }
+        if action == "workspace:pick" {
+            self.toolbar_overflow = false;
+        }
+        if action == "settings" {
+            self.toolbar_overflow = false;
+            self.settings_open = true;
+            cx.notify();
+            return;
+        }
+        if action == "clear_strokes" {
+            // `tool-clear-strokes` — `canvas.clearStrokes`, journaled.
+            if !self.canvas.strokes.is_empty() {
+                self.canvas.strokes.clear();
+                self.commit_strokes();
+            }
+            self.toolbar_overflow = false;
+            cx.notify();
+            return;
+        }
         if let Some(mode) = action.strip_prefix("mode:") {
             self.command_message = mode == "message";
             // Mode change resets the suggestion highlight — the shell's
@@ -1801,17 +1841,12 @@ impl CanvasView {
         }
         let center = Pos2::new(self.viewport.x / 2.0, self.viewport.y / 2.0);
         match action {
-            "clear_strokes" => {
-                self.canvas.strokes.clear();
-                self.commit_strokes();
-            }
             "zoom_in" => zoom_at(&mut self.canvas.camera, Pos2::ZERO, center, 1.2),
             "zoom_out" => zoom_at(&mut self.canvas.camera, Pos2::ZERO, center, 1.0 / 1.2),
             "zoom_reset" => self.canvas.camera.zoom = 1.0,
             "fit" => self.fit(self.viewport, cx),
             "undo" => self.undo(false),
             "redo" => self.undo(true),
-            "settings" => self.settings_open = !self.settings_open,
             "focus_input" => {
                 if self.command_bar.is_none() {
                     self.command_bar = Some(String::new());
@@ -2707,6 +2742,61 @@ impl CanvasView {
             });
         self.command_bar = Some(format!("{prefix}{kind} "));
         self.command_suggestion = 0;
+    }
+
+    /// `submitCommand` — the form's Enter/↵ path, shared by the keypress
+    /// and the toolbar's submit button. A highlighted suggestion whose
+    /// name isn't yet the typed token is adopted, not run.
+    fn submit_command_bar(&mut self, viewport: Vec2, cx: &mut Context<Self>) {
+        let typed = self
+            .command_bar
+            .as_deref()
+            .and_then(|b| {
+                b.trim_start()
+                    .split_whitespace()
+                    .next()
+                    .map(|t| t.trim_start_matches(['/', '.', '@']).to_lowercase())
+            })
+            .unwrap_or_default();
+        let suggestions = self.command_suggestions();
+        let picked = suggestions
+            .get(self.command_suggestion.min(suggestions.len().saturating_sub(1)))
+            .map(|(kind, _, _)| kind.as_str());
+        if picked.is_some_and(|kind| kind != typed) {
+            self.adopt_suggestion();
+            cx.notify();
+            return;
+        }
+        let buffer = self.command_bar.take().unwrap_or_default();
+        // `if (!value) return` — an empty submit kept the input and its
+        // text; reopen with the buffer untouched.
+        if buffer.trim().is_empty() {
+            self.command_bar = Some(buffer);
+            cx.notify();
+            return;
+        }
+        let target = self.command_target_terminal();
+        if self.command_message {
+            // Message mode writes the text verbatim — no trailing `\r`
+            // (`mode === 'message' ? command : …`).
+            if let Some(target) = target.as_deref() {
+                let _ = self.manager.write_text(target, &buffer, false);
+            }
+            self.command_message = false;
+        } else if let Some((kind, initial)) =
+            parse_widget_invocation(&buffer, self.settings.command_prefix())
+        {
+            self.create_widget_from_command(kind, &initial, viewport, cx);
+        } else if let Some(target) = target.as_deref() {
+            // A non-invocation line in command mode is terminal input —
+            // the original's `${command}\r` write.
+            let _ = self.manager.write_text(target, &buffer, true);
+        } else {
+            // Nothing to receive it — a miss keeps the bar open so a
+            // typo can be fixed, like the disabled submit.
+            self.command_bar = Some(buffer);
+        }
+        cx.notify();
     }
 
     /// Transient toast — the shell's `notice` state: cap hits, control-route
@@ -4252,7 +4342,9 @@ impl Render for CanvasView {
         let rail_w = if self.prefs.sidebar_open {
             theme::geometry::SIDEBAR_EXPANDED
         } else {
-            theme::geometry::RAIL_WIDTH
+            // The shell's `<Sidebar>` only mounts off-canvas — a closed
+            // sidebar is no strip at all, not the collapsed rail.
+            0.0
         };
         let browser_clip = if self.settings_open || splash_t.is_some() {
             Bounds::default()
@@ -5149,6 +5241,19 @@ impl Render for CanvasView {
                 })
                 .filter(|name| !name.is_empty())
                 .unwrap_or_else(|| "No folder".to_owned());
+            // `canSubmit`: a non-empty buffer plus either a live target or
+            // a parseable widget invocation in command mode.
+            let can_submit = {
+                let trimmed = buffer.trim();
+                !trimmed.is_empty()
+                    && (self.command_target_terminal().is_some()
+                        || (!message
+                            && parse_widget_invocation(
+                                trimmed,
+                                self.settings.command_prefix(),
+                            )
+                            .is_some()))
+            };
             let state = crate::views_toolbar::ToolbarState {
                 buffer: buffer.clone(),
                 open,
@@ -5157,8 +5262,9 @@ impl Render for CanvasView {
                 terminals,
                 tool: tool.to_owned(),
                 stroke_color: self.stroke_color,
-                can_undo: !self.undo_stack.is_empty(),
-                can_redo: !self.redo_stack.is_empty(),
+                can_submit,
+                has_strokes: !self.canvas.strokes.is_empty(),
+                overflow_open: self.toolbar_overflow,
                 zoom_percent: (self.canvas.camera.zoom * 100.0).round().max(0.0) as u32,
                 workspace_name,
                 suggestions: if message {
@@ -5399,10 +5505,10 @@ impl Render for CanvasView {
             }
         }
 
-        // StatusBar: the 22px bottom strip that was never a widget — right
-        // aligned CPU%, zoom, widget count and the local clock.
-        let widget_count = self.canvas.widgets.len();
-        let zoom_label = canvas::zoom_label(&view);
+        // StatusBar: the shell's 22px bottom strip — right-aligned,
+        // nothing but the threshold-coloured CPU% and the local clock
+        // (`StatusBar.tsx`: `justify-end gap-3`, `text-[10px] text-text-faint`,
+        // clock `text-text-dim`).
         let (hh, mm, ss) = clock_hms();
         root = root.child(
             div()
@@ -5417,7 +5523,7 @@ impl Render for CanvasView {
                 .justify_end()
                 .gap(px(12.0))
                 .px_3()
-                .bg(rgb(theme::hex(theme::monochrome::BASE)))
+                .bg(rgba((theme::hex(theme::monochrome::BASE) << 8) | 0xE5))
                 .border_t_1()
                 .border_color(rgb(theme::hex(theme::hairline::SOFT)))
                 .text_size(px(10.0))
@@ -5426,29 +5532,6 @@ impl Render for CanvasView {
                     cx.listener(|_this, _event, _window, cx| {
                         cx.stop_propagation();
                     }),
-                )
-                // The TitleBar arrange menu — a chip that opens the four
-                // modes over the status bar.
-                .child(
-                    div()
-                        .id("slate-arrange-chip")
-                        .px_2()
-                        .py(px(2.0))
-                        .cursor_pointer()
-                        .text_color(rgb(theme::hex(theme::text::FAINT)))
-                        .hover(|s| s.text_color(rgb(theme::hex(theme::text::NORMAL))))
-                        .child(format!(
-                            "arrange: {}",
-                            self.prefs.arrange_mode.label().to_lowercase()
-                        ))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _event, _window, cx| {
-                                cx.stop_propagation();
-                                this.arrange_menu = !this.arrange_menu;
-                                cx.notify();
-                            }),
-                        ),
                 )
                 .when_some(self.cpu_percent, |bar, pct| {
                     bar.child(
@@ -5463,88 +5546,74 @@ impl Render for CanvasView {
                             .child(format!("{pct}%")),
                     )
                 })
-                // The active tool, where the shell's Toolbar showed it —
-                // "draw" carries the current swatch so the picked color is
-                // visible without a palette row.
-                .when(self.draw_mode, |bar| {
-                    bar.child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .w(px(8.0))
-                                    .h(px(8.0))
-                                    .bg(rgba(stroke_color_u32(STROKE_COLORS[self.stroke_color]))),
-                            )
-                            .text_color(rgba(stroke_color_u32(STROKE_COLORS[self.stroke_color])))
-                            .child("draw".to_owned()),
-                    )
-                })
-                .when(self.erase_mode, |bar| {
-                    bar.child(
-                        div()
-                            .text_color(rgb(theme::hex(theme::status::WARN)))
-                            .child("erase".to_owned()),
-                    )
-                })
-                .when(self.select_mode, |bar| {
-                    bar.child(
-                        div()
-                            .text_color(rgb(theme::hex(theme::status::INFO)))
-                            .child("select".to_owned()),
-                    )
-                })
                 .child(
                     div()
-                        .text_color(rgb(theme::hex(theme::text::FAINT)))
-                        .child(format!(
-                            "{zoom_label} · {widget_count} widgets · {hh:02}:{mm:02}:{ss:02}"
-                        )),
+                        .text_color(rgb(theme::hex(theme::text::DIM)))
+                        .child(format!("{hh:02}:{mm:02}:{ss:02}")),
                 ),
         );
 
-        // The arrange dropdown — four modes with the shell's hints, parked
-        // just above the status bar's right edge like the TitleBar menu.
+        // The arrange dropdown — the shell's `top-[36px] right-0 w-[210px]`
+        // menu under the TitleBar's right island: label + hint rows, `✓`
+        // on the active mode.
         if self.arrange_menu {
             let mut popup = div()
                 .id("slate-arrange-menu")
                 .absolute()
-                .bottom(px(24.0))
-                .right(px(4.0))
-                .w(px(240.0))
+                .top(px(38.0))
+                .right(px(140.0))
+                .w(px(210.0))
                 .flex()
                 .flex_col()
-                .bg(rgb(theme::hex(theme::monochrome::RAISED)))
+                .rounded_xl()
+                .overflow_hidden()
+                .bg(rgb(theme::hex(theme::monochrome::ELEVATED)))
                 .border_1()
                 .border_color(rgb(theme::hex(theme::hairline::SOFT)))
-                .py_1();
+                .py_1()
+                .shadow_2xl();
             for mode in slate_app::arrange::ArrangeMode::ALL {
                 let current = mode == self.prefs.arrange_mode;
                 popup = popup.child(
                     div()
                         .id(format!("slate-arrange-{}", mode.label().to_lowercase()))
                         .w_full()
-                        .px_3()
+                        .px_2()
                         .py(px(6.0))
                         .flex()
-                        .flex_col()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
                         .cursor_pointer()
                         .text_color(rgb(theme::hex(if current {
                             theme::text::NORMAL
                         } else {
                             theme::text::DIM
                         })))
-                        .hover(|s| s.bg(rgb(theme::hex(theme::monochrome::ELEVATED))))
-                        .child(mode.label())
+                        .hover(|s| s.bg(rgb(theme::hex(theme::monochrome::RAISED))))
                         .child(
                             div()
-                                .text_size(px(9.0))
-                                .text_color(rgb(theme::hex(theme::text::FAINT)))
-                                .child(mode.hint()),
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .child(mode.label())
+                                .child(
+                                    div()
+                                        .text_size(px(10.0))
+                                        .text_color(rgb(theme::hex(theme::text::FAINT)))
+                                        .child(mode.hint()),
+                                ),
                         )
+                        .when(current, |el| {
+                            el.child(
+                                div()
+                                    .flex_none()
+                                    .text_size(px(13.0))
+                                    .text_color(rgb(theme::hex(theme::text::NORMAL)))
+                                    .child("✓"),
+                            )
+                        })
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, _e, _w, cx| {
@@ -5558,11 +5627,12 @@ impl Render for CanvasView {
             root = root.child(popup);
         }
 
-        // The left rail — the shell's `rail-shell` adapted to canvas mode:
-        // collapsed it is a 56px icon strip, expanded a 200px panel with
-        // the workspace, open widgets and the planner preview. It floats
-        // over the canvas between the title bar and the status bar.
-        {
+        // The left rail — the shell's `<Sidebar>` mounts only off-canvas,
+        // so this canvas port renders nothing until `sidebar_open` is
+        // toggled on (Settings or `slate api`); then the 200px panel with
+        // the workspace, open widgets and the planner preview floats over
+        // the canvas between the title bar and the status bar.
+        if self.prefs.sidebar_open {
             let (rows, _) = crate::views_planner::planner_items();
             let planner_items = json!({
                 "items": rows
@@ -5585,7 +5655,7 @@ impl Render for CanvasView {
                     .child(crate::views_sidebar::sidebar_pane(
                         &self.canvas,
                         &planner_items,
-                        self.prefs.sidebar_open,
+                        true,
                         cx,
                     )),
             );
@@ -5595,7 +5665,7 @@ impl Render for CanvasView {
         // arrows, view tabs, flip, git chip, window controls), floating
         // over the canvas exactly like the Electron layer order: canvas →
         // chrome.
-        if let Some(dir) = slate_app::workspace::current() {
+        if slate_app::workspace::current().is_some() {
             root = root.child(
                 div()
                     .absolute()
@@ -5605,8 +5675,6 @@ impl Render for CanvasView {
                     .h(px(canvas::TITLE_BAR_HEIGHT))
                     .child(crate::views_titlebar::titlebar_pane(
                         &crate::views_titlebar::TitlebarState {
-                            workspace_dir: std::path::Path::new(&dir),
-                            presence_count: self.snapshots.len(),
                             can_undo: !self.undo_stack.is_empty(),
                             can_redo: !self.redo_stack.is_empty(),
                             terminals_flipped: self.prefs.terminals_flipped,
@@ -5840,9 +5908,12 @@ impl CanvasView {
             cx.stop_propagation();
             return;
         }
-        if (self.agent_menu.is_some() || self.arrange_menu) && keystroke.key.as_str() == "escape" {
+        if (self.agent_menu.is_some() || self.arrange_menu || self.toolbar_overflow)
+            && keystroke.key.as_str() == "escape"
+        {
             self.agent_menu = None;
             self.arrange_menu = false;
+            self.toolbar_overflow = false;
             cx.notify();
             cx.stop_propagation();
             return;
@@ -5930,59 +6001,7 @@ impl CanvasView {
                     }
                 }
                 "enter" => {
-                    // A highlighted suggestion whose name isn't yet the
-                    // typed token is adopted, not run — `submitCommand`'s
-                    // `typedName !== picked` branch.
-                    let typed = self
-                        .command_bar
-                        .as_deref()
-                        .and_then(|b| {
-                            b.trim_start()
-                                .split_whitespace()
-                                .next()
-                                .map(|t| t.trim_start_matches(['/', '.', '@']).to_lowercase())
-                        })
-                        .unwrap_or_default();
-                    let suggestions = self.command_suggestions();
-                    let picked = suggestions
-                        .get(self.command_suggestion.min(suggestions.len().saturating_sub(1)))
-                        .map(|(kind, _, _)| kind.as_str());
-                    if picked.is_some_and(|kind| kind != typed) {
-                        self.adopt_suggestion();
-                        cx.notify();
-                        cx.stop_propagation();
-                        return;
-                    }
-                    let buffer = self.command_bar.take().unwrap_or_default();
-                    // `if (!value) return` — an empty submit kept the input
-                    // and its text; reopen with the buffer untouched.
-                    if buffer.trim().is_empty() {
-                        self.command_bar = Some(buffer);
-                        cx.notify();
-                        cx.stop_propagation();
-                        return;
-                    }
-                    let target = self.command_target_terminal();
-                    if self.command_message {
-                        // Message mode writes the text verbatim — no
-                        // trailing `\r` (`mode === 'message' ? command : …`).
-                        if let Some(target) = target.as_deref() {
-                            let _ = self.manager.write_text(target, &buffer, false);
-                        }
-                        self.command_message = false;
-                    } else if let Some((kind, initial)) =
-                        parse_widget_invocation(&buffer, self.settings.command_prefix())
-                    {
-                        self.create_widget_from_command(kind, &initial, viewport, cx);
-                    } else if let Some(target) = target.as_deref() {
-                        // A non-invocation line in command mode is terminal
-                        // input — the original's `${command}\r` write.
-                        let _ = self.manager.write_text(target, &buffer, true);
-                    } else {
-                        // Nothing to receive it — a miss keeps the bar open
-                        // so a typo can be fixed, like the disabled submit.
-                        self.command_bar = Some(buffer);
-                    }
+                    self.submit_command_bar(viewport, cx);
                 }
                 "backspace" => {
                     if let Some(buffer) = self.command_bar.as_mut() {
@@ -6368,10 +6387,12 @@ impl CanvasView {
         let key = keystroke.key.as_str();
         match key {
             "escape" => {
-                if self.draw_mode || self.erase_mode || self.select_mode {
+                if self.draw_mode || self.erase_mode || !self.select_mode {
+                    // Back to the resting tool — the shell never has a
+                    // no-tool state, so Escape lands on select, not pan.
                     self.draw_mode = false;
                     self.erase_mode = false;
-                    self.select_mode = false;
+                    self.select_mode = true;
                     self.pending_stroke.clear();
                 } else if let Some(id) = self
                     .canvas

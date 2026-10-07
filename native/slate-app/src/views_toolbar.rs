@@ -12,38 +12,32 @@
 //! carrying the workspace-dir button, Settings, the Mode + Terminal
 //! `<select>`s, the zoom group, and "Clear all drawings".
 //!
-//! This port follows the coordinator's flattened strip: the overflow
-//! menu's contents are inlined (workspace chip, mode select, target
-//! select, zoom group, clear-strokes, settings) and undo/redo ride the
-//! strip too — in the shell they lived on the TitleBar
-//! (`titlebar-undo`/`titlebar-redo`, `disabled` + `text-white/25`).
-//! The shell's `pan` tool is not ported: the contract's tool actions are
-//! `tool:select` / `tool:draw` / `tool:erase` only, and middle-drag pans on
-//! every tool.
+//! The port keeps the shell's exact bar order — Draw, the command input,
+//! the `↵` submit, Select / Eraser / Pan, then the `⋯` button that pops
+//! the overflow menu — and parks everything the menu carried inside it:
+//! workspace pick + Settings, the Mode + Terminal selects, the zoom
+//! group and "Clear all drawings". Undo/redo stayed on the TitleBar.
 //!
 //! Deviations and why, flagged for the coordinator:
 //!
-//! - **Selects are click-to-cycle chips.** gpui has no `<select>` and
-//!   `ToolbarState` carries no popup-open flag, so Mode toggles
-//!   `command`↔`message` on click and the terminal chip cycles the list
-//!   (left = next, right = previous). Both emit the documented verbs.
-//! - **No `↵` submit button / `⋯` menu.** Enter and Escape are keystrokes
-//!   the caller already routes through `command_bar`; there is no
-//!   `submit` verb, so the button is omitted rather than dead.
+//! - **Selects are click-to-cycle chips.** gpui has no `<select>`, so
+//!   Mode toggles `command`↔`message` on click and the terminal chip
+//!   cycles the list (left = next, right = previous). Same verbs.
 //! - **No backdrop blur / scale transitions.** gpui has no
 //!   `backdrop-filter`; the strip keeps the 80% surface fill, and a
 //!   selected swatch is a white border instead of `scale-110`.
-//! - **Swatch row is inline**, shown only while `tool == "draw"` — the
-//!   original's hover-to-keep-open (`B` state) has no counterpart field.
+//! - **Swatch palette only while `tool == "draw"`** — the original's
+//!   hover-to-keep-open half has no counterpart state.
 //! - Glyphs stand in for lucide icons (no SVG assets here):
-//!   ↖ select · ✎ draw · ⌫ erase · ✕ clear · ⌂ workspace ·
-//!   ⛶ fit · ↶/↷ undo/redo · ⚙ settings.
+//!   ✎ draw · ↖ select · ⌫ erase · ✋ pan · ⋯ more · ⌂ workspace ·
+//!   ⚙ settings · ⛶ fit · 🗑 clear.
 //!
 //! Emitted through `CanvasView::toolbar_command(action, json!({}), cx)`:
-//! `tool:select` `tool:draw` `tool:erase`, `stroke:<0-7>`,
-//! `clear_strokes`, `workspace:pick`, `mode:command` `mode:message`,
-//! `target:<id>`, `focus_input`, `suggest:<kind>`, `fit`, `zoom_out`,
-//! `zoom_reset`, `zoom_in`, `undo`, `redo`, `settings`.
+//! `tool:select` `tool:draw` `tool:erase` `tool:pan`, `stroke:<0-7>`,
+//! `submit`, `overflow`, `clear_strokes`, `workspace:pick`,
+//! `mode:command` `mode:message`, `target:<id>`, `focus_input`,
+//! `suggest:<kind>`, `fit`, `zoom_out`, `zoom_reset`, `zoom_in`,
+//! `settings`.
 
 use gpui::prelude::FluentBuilder;
 use gpui::*;
@@ -73,9 +67,14 @@ pub struct ToolbarState {
     pub tool: String,
     /// Index into [`STROKE_SWATCHES`] — the picked stroke color.
     pub stroke_color: usize,
-    /// `canUndo` / `canRedo` — the TitleBar buttons' disabled gates.
-    pub can_undo: bool,
-    pub can_redo: bool,
+    /// `canSubmit` — the `↵` button's disabled gate: non-empty buffer
+    /// and either a live target terminal or (command mode) a parseable
+    /// widget invocation.
+    pub can_submit: bool,
+    /// The `⋯` overflow menu's open flag.
+    pub overflow_open: bool,
+    /// `hasStrokes` — gates "Clear all drawings".
+    pub has_strokes: bool,
     /// `Math.round(zoom * 100)` — the reset button's label.
     pub zoom_percent: u32,
     /// `workspaceDir` basename, already falling back to `"No folder"`.
@@ -232,56 +231,6 @@ fn suggestion_row(
             );
     }
     row
-}
-
-/// A labeled chip (`h-8 px-2`) — the flattened port of the overflow
-/// menu's buttons and `<select>`s. `label` is the leading glyph, `value`
-/// the truncated text. Emits `action`; `None` renders it inert+dim.
-fn chip(
-    id: &'static str,
-    glyph: &'static str,
-    value: String,
-    action: Option<String>,
-    enabled: bool,
-    cx: &mut Context<crate::canvas_view::CanvasView>,
-) -> impl IntoElement {
-    let mut el = div()
-        .id(id)
-        .flex_none()
-        .h(px(BTN))
-        .px_2()
-        .rounded_xl()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(6.0))
-        .text_size(px(11.0))
-        .text_color(rgb(theme::hex(theme::text::DIM)))
-        .child(
-            div()
-                .flex_none()
-                .text_color(rgb(theme::hex(theme::text::FAINT)))
-                .child(glyph),
-        )
-        .child(div().min_w_0().max_w(px(140.0)).truncate().child(value));
-    if let (true, Some(action)) = (enabled, action) {
-        el = el
-            .cursor_pointer()
-            .hover(|el| {
-                el.bg(rgb(theme::hex(theme::monochrome::RAISED)))
-                    .text_color(rgb(theme::hex(theme::text::NORMAL)))
-            })
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _event, _window, cx| {
-                    cx.stop_propagation();
-                    this.toolbar_command(&action, json!({}), cx);
-                }),
-            );
-    } else {
-        el = el.opacity(0.5);
-    }
-    el
 }
 
 /// One swatch (`h-5 w-5 rounded-pill border`) — the picked color gets the
@@ -443,52 +392,12 @@ pub fn toolbar_pane(
         strip = strip.child(pop);
     }
 
-    // ── Tool buttons — `Kn`s for select/draw/erase ────────────────────────
-    strip = strip
-        .child(tool_button(
-            "slate-tool-select",
-            "↖",
-            15.0,
-            "tool:select",
-            state.tool == "select",
-            enabled,
-            cx,
-        ))
-        .child(tool_button(
-            "slate-tool-draw",
-            "✎",
-            16.0,
-            "tool:draw",
-            state.tool == "draw",
-            enabled,
-            cx,
-        ))
-        .child(tool_button(
-            "slate-tool-erase",
-            "⌫",
-            16.0,
-            "tool:erase",
-            state.tool == "erase",
-            enabled,
-            cx,
-        ));
-
-    // ── "Clear all drawings" (`tool-clear-strokes`) ───────────────────────
-    strip = strip.child(tool_button(
-        "slate-clear-strokes",
-        "✕",
-        14.0,
-        "clear_strokes",
-        false,
-        enabled,
-        cx,
-    ));
-
-    // ── The 8-swatch row — the floating `Stroke Color` group, inlined ─────
-    // Original gate: `me = t !== "draw" && !hovered`; the hover half has
-    // no state-field counterpart, so this renders only in draw mode.
+    // ── Stroke palette — the floating `Stroke Color` group ────────────────
+    // Original: `absolute bottom-[calc(100%+8px)] left-1/2 -translate-x-1/2`
+    // with swatches, visible while draw is active or the pencil/palette is
+    // hovered. gpui can't translate, so a full-width row centers the panel.
     if state.tool == "draw" {
-        let mut row = div()
+        let mut swatches = div()
             .flex_none()
             .flex()
             .flex_row()
@@ -499,55 +408,196 @@ pub fn toolbar_pane(
             .border_color(rgb(theme::hex(theme::hairline::FAINT)))
             .bg(rgba(0x121212E5)) // bg-bg-raise/90
             .px(px(10.0))
-            .h(px(BTN));
+            .py_2();
         for (index, (hex, _name)) in STROKE_SWATCHES.iter().enumerate() {
-            row = row.child(swatch(index, hex, index == state.stroke_color, enabled, cx));
+            swatches = swatches.child(swatch(index, hex, index == state.stroke_color, enabled, cx));
         }
-        strip = strip.child(row);
+        strip = strip.child(
+            div()
+                .absolute()
+                .bottom(px(POPOVER_LIFT))
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .child(swatches),
+        );
     }
 
-    // ── Workspace chip — the menu's "Change directory" (folder + basename)
-    strip = strip.child(chip(
-        "slate-workspace",
-        "⌂",
-        if state.workspace_name.is_empty() {
-            "No folder".to_owned()
-        } else {
-            state.workspace_name.clone()
-        },
-        Some("workspace:pick".to_owned()),
-        enabled,
-        cx,
-    ));
-
-    // ── Mode select — `command`/`message`, a click-to-toggle chip ─────────
-    strip = strip.child(chip(
-        "slate-mode",
-        "›",
-        if state.message_mode {
-            "msg".to_owned()
-        } else {
-            "cmd".to_owned()
-        },
-        Some(
-            if state.message_mode {
-                "mode:command"
+    // ── Overflow menu — `toolbar-overflow-menu`, right-anchored ──────────
+    // Original: `absolute right-0 bottom-[calc(100%+8px)]` on the ⋯
+    // wrapper, `w-[min(280px)] flex-col gap-2 p-2.5`. The wrapper sits at
+    // the strip's content-box right edge (px-2), so `right: 8px` here.
+    if state.overflow_open {
+        let menu_label = |text: &'static str| {
+            div()
+                .px_1()
+                .text_size(px(10.0))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(rgb(theme::hex(theme::text::FAINT)))
+                .child(text)
+        };
+        let menu_row = |id: &'static str,
+                        glyph: &'static str,
+                        value: String,
+                        action: &'static str,
+                        enabled: bool,
+                        cx: &mut Context<crate::canvas_view::CanvasView>| {
+            let mut el = div()
+                .id(id)
+                .flex_1()
+                .h(px(BTN))
+                .min_w_0()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .rounded_xl()
+                .px_2()
+                .text_size(px(11.0))
+                .text_color(rgb(theme::hex(theme::text::DIM)))
+                .child(
+                    div()
+                        .flex_none()
+                        .text_color(rgb(theme::hex(theme::text::FAINT)))
+                        .child(glyph),
+                )
+                .child(div().min_w_0().truncate().child(value));
+            if enabled {
+                el = el
+                    .cursor_pointer()
+                    .hover(|el| {
+                        el.bg(rgb(theme::hex(theme::monochrome::RAISED)))
+                            .text_color(rgb(theme::hex(theme::text::NORMAL)))
+                    })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _event, _window, cx| {
+                            cx.stop_propagation();
+                            this.toolbar_command(action, json!({}), cx);
+                        }),
+                    );
             } else {
-                "mode:message"
+                el = el.opacity(0.35);
             }
-            .to_owned(),
-        ),
-        enabled,
-        cx,
-    ));
+            el
+        };
 
-    // ── Terminal select — the target `<select>`, a click-to-cycle chip ────
-    // Left click takes the next terminal, right click the previous one;
-    // with one or zero terminals it is just the current target's name.
-    {
-        // The current target's slot: `target_name` is a title, but an id
-        // match is accepted too (coordinator's choice of payload). No
-        // match lands on index 0 — the original's `d[0]?.id` fallback.
+        let mut menu = div()
+            .id("slate-overflow-menu")
+            .absolute()
+            .bottom(px(POPOVER_LIFT))
+            .right(px(8.0))
+            .w(px(280.0))
+            .flex()
+            .flex_col()
+            .gap_2()
+            .rounded_xl()
+            .border_1()
+            .border_color(rgb(theme::hex(theme::hairline::FAINT)))
+            .bg(rgba(PANEL_95))
+            .p(px(10.0))
+            .shadow_2xl()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_this, _event, _window, cx| {
+                    cx.stop_propagation();
+                }),
+            )
+            .child(menu_label("WORKSPACE"))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap(px(6.0))
+                    .child(menu_row(
+                        "slate-menu-workspace",
+                        "⌂",
+                        if state.workspace_name.is_empty() {
+                            "No folder".to_owned()
+                        } else {
+                            state.workspace_name.clone()
+                        },
+                        "workspace:pick",
+                        enabled,
+                        cx,
+                    ))
+                    .child(menu_row(
+                        "slate-menu-settings",
+                        "⚙",
+                        "Settings".to_owned(),
+                        "settings",
+                        enabled,
+                        cx,
+                    )),
+            )
+            .child(
+                div()
+                    .h(px(1.0))
+                    .bg(rgb(theme::hex(theme::hairline::FAINT))),
+            )
+            .child(menu_label("COMMAND TARGET"));
+
+        // ── Mode + Terminal blocks — `label + <select>` pairs ────────────
+        // gpui has no <select>: Mode toggles on click, Terminal cycles
+        // (left = next, right = previous). Same verbs as the original.
+        let mode_action = if state.message_mode {
+            "mode:command"
+        } else {
+            "mode:message"
+        };
+        let select_block = |id: &'static str, label: &'static str, value: String| {
+            div()
+                .id(id)
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .rounded_xl()
+                .bg(rgb(theme::hex(theme::monochrome::SURFACE))) // bg-bg-raise
+                .px_2()
+                .py(px(6.0))
+                .child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(rgb(theme::hex(theme::text::FAINT)))
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .h(px(24.0))
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(11.0))
+                        .text_color(rgb(theme::hex(theme::text::NORMAL)))
+                        .child(value),
+                )
+        };
+        let mut mode_block = select_block(
+            "slate-menu-mode",
+            "Mode",
+            if state.message_mode {
+                "Message".to_owned()
+            } else {
+                "Command".to_owned()
+            },
+        );
+        if enabled {
+            mode_block = mode_block
+                .cursor_pointer()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _event, _window, cx| {
+                        cx.stop_propagation();
+                        this.toolbar_command(mode_action, json!({}), cx);
+                    }),
+                );
+        }
+
+        // The current target's slot — `target_name` is a title, an id
+        // match is accepted too. No match lands on index 0, the
+        // original's `d[0]?.id` fallback.
         let at = state
             .terminals
             .iter()
@@ -567,32 +617,10 @@ pub fn toolbar_pane(
                 .clone()
                 .unwrap_or_else(|| state.terminals[at].1.clone())
         };
-        let mut el = div()
-            .id("slate-target")
-            .flex_none()
-            .h(px(BTN))
-            .px_2()
-            .rounded_xl()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(6.0))
-            .text_size(px(11.0))
-            .text_color(rgb(theme::hex(theme::text::DIM)))
-            .child(
-                div()
-                    .flex_none()
-                    .text_color(rgb(theme::hex(theme::text::FAINT)))
-                    .child("❯"),
-            )
-            .child(div().min_w_0().max_w(px(140.0)).truncate().child(title));
+        let mut terminal_block = select_block("slate-menu-terminal", "Terminal", title);
         if let (true, Some(next)) = (enabled, next) {
-            el = el
+            terminal_block = terminal_block
                 .cursor_pointer()
-                .hover(|el| {
-                    el.bg(rgb(theme::hex(theme::monochrome::RAISED)))
-                        .text_color(rgb(theme::hex(theme::text::NORMAL)))
-                })
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _event, _window, cx| {
@@ -601,7 +629,7 @@ pub fn toolbar_pane(
                     }),
                 );
             if let Some(prev) = prev {
-                el = el.on_mouse_down(
+                terminal_block = terminal_block.on_mouse_down(
                     MouseButton::Right,
                     cx.listener(move |this, _event, _window, cx| {
                         cx.stop_propagation();
@@ -610,10 +638,130 @@ pub fn toolbar_pane(
                 );
             }
         } else {
-            el = el.opacity(0.5);
+            terminal_block = terminal_block.opacity(0.5);
         }
-        strip = strip.child(el);
+
+        menu = menu.child(
+            div()
+                .flex()
+                .flex_row()
+                .gap(px(6.0))
+                .child(mode_block)
+                .child(terminal_block),
+        );
+
+        // ── Zoom group — `Canvas zoom` + fit/−/%/+ ───────────────────────
+        menu = menu.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .rounded_xl()
+                .bg(rgb(theme::hex(theme::monochrome::SURFACE)))
+                .px_2()
+                .py_1()
+                .child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(rgb(theme::hex(theme::text::FAINT)))
+                        .child("Canvas zoom"),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(2.0))
+                        .child(zoom_button(
+                            "slate-zoom-fit",
+                            "⛶".to_owned(),
+                            ZOOM_BTN,
+                            "fit",
+                            false,
+                            enabled,
+                            cx,
+                        ))
+                        .child(zoom_button(
+                            "slate-zoom-out",
+                            "−".to_owned(),
+                            ZOOM_BTN,
+                            "zoom_out",
+                            false,
+                            enabled,
+                            cx,
+                        ))
+                        .child(zoom_button(
+                            "slate-zoom-reset",
+                            format!("{}%", state.zoom_percent),
+                            42.0,
+                            "zoom_reset",
+                            true,
+                            enabled,
+                            cx,
+                        ))
+                        .child(zoom_button(
+                            "slate-zoom-in",
+                            "+".to_owned(),
+                            ZOOM_BTN,
+                            "zoom_in",
+                            false,
+                            enabled,
+                            cx,
+                        )),
+                ),
+        );
+
+        // ── "Clear all drawings" — `tool-clear-strokes` ──────────────────
+        let mut clear_row = div()
+            .id("slate-clear-strokes")
+            .h(px(BTN))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .rounded_xl()
+            .px_2()
+            .text_size(px(11.0))
+            .text_color(rgb(theme::hex(theme::text::DIM)))
+            .child(
+                div()
+                    .flex_none()
+                    .text_color(rgb(theme::hex(theme::text::FAINT)))
+                    .child("✕"),
+            )
+            .child("Clear all drawings");
+        if enabled && state.has_strokes {
+            clear_row = clear_row
+                .cursor_pointer()
+                .hover(|el| {
+                    el.bg(rgb(theme::hex(theme::monochrome::RAISED)))
+                        .text_color(rgb(theme::hex(theme::text::NORMAL)))
+                })
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _event, _window, cx| {
+                        cx.stop_propagation();
+                        this.toolbar_command("clear_strokes", json!({}), cx);
+                    }),
+                );
+        } else {
+            clear_row = clear_row.opacity(0.35);
+        }
+        menu = menu.child(clear_row);
+        strip = strip.child(menu);
     }
+
+    // ── The form: pencil → input → ↵ ──────────────────────────────────────
+    strip = strip.child(tool_button(
+        "slate-tool-draw",
+        "✎",
+        16.0,
+        "tool:draw",
+        state.tool == "draw",
+        enabled,
+        cx,
+    ));
 
     // ── The command `<input>` — renders `buffer`; clicks emit focus ──────
     {
@@ -670,87 +818,101 @@ pub fn toolbar_pane(
         strip = strip.child(input);
     }
 
-    // ── Zoom group — the menu's `bg-bg-raise` Canvas-zoom block ──────────
-    strip = strip.child(
-        div()
+    // ── `↵` submit — `h-7 w-7 rounded-pill`, gated on `canSubmit` ─────────
+    {
+        let mut el = div()
+            .id("slate-command-submit")
             .flex_none()
+            .w(px(28.0))
+            .h(px(28.0))
+            .rounded_full()
             .flex()
-            .flex_row()
             .items_center()
-            .gap(px(2.0))
-            .rounded_xl()
-            .bg(rgb(theme::hex(theme::monochrome::SURFACE))) // bg-bg-raise
-            .px(px(6.0))
-            .py(px(2.0))
-            .child(zoom_button(
-                "slate-zoom-fit",
-                "⛶".to_owned(),
-                ZOOM_BTN,
-                "fit",
-                false,
-                enabled,
-                cx,
-            ))
-            .child(zoom_button(
-                "slate-zoom-out",
-                "−".to_owned(),
-                ZOOM_BTN,
-                "zoom_out",
-                false,
-                enabled,
-                cx,
-            ))
-            .child(zoom_button(
-                "slate-zoom-reset",
-                format!("{}%", state.zoom_percent),
-                42.0,
-                "zoom_reset",
-                true,
-                enabled,
-                cx,
-            ))
-            .child(zoom_button(
-                "slate-zoom-in",
-                "+".to_owned(),
-                ZOOM_BTN,
-                "zoom_in",
-                false,
-                enabled,
-                cx,
-            )),
-    );
+            .justify_center()
+            .text_size(px(14.0))
+            .text_color(rgb(theme::hex(theme::text::NORMAL)))
+            .child("↵");
+        if enabled && state.can_submit {
+            el = el
+                .cursor_pointer()
+                .hover(|el| el.bg(rgb(theme::hex(theme::monochrome::RAISED))))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _event, _window, cx| {
+                        cx.stop_propagation();
+                        this.toolbar_command("submit", json!({}), cx);
+                    }),
+                );
+        } else {
+            // `disabled:opacity-30`
+            el = el.opacity(0.3);
+        }
+        strip = strip.child(el);
+    }
 
-    // ── Undo/redo — the TitleBar pair, `disabled`+dimmed when empty ──────
+    // ── Select / Eraser / Pan — the trailing `Kn` trio ────────────────────
     strip = strip
         .child(tool_button(
-            "slate-undo",
-            "↶",
+            "slate-tool-select",
+            "↖",
             15.0,
-            "undo",
-            false,
-            enabled && state.can_undo,
+            "tool:select",
+            state.tool == "select",
+            enabled,
             cx,
         ))
         .child(tool_button(
-            "slate-redo",
-            "↷",
-            15.0,
-            "redo",
-            false,
-            enabled && state.can_redo,
+            "slate-tool-erase",
+            "⌫",
+            16.0,
+            "tool:erase",
+            state.tool == "erase",
+            enabled,
+            cx,
+        ))
+        .child(tool_button(
+            "slate-tool-pan",
+            "✋",
+            16.0,
+            "tool:pan",
+            state.tool == "pan",
+            enabled,
             cx,
         ));
 
-    // ── Settings — `pe()`'s `orcspace:open-settings` dispatch ────────────
-    strip = strip.child(tool_button(
-        "slate-settings",
-        "⚙",
-        15.0,
-        "settings",
-        false,
-        enabled,
-        cx,
-    ));
+    // ── `⋯` — `toolbar-more`, `h-8 w-8 rounded-pill`, menu toggle ─────────
+    {
+        let mut el = div()
+            .id("slate-toolbar-more")
+            .flex_none()
+            .w(px(BTN))
+            .h(px(BTN))
+            .rounded_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_size(px(16.0))
+            .text_color(rgb(theme::hex(theme::text::NORMAL)))
+            .child("⋯");
+        if enabled {
+            el = el
+                .cursor_pointer()
+                .when(state.overflow_open, |el| {
+                    el.bg(rgb(theme::hex(theme::monochrome::RAISED)))
+                })
+                .hover(|el| el.bg(rgb(theme::hex(theme::monochrome::RAISED))))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _event, _window, cx| {
+                        cx.stop_propagation();
+                        this.toolbar_command("overflow", json!({}), cx);
+                    }),
+                );
+        } else {
+            el = el.opacity(0.35);
+        }
+        strip = strip.child(el);
+    }
 
     strip
 }
