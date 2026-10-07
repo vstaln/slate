@@ -181,6 +181,53 @@ pub struct TitlebarState<'a> {
     pub terminals_flipped: bool,
     /// The last lazy poll's repo read (`CanvasView::git_chip`).
     pub git: &'a GitChip,
+    /// Window width — the git label is `hidden min-[1000px]:inline` in
+    /// the shell, so it only exists at 1000px and wider.
+    pub window_width: f32,
+}
+
+/// The git pill's laid-out width — the Arrange menu is `absolute right-0`
+/// of the arrange button's `relative mr-1` wrapper, which sits
+/// `git-pill + divider + window-controls` from the window's right edge,
+/// so `canvas_view` needs this to anchor the popover the same way.
+pub fn git_chip_width(chip: &GitChip, window_width: f32, window: &Window) -> f32 {
+    // `Ft`: `h-[24px] px-[9px] gap-1.5` holding the 14px branch icon.
+    let mut width = 9.0 + 14.0;
+    if window_width >= 1000.0 {
+        let label = git_chip_label(chip);
+        let mut font = gpui::font("Plus Jakarta Sans");
+        font.weight = FontWeight::MEDIUM;
+        let line = window.text_system().shape_line(
+            label.clone().into(),
+            px(12.0),
+            &[gpui::TextRun {
+                len: label.len(),
+                font,
+                color: rgb(0xFFFFFF).into(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            }],
+            None,
+        );
+        // `max-w-[110px] truncate` on the label span.
+        width += 6.0 + f32::from(line.width).min(110.0);
+    }
+    if chip.dirty > 0 {
+        // gap-1.5 + `h-1.5 w-1.5` dirty dot.
+        width += 6.0 + 6.0;
+    }
+    width + 9.0
+}
+
+fn git_chip_label(chip: &GitChip) -> String {
+    if !chip.repo {
+        "Git".to_owned()
+    } else if chip.branch.is_empty() {
+        "HEAD".to_owned()
+    } else {
+        chip.branch.clone()
+    }
 }
 
 /// `WebkitAppRegion: drag` — dead space that moves the window. A left
@@ -230,14 +277,14 @@ fn pill_wrap() -> Div {
 /// `Ft` — the bar's pill button: 24px tall, rounded, dim until hover.
 /// One `action` verb, dispatched with the contract's empty payload.
 fn action_button(
-    glyph: &'static str,
+    icon_name: &'static str,
+    icon_size: f32,
     action: &'static str,
     cx: &mut Context<crate::canvas_view::CanvasView>,
 ) -> Div {
     div()
         .h(px(BUTTON_H))
-        .min_w(px(30.0))
-        .px_2()
+        .px(px(8.0))
         .flex_none()
         .flex()
         .items_center()
@@ -248,10 +295,14 @@ fn action_button(
         .text_color(rgb(theme::hex(theme::text::DIM)))
         .cursor_pointer()
         .hover(|el| {
-            el.bg(rgb(theme::hex(theme::monochrome::RAISED)))
+            el.bg(rgb(theme::hex(theme::hairline::FAINT)))
                 .text_color(rgb(theme::hex(theme::text::NORMAL)))
         })
-        .child(glyph)
+        .child(crate::assets::icon(
+            icon_name,
+            icon_size,
+            theme::hex(theme::text::DIM),
+        ))
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, _event, window, cx| {
@@ -265,15 +316,14 @@ fn action_button(
 /// the pill button while the stack has entries, the shell's
 /// `cursor-default text-white/25` and no click when it's empty.
 fn history_button(
-    glyph: &'static str,
+    icon_name: &'static str,
     action: &'static str,
     enabled: bool,
     cx: &mut Context<crate::canvas_view::CanvasView>,
 ) -> Div {
     let mut el = div()
         .h(px(BUTTON_H))
-        .min_w(px(30.0))
-        .px_2()
+        .px(px(11.0))
         .flex_none()
         .flex()
         .items_center()
@@ -281,13 +331,21 @@ fn history_button(
         .rounded_full()
         .text_size(px(12.0))
         .font_weight(FontWeight::MEDIUM)
-        .child(glyph);
+        .child(crate::assets::icon(
+            icon_name,
+            15.0,
+            theme::hex(if enabled {
+                theme::text::DIM
+            } else {
+                theme::text::FAINT
+            }),
+        ));
     if enabled {
         el = el
             .text_color(rgb(theme::hex(theme::text::DIM)))
             .cursor_pointer()
             .hover(|el| {
-                el.bg(rgb(theme::hex(theme::monochrome::RAISED)))
+                el.bg(rgb(theme::hex(theme::hairline::FAINT)))
                     .text_color(rgb(theme::hex(theme::text::NORMAL)))
             })
             .on_mouse_down(
@@ -337,7 +395,7 @@ fn view_tab(
             .text_color(rgb(theme::hex(theme::text::DIM)))
             .cursor_pointer()
             .hover(|el| {
-                el.bg(rgb(theme::hex(theme::monochrome::RAISED)))
+                el.bg(rgb(theme::hex(theme::hairline::FAINT)))
                     .text_color(rgb(theme::hex(theme::text::NORMAL)))
             });
     } else {
@@ -369,16 +427,15 @@ fn flip_button(flipped: bool, cx: &mut Context<crate::canvas_view::CanvasView>) 
         .text_size(px(12.0))
         .font_weight(FontWeight::MEDIUM)
         .cursor_pointer()
-        .child(
-            div()
-                .flex_none()
-                .text_color(rgb(theme::hex(if flipped {
-                    theme::text::NORMAL
-                } else {
-                    theme::text::FAINT
-                })))
-                .child(if flipped { "◉" } else { "◎" }),
-        )
+        .child(crate::assets::icon(
+            if flipped { "eye" } else { "eye-off" },
+            14.0,
+            theme::hex(if flipped {
+                theme::text::NORMAL
+            } else {
+                theme::text::FAINT
+            }),
+        ))
         .child(if flipped {
             "Show terminals"
         } else {
@@ -393,7 +450,7 @@ fn flip_button(flipped: bool, cx: &mut Context<crate::canvas_view::CanvasView>) 
         el = el
             .text_color(rgb(theme::hex(theme::text::DIM)))
             .hover(|el| {
-                el.bg(rgb(theme::hex(theme::monochrome::RAISED)))
+                el.bg(rgb(theme::hex(theme::hairline::FAINT)))
                     .text_color(rgb(theme::hex(theme::text::NORMAL)))
             });
     }
@@ -406,28 +463,28 @@ fn flip_button(flipped: bool, cx: &mut Context<crate::canvas_view::CanvasView>) 
     )
 }
 
-/// The git pill (`title-bar-git`): `⎇` + branch + dirty dot inside the
-/// same bordered wrap. The glyph is accent while the tree is dirty (the
-/// native accent is `status::INFO`), dim on a clean repo, faint off one.
+/// The git pill (`title-bar-git`): `GitBranch` + branch + dirty dot inside
+/// the same bordered wrap. The icon is the white accent while the tree is
+/// dirty, dim on a clean repo, faint off one; the dot is `bg-accent` white.
+/// The branch label only exists at 1000px+ (`hidden min-[1000px]:inline`).
 /// No checkout panel in this build — a click repolls and flashes the
 /// summary the original's tooltip carried.
-fn git_button(chip: &GitChip, cx: &mut Context<crate::canvas_view::CanvasView>) -> Div {
-    let (glyph_color, label) = if chip.repo {
-        (
-            theme::hex(if chip.dirty > 0 {
-                theme::status::INFO
-            } else {
-                theme::text::DIM
-            }),
-            if chip.branch.is_empty() {
-                "HEAD".to_owned()
-            } else {
-                chip.branch.clone()
-            },
-        )
+fn git_button(
+    chip: &GitChip,
+    window_width: f32,
+    cx: &mut Context<crate::canvas_view::CanvasView>,
+) -> Div {
+    // The branch icon: `text-accent` (white) while dirty, `text-text-dim`
+    // on a clean repo, `text-text-faint` off one.
+    let glyph_color = theme::hex(if chip.repo {
+        if chip.dirty > 0 {
+            theme::text::NORMAL
+        } else {
+            theme::text::DIM
+        }
     } else {
-        (theme::hex(theme::text::FAINT), "Git".to_owned())
-    };
+        theme::text::FAINT
+    });
     let mut el = div()
         .h(px(BUTTON_H))
         .flex_none()
@@ -441,25 +498,34 @@ fn git_button(chip: &GitChip, cx: &mut Context<crate::canvas_view::CanvasView>) 
         .text_color(rgb(theme::hex(theme::text::DIM)))
         .cursor_pointer()
         .hover(|el| {
-            el.bg(rgb(theme::hex(theme::monochrome::RAISED)))
+            el.bg(rgb(theme::hex(theme::hairline::FAINT)))
                 .text_color(rgb(theme::hex(theme::text::NORMAL)))
         })
-        .child(div().flex_none().text_color(rgb(glyph_color)).child("⎇"))
         .child(
+            div()
+                .flex_none()
+                .text_color(rgb(glyph_color))
+                .child(crate::assets::icon("git-branch", 14.0, glyph_color)),
+        );
+    // `hidden min-[1000px]:inline max-w-[110px] truncate`.
+    if window_width >= 1000.0 {
+        el = el.child(
             div()
                 .flex_none()
                 .max_w(px(110.0))
                 .truncate()
-                .child(label),
+                .child(git_chip_label(chip)),
         );
+    }
     if chip.dirty > 0 {
+        // `bg-accent` — the white accent dot.
         el = el.child(
             div()
                 .w(px(6.0))
                 .h(px(6.0))
                 .flex_none()
                 .rounded_full()
-                .bg(rgb(theme::hex(theme::status::INFO))),
+                .bg(rgb(theme::hex(theme::text::NORMAL))),
         );
     }
     el.on_mouse_down(
@@ -475,7 +541,8 @@ fn git_button(chip: &GitChip, cx: &mut Context<crate::canvas_view::CanvasView>) 
 /// faint-on-raised hover; `danger` paints the shell's red close hover.
 #[cfg(not(target_os = "macos"))]
 fn window_button(
-    glyph: &'static str,
+    icon_name: &'static str,
+    icon_size: f32,
     action: &'static str,
     danger: bool,
     cx: &mut Context<crate::canvas_view::CanvasView>,
@@ -487,8 +554,12 @@ fn window_button(
         .flex()
         .items_center()
         .justify_center()
-        .text_size(px(13.0))
-        .text_color(rgb(theme::hex(theme::text::FAINT)))
+        .text_color(rgb(theme::hex(if danger {
+            // `jr` close: text-text-dim, the others text-text-faint.
+            theme::text::DIM
+        } else {
+            theme::text::FAINT
+        })))
         .cursor_pointer()
         .hover(move |el| {
             if danger {
@@ -498,7 +569,15 @@ fn window_button(
                     .text_color(rgb(theme::hex(theme::text::NORMAL)))
             }
         })
-        .child(glyph)
+        .child(crate::assets::icon(
+            icon_name,
+            icon_size,
+            theme::hex(if danger {
+                theme::text::DIM
+            } else {
+                theme::text::FAINT
+            }),
+        ))
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, _event, window, cx| {
@@ -537,7 +616,9 @@ pub fn titlebar_pane(
 
     // Left: `title-bar-history-switch` (Undo/Redo), then the drag
     // spacer — the shell's flash text only sits here while a notice is
-    // live, and that slot renders through `notice` instead.
+    // live, and that slot renders through `notice` instead. The
+    // `overflow-hidden` is the shell's `min-w-0` contract: a narrow
+    // window clips this column before it touches the centred tabs.
     let left = div()
         .flex_1()
         .min_w_0()
@@ -545,11 +626,12 @@ pub fn titlebar_pane(
         .flex()
         .flex_row()
         .items_center()
-        .gap_2()
+        .gap_3()
+        .overflow_hidden()
         .child(
             pill_wrap()
-                .child(history_button("←", "undo", state.can_undo, cx))
-                .child(history_button("→", "redo", state.can_redo, cx)),
+                .child(history_button("arrow-left", "undo", state.can_undo, cx))
+                .child(history_button("arrow-right", "redo", state.can_redo, cx)),
         )
         .child(drag_space(cx));
 
@@ -568,7 +650,10 @@ pub fn titlebar_pane(
         );
 
     // Right: drag space, the flip toggle, the Arrange menu, the git
-    // pill, divider, window controls — the shell's island order.
+    // pill, divider, window controls — the shell's island order. The
+    // column clips its own overflow (`min-w-0` + justify-end), so on a
+    // narrow window the island's left edge eats itself before it can
+    // cover the centred tabs.
     let mut right = div()
         .flex_1()
         .min_w_0()
@@ -577,26 +662,26 @@ pub fn titlebar_pane(
         .flex_row()
         .items_center()
         .justify_end()
+        .overflow_hidden()
         .child(drag_space(cx));
 
     right = right
         .child(
             div()
                 .flex_none()
-                .mx(px(4.0))
+                .mr(px(4.0))
                 .child(pill_wrap().child(flip_button(state.terminals_flipped, cx))),
         )
         .child(
             div()
                 .flex_none()
                 .mr(px(4.0))
-                .child(pill_wrap().child(action_button("▦", "arrange", cx))),
+                .child(pill_wrap().child(action_button("layout-grid", 14.0, "arrange", cx))),
         )
         .child(
             div()
                 .flex_none()
-                .mx(px(4.0))
-                .child(pill_wrap().child(git_button(state.git, cx))),
+                .child(pill_wrap().child(git_button(state.git, state.window_width, cx))),
         );
 
     // `!vt` — window controls exist only off macOS, flush to the right
@@ -612,9 +697,9 @@ pub fn titlebar_pane(
                     .flex_none()
                     .bg(rgba((theme::hex(theme::hairline::SOFT) << 8) | 0xCC)),
             )
-            .child(window_button("–", "minimize", false, cx))
-            .child(window_button("□", "maximize", false, cx))
-            .child(window_button("×", "close", true, cx));
+            .child(window_button("minus", 14.0, "minimize", false, cx))
+            .child(window_button("square", 13.0, "maximize", false, cx))
+            .child(window_button("x", 14.0, "close", true, cx));
     }
 
     bar.child(left).child(center).child(right)

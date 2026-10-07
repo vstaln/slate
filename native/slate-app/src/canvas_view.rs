@@ -450,6 +450,15 @@ pub struct CanvasView {
     /// viewport size is known (the count scales with it). `Rc` so the
     /// paint closure can share it without a per-frame clone.
     splash_points: Rc<Vec<SplashPoint>>,
+    /// The wallpaper as rendered, keyed `(data-url hash, backgroundBlur)`
+    /// — the blur runs off-thread (`blur_wallpaper`) because gpui has no
+    /// image filter; the unblurred decode paints until it lands.
+    wallpaper_cache: Option<(u64, u64, gpui::ImageSource)>,
+    /// The plain decode keyed by data-url hash — the blur job's fallback
+    /// paint and the `backgroundBlur: 0` path.
+    wallpaper_raw: Option<(u64, gpui::ImageSource)>,
+    /// The key of the in-flight blur job so renders don't stack workers.
+    wallpaper_blurring: Option<(u64, u64)>,
     counter: u64,
 }
 
@@ -873,6 +882,9 @@ impl CanvasView {
             git_polling: false,
             splash_started: Some(Instant::now()),
             splash_points: Rc::new(Vec::new()),
+            wallpaper_cache: None,
+            wallpaper_raw: None,
+            wallpaper_blurring: None,
             counter: 0,
         };
         view.snapshots = view.manager.snapshots();
@@ -3354,6 +3366,63 @@ fn decode_data_image(url: &str) -> Option<gpui::ImageSource> {
     Some(std::sync::Arc::new(gpui::Image::from_bytes(format, bytes)).into())
 }
 
+fn hash_str(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// The shell's CSS `blur(Npx)` on the wallpaper, run once off the UI
+/// thread — gpui's img() has no filter support, so hand it an
+/// already-blurred JPEG instead. The work happens at (roughly) display
+/// resolution under object-fit: cover — capped at 1600px so a 4K source
+/// isn't blurred pixel-by-pixel when nothing finer survives anyway — so
+/// `sigma` carries the CSS-pixel scale with it.
+/// Returns the encoded JPEG bytes — `gpui::ImageSource` isn't Send, so
+/// the caller wraps them on the UI thread.
+fn blur_wallpaper(url: &str, blur: u64, viewport: Vec2) -> Option<Vec<u8>> {
+    let rest = url.strip_prefix("data:image/")?;
+    let (_, payload) = rest.split_once(";base64,")?;
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(payload)
+        .ok()?;
+    let decoded = image::load_from_memory(&bytes).ok()?;
+    let (iw, ih) = (decoded.width() as f32, decoded.height() as f32);
+    if iw < 1.0 || ih < 1.0 {
+        return None;
+    }
+    let cover = (viewport.x / iw).max(viewport.y / ih).max(0.0);
+    let (disp_w, disp_h) = (iw * cover, ih * cover);
+    let shrink = (1600.0 / disp_w).min(1600.0 / disp_h).min(1.0);
+    let work_w = (disp_w * shrink).round().max(1.0) as u32;
+    let work_h = (disp_h * shrink).round().max(1.0) as u32;
+    let working = if work_w < decoded.width() || work_h < decoded.height() {
+        decoded.resize(work_w, work_h, image::imageops::FilterType::Triangle)
+    } else {
+        decoded
+    };
+    // Chrome's blur(N) ≈ a Gaussian with std-dev ~N/2.
+    let sigma = (blur as f32 / 2.0 * shrink).max(0.0);
+    let blurred = if sigma > 0.0 {
+        image::imageops::blur(&working.to_rgba8(), sigma)
+    } else {
+        working.to_rgba8()
+    };
+    let mut out = Vec::new();
+    let rgb = image::DynamicImage::ImageRgba8(blurred).into_rgb8();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 85)
+        .encode(
+            rgb.as_raw(),
+            rgb.width(),
+            rgb.height(),
+            image::ExtendedColorType::Rgb8,
+        )
+        .ok()?;
+    Some(out)
+}
+
 /// A stroke's "#rrggbb" journal color as the 0xRRGGBBAA `rgba()` wants —
 /// opaque. Anything unreadable falls back to the default white.
 fn stroke_color_u32(color: &str) -> u32 {
@@ -4216,24 +4285,87 @@ impl Render for CanvasView {
 
         // The wallpaper — the shell's `.wallpaper-container`: a full-bleed
         // image under everything (settings `background` holds a data:image
-        // URL), dimmed by `backgroundDim`'s rgba(8,8,8,d) overlay.
-        if let Some(image) = self
+        // URL), blurred by `backgroundBlur` (the shell's CSS `blur(Npx)` —
+        // done on the CPU off-thread, gpui has no image filter) and dimmed
+        // by `backgroundDim`'s rgba(8,8,8,d) overlay.
+        if let Some(url) = self
             .settings
             .extra("background")
             .and_then(Value::as_str)
-            .and_then(decode_data_image)
+            .map(str::to_owned)
         {
-            root = root.child(
-                div().absolute().inset_0().child(
-                    gpui::img(image)
-                        .size_full()
-                        .object_fit(gpui::ObjectFit::Cover),
-                ),
-            );
-            let dim = (self.settings.background_dim.min(100) as f32 / 100.0 * 255.0) as u32;
-            if dim > 0 {
-                root = root.child(div().absolute().inset_0().bg(rgba(0x08080800 | dim)));
+            let blur = self.settings.background_blur().min(200);
+            let key = (hash_str(&url), blur);
+            // The blurred variant, when this (url, blur) pair is ready.
+            let mut image = self
+                .wallpaper_cache
+                .as_ref()
+                .filter(|(h, b, _)| *h == key.0 && *b == key.1)
+                .map(|(_, _, src)| src.clone());
+            if blur > 0 && image.is_none() && self.wallpaper_blurring != Some(key) {
+                self.wallpaper_blurring = Some(key);
+                let url_for_job = url.clone();
+                let viewport_for_job = viewport_size;
+                cx.spawn(async move |this, cx| {
+                    let source = cx
+                        .background_executor()
+                        .spawn(async move {
+                            blur_wallpaper(&url_for_job, blur, viewport_for_job)
+                        })
+                        .await;
+                    let _ = this.update(cx, |this, cx| {
+                        // `wallpaper_blurring` stays set — it marks the key
+                        // as attempted so a failed job never respawns.
+                        // On failure park the plain decode under the key:
+                        // the wallpaper still paints, just unblurred.
+                        let source = source
+                            .map(|bytes| {
+                                let image: gpui::ImageSource = std::sync::Arc::new(
+                                    gpui::Image::from_bytes(gpui::ImageFormat::Jpeg, bytes),
+                                )
+                                .into();
+                                image
+                            })
+                            .or_else(|| {
+                                this.wallpaper_raw
+                                    .as_ref()
+                                    .filter(|(h, _)| *h == key.0)
+                                    .map(|(_, src)| src.clone())
+                            });
+                        if let Some(source) = source {
+                            this.wallpaper_cache = Some((key.0, key.1, source));
+                        }
+                        cx.notify();
+                    });
+                })
+                .detach();
             }
+            // Fallback while the blur job runs (and the `backgroundBlur:
+            // 0` path): the plain decode, cached so a multi-MB data URL
+            // isn't re-decoded every frame.
+            if image.is_none() {
+                if !matches!(&self.wallpaper_raw, Some((h, _)) if *h == key.0) {
+                    self.wallpaper_raw = decode_data_image(&url).map(|src| (key.0, src));
+                }
+                image = self.wallpaper_raw.as_ref().map(|(_, src)| src.clone());
+            }
+            if let Some(image) = image {
+                root = root.child(
+                    div().absolute().inset_0().child(
+                        gpui::img(image)
+                            .size_full()
+                            .object_fit(gpui::ObjectFit::Cover),
+                    ),
+                );
+                let dim =
+                    (self.settings.background_dim.min(100) as f32 / 100.0 * 255.0) as u32;
+                if dim > 0 {
+                    root = root.child(div().absolute().inset_0().bg(rgba(0x08080800 | dim)));
+                }
+            }
+        } else {
+            self.wallpaper_cache = None;
+            self.wallpaper_raw = None;
         }
 
         // ConnectionsLayer: arcs between widget top-centers, painted under
@@ -4389,6 +4521,8 @@ impl Render for CanvasView {
             let cam = camera.clone();
             let header_h = theme::geometry::HEADER_HEIGHT * zoom;
 
+            // WidgetFrame's `widget-header-shell`: h-34, `gap-1`,
+            // `pl-2.5 pr-0` — the right-edge controls run flush.
             let header = div()
                 .id(("slate-widget-header", widget.z as u64))
                 .h(px(header_h))
@@ -4396,15 +4530,24 @@ impl Render for CanvasView {
                 .flex()
                 .flex_row()
                 .items_center()
-                .px(px(10.0 * zoom))
-                .gap(px(8.0 * zoom))
-                .bg(rgb(theme::hex(
-                    if is_terminal_kind(widget.kind.as_deref()) {
-                        theme::monochrome::TERMINAL_HEADER
-                    } else {
-                        theme::monochrome::ELEVATED
-                    },
-                )))
+                .pl(px(10.0 * zoom))
+                .pr_0()
+                .gap(px(4.0 * zoom))
+                // `.is-terminal .widget-header-shell` is
+                // `terminalHeaderGlass` — rgba(18,18,18,.35); the blurred
+                // wallpaper behind stands in for the backdrop-filter.
+                .bg(if is_terminal {
+                    rgba(0x12121259)
+                } else {
+                    rgba(theme::hex(theme::monochrome::ELEVATED) << 8 | 0xFF)
+                })
+                // `.widget-header-shell`'s `inset 0 -1px 0 line-faint`
+                // separator — suppressed on terminals
+                // (`is-terminal … { boxShadow: none }`).
+                .when(!is_terminal, |el| {
+                    el.border_b_1()
+                        .border_color(rgb(theme::hex(theme::hairline::FAINT)))
+                })
                 .cursor_grab()
                 .on_mouse_down(
                     MouseButton::Left,
@@ -4452,11 +4595,9 @@ impl Render for CanvasView {
                         .items_center()
                         .min_w_0()
                         .text_size(px(12.0 * zoom))
-                        .text_color(rgb(theme::hex(if renaming_this {
-                            theme::text::NORMAL
-                        } else {
-                            theme::text::DIM
-                        })))
+                        // `text-xs text-text` — the shell's title is full
+                        // white, not dim.
+                        .text_color(rgb(theme::hex(theme::text::NORMAL)))
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
@@ -4493,20 +4634,24 @@ impl Render for CanvasView {
                 )
                 .when(is_terminal, |header| {
                     // Copy terminal name — the shell's hover-revealed Copy
-                    // button, always-on here (no group-hover trick). Shows
-                    // the shell's Check briefly after a click.
+                    // button, always-on here (no group-hover trick). `h-4
+                    // w-4` with Check/Copy at 10px; shows the shell's
+                    // Check briefly after a click.
                     header.child(
                         div()
                             .id(("slate-widget-copy", widget.z as u64))
-                            .w(px(18.0 * zoom))
-                            .h(px(18.0 * zoom))
+                            .w(px(16.0 * zoom))
+                            .h(px(16.0 * zoom))
                             .flex()
                             .items_center()
                             .justify_center()
-                            .text_size(px(11.0 * zoom))
                             .text_color(rgb(theme::hex(theme::text::FAINT)))
                             .cursor_pointer()
-                            .child(if name_copied { "✓" } else { "⧉" })
+                            .child(crate::assets::icon(
+                                if name_copied { "check" } else { "copy" },
+                                10.0 * zoom,
+                                theme::hex(theme::text::FAINT),
+                            ))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _event, _window, cx| {
@@ -4524,20 +4669,29 @@ impl Render for CanvasView {
                     )
                 })
                 .when(is_terminal, |header| {
-                    // The shell's "Select Agent" pencil: opens the small
+                    // The shell's "Select Agent" pencil: `h-6 w-6
+                    // rounded-pill` with Pencil at 11px; opens the small
                     // picker parked under this header's right edge.
                     header.child(
                         div()
                             .id(("slate-widget-agent", widget.z as u64))
-                            .w(px(18.0 * zoom))
-                            .h(px(18.0 * zoom))
+                            .w(px(24.0 * zoom))
+                            .h(px(24.0 * zoom))
                             .flex()
                             .items_center()
                             .justify_center()
-                            .text_size(px(11.0 * zoom))
+                            .rounded_full()
                             .text_color(rgb(theme::hex(theme::text::FAINT)))
                             .cursor_pointer()
-                            .child("✎".to_owned())
+                            .hover(|el| {
+                                el.bg(rgb(theme::hex(theme::monochrome::RAISED)))
+                                    .text_color(rgb(theme::hex(theme::text::NORMAL)))
+                            })
+                            .child(crate::assets::icon(
+                                "pencil-thin",
+                                11.0 * zoom,
+                                theme::hex(theme::text::FAINT),
+                            ))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _event, _window, cx| {
@@ -4554,60 +4708,94 @@ impl Render for CanvasView {
                             ),
                     )
                 })
+                // `ml-1 flex h-[34px]` — maximize and close run the header's
+                // full height at `w-8`, close keeping the shell's red hover
+                // and its `rounded-tr-panel` corner.
                 .child(
                     div()
-                        .id(("slate-widget-max", widget.z as u64))
-                        .w(px(18.0 * zoom))
-                        .h(px(18.0 * zoom))
+                        .ml(px(4.0 * zoom))
+                        .h_full()
+                        .flex_none()
                         .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_size(px(13.0 * zoom))
-                        .text_color(rgb(theme::hex(if can_maximize {
-                            theme::text::FAINT
-                        } else {
-                            // NON_MAXIMIZABLE kinds get the same button,
-                            // drawn disabled — the shell's text-faint/40.
-                            theme::hairline::FAINT
-                        })))
-                        .when(can_maximize, |el| el.cursor_pointer())
-                        .when(!can_maximize, |el| el.cursor_not_allowed())
-                        .child(if maximized { "↙" } else { "↗" })
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _event, _window, cx| {
-                                cx.stop_propagation();
-                                if can_maximize {
-                                    this.toggle_maximize(&id_for_max, cx);
-                                }
-                            }),
-                        ),
-                )
-                .child(
-                    div()
-                        .id(("slate-widget-close", widget.z as u64))
-                        .w(px(18.0 * zoom))
-                        .h(px(18.0 * zoom))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_size(px(13.0 * zoom))
-                        .text_color(rgb(theme::hex(theme::text::FAINT)))
-                        .cursor_pointer()
-                        .child("×".to_owned())
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _event, _window, cx| {
-                                cx.stop_propagation();
-                                // The shell's onClose ran the same confirm
-                                // for terminals that frame-Delete does.
-                                if is_terminal_kind(this.widget_kind(&id_for_close).as_deref()) {
-                                    this.pending_close = Some(id_for_close.clone());
-                                    cx.notify();
+                        .flex_row()
+                        .child(
+                            div()
+                                .id(("slate-widget-max", widget.z as u64))
+                                .w(px(32.0 * zoom))
+                                .h_full()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_color(rgb(theme::hex(if can_maximize {
+                                    theme::text::DIM
                                 } else {
-                                    this.close_widget(&id_for_close, cx);
-                                }
-                            }),
+                                    // NON_MAXIMIZABLE kinds get the same
+                                    // button, drawn disabled — the shell's
+                                    // text-faint/40.
+                                    theme::hairline::FAINT
+                                })))
+                                .when(can_maximize, |el| {
+                                    el.cursor_pointer().hover(|el| {
+                                        el.bg(rgb(theme::hex(theme::monochrome::RAISED)))
+                                            .text_color(rgb(theme::hex(theme::text::NORMAL)))
+                                    })
+                                })
+                                .when(!can_maximize, |el| el.cursor_not_allowed())
+                                .child(crate::assets::icon(
+                                    if maximized { "minimize-2" } else { "maximize-2" },
+                                    13.0 * zoom,
+                                    theme::hex(if can_maximize {
+                                        theme::text::DIM
+                                    } else {
+                                        theme::hairline::FAINT
+                                    }),
+                                ))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _event, _window, cx| {
+                                        cx.stop_propagation();
+                                        if can_maximize {
+                                            this.toggle_maximize(&id_for_max, cx);
+                                        }
+                                    }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id(("slate-widget-close", widget.z as u64))
+                                .w(px(32.0 * zoom))
+                                .h_full()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded_tr(px(12.0 * zoom))
+                                .text_color(rgb(theme::hex(theme::text::DIM)))
+                                .cursor_pointer()
+                                .hover(|el| {
+                                    el.bg(rgb(0xE04343)).text_color(rgb(0xFFFFFF))
+                                })
+                                .child(crate::assets::icon(
+                                    "x",
+                                    13.0 * zoom,
+                                    theme::hex(theme::text::DIM),
+                                ))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _event, _window, cx| {
+                                        cx.stop_propagation();
+                                        // The shell's onClose ran the same
+                                        // confirm for terminals that
+                                        // frame-Delete does.
+                                        if is_terminal_kind(
+                                            this.widget_kind(&id_for_close).as_deref(),
+                                        ) {
+                                            this.pending_close = Some(id_for_close.clone());
+                                            cx.notify();
+                                        } else {
+                                            this.close_widget(&id_for_close, cx);
+                                        }
+                                    }),
+                                ),
                         ),
                 );
 
@@ -4617,11 +4805,16 @@ impl Render for CanvasView {
             let id_body_um = id_for_body.clone();
             let id_body_ur = id_for_body.clone();
             let id_body_mv = id_for_body.clone();
+            // Terminal bodies stay transparent — `is-canvas-terminal`
+            // paints `terminalGlass` on the shell instead of a solid fill,
+            // and the (now CPU-blurred) wallpaper behind does the rest.
             let body = div()
                 .flex_1()
                 .w_full()
                 .overflow_hidden()
-                .bg(rgb(theme::hex(theme::monochrome::BASE)))
+                .when(!is_terminal, |el| {
+                    el.bg(rgb(theme::hex(theme::monochrome::BASE)))
+                })
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, event: &MouseDownEvent, window, cx| {
@@ -4830,6 +5023,9 @@ impl Render for CanvasView {
                     }
                 });
 
+            // `widget-shell`: `rounded-panel overflow-hidden` — 12px
+            // corners in world space, clipped so the square-cornered
+            // terminal body can't poke out.
             let mut frame = div()
                 .absolute()
                 .left(px(rect.min.x))
@@ -4838,13 +5034,32 @@ impl Render for CanvasView {
                 .h(px(rect.height()))
                 .flex()
                 .flex_col()
-                .bg(rgb(theme::hex(theme::monochrome::SURFACE)))
-                .border_1()
-                .border_color(rgb(theme::hex(if is_active {
-                    theme::text::FAINT
+                .rounded(px(12.0 * zoom))
+                .overflow_hidden()
+                // `is-canvas-terminal` wears `terminalGlass`
+                // (rgba(8,8,8,.20)); there is no backdrop-filter in gpui,
+                // but the wallpaper behind it is CPU-blurred, which
+                // carries the same frosted read.
+                .bg(if is_terminal {
+                    rgba(0x08080833)
                 } else {
-                    theme::hairline::SOFT
-                })))
+                    rgba(theme::hex(theme::monochrome::SURFACE) << 8 | 0xFF)
+                })
+                // `is-canvas-terminal` has no ring at rest; active gets
+                // `0 0 0 1px rgba(169,171,176,.42)`. Other widgets keep the
+                // hairline-soft ring, brighter when active.
+                .border_1()
+                .border_color(if is_terminal {
+                    if is_active {
+                        rgba(0xA9ABB06B)
+                    } else {
+                        rgba(0x00000000)
+                    }
+                } else {
+                    // hairline.soft and hairline.active are the same
+                    // #1F1F1F — the ring never brightens.
+                    rgba(theme::hex(theme::hairline::SOFT) << 8 | 0xFF)
+                })
                 .child(header)
                 .child(body);
 
@@ -5273,30 +5488,23 @@ impl Render for CanvasView {
                     toolbar_suggestions(&buffer, self.settings.command_prefix())
                 },
                 suggestion_sel: self.command_suggestion,
+                window_width: viewport_size.x,
                 enabled: true,
             };
             root = root.child(
                 div()
                     .id("slate-toolbar-row")
                     .absolute()
-                    .bottom(px(34.0))
+                    // `fixed bottom-6` — 24px off the window's bottom edge,
+                    // 2px above the 22px status strip.
+                    .bottom(px(24.0))
                     .left_0()
                     .right_0()
                     .flex()
                     .justify_center()
-                    // A click on the row focuses the canvas input like the
-                    // old bar's body did — the strip's own buttons stop
-                    // propagation before this sees them.
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _event, window, cx| {
-                            cx.stop_propagation();
-                            window.focus(&this.focus, cx);
-                            this.active = None;
-                            this.frame_focus = None;
-                            cx.notify();
-                        }),
-                    )
+                    // No press handler here: the shell's `fixed` bar only
+                    // captures its own box, so clicks beside the pill must
+                    // reach the canvas's own press handler untouched.
                     .child(crate::views_toolbar::toolbar_pane(&state, cx)),
             );
         }
@@ -5534,8 +5742,14 @@ impl Render for CanvasView {
                     }),
                 )
                 .when_some(self.cpu_percent, |bar, pct| {
+                    // The shell's `Cpu size={11}` ahead of the percentage,
+                    // both wearing the threshold colour.
                     bar.child(
                         div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_1()
                             .text_color(rgb(theme::hex(if pct > 80 {
                                 theme::status::DANGER
                             } else if pct > 50 {
@@ -5543,6 +5757,17 @@ impl Render for CanvasView {
                             } else {
                                 theme::status::INFO
                             })))
+                            .child(crate::assets::icon(
+                                "cpu",
+                                11.0,
+                                theme::hex(if pct > 80 {
+                                    theme::status::DANGER
+                                } else if pct > 50 {
+                                    theme::status::WARN
+                                } else {
+                                    theme::status::INFO
+                                }),
+                            ))
                             .child(format!("{pct}%")),
                     )
                 })
@@ -5555,13 +5780,25 @@ impl Render for CanvasView {
 
         // The arrange dropdown — the shell's `top-[36px] right-0 w-[210px]`
         // menu under the TitleBar's right island: label + hint rows, `✓`
-        // on the active mode.
+        // on the active mode. The shell anchors `right-0` on the arrange
+        // button's `relative mr-1` wrapper, so the popover's right edge
+        // sits `git-pill + divider + controls + 4px` in from the window's
+        // right edge — measured, since the chip width varies with the
+        // branch name.
         if self.arrange_menu {
+            let git_w =
+                crate::views_titlebar::git_chip_width(&self.git_chip, viewport_size.x, window);
+            // `!vt`: divider `mx-0.5` + w-px and the three 46px controls.
+            let chrome_w = if cfg!(target_os = "macos") {
+                0.0
+            } else {
+                5.0 + 3.0 * 46.0
+            };
             let mut popup = div()
                 .id("slate-arrange-menu")
                 .absolute()
-                .top(px(38.0))
-                .right(px(140.0))
+                .top(px(36.0))
+                .right(px(4.0 + git_w + chrome_w))
                 .w(px(210.0))
                 .flex()
                 .flex_col()
@@ -5679,6 +5916,7 @@ impl Render for CanvasView {
                             can_redo: !self.redo_stack.is_empty(),
                             terminals_flipped: self.prefs.terminals_flipped,
                             git: &self.git_chip,
+                            window_width: viewport_size.x,
                         },
                         cx,
                     )),

@@ -28,9 +28,10 @@
 //!   selected swatch is a white border instead of `scale-110`.
 //! - **Swatch palette only while `tool == "draw"`** — the original's
 //!   hover-to-keep-open half has no counterpart state.
-//! - Glyphs stand in for lucide icons (no SVG assets here):
-//!   ✎ draw · ↖ select · ⌫ erase · ✋ pan · ⋯ more · ⌂ workspace ·
-//!   ⚙ settings · ⛶ fit · 🗑 clear.
+//!
+//! Icons are the vendored Lucide SVGs (`crate::assets::icon`): Pencil
+//! draw · MousePointer2 select · Eraser erase · Hand pan · MoreHorizontal
+//! more · FolderOpen workspace · Settings · Expand fit · Trash2 clear.
 //!
 //! Emitted through `CanvasView::toolbar_command(action, json!({}), cx)`:
 //! `tool:select` `tool:draw` `tool:erase` `tool:pan`, `stroke:<0-7>`,
@@ -85,6 +86,9 @@ pub struct ToolbarState {
     /// `p` — the highlighted suggestion; clamped to `len - 1` on render,
     /// matching the original's `Math.min(p, W.length - 1)`.
     pub suggestion_sel: usize,
+    /// Window width — the strip is `w-[min(780px,calc(100vw-24px))]`, a
+    /// fixed width, not content-sized.
+    pub window_width: f32,
     /// Master gate — `false` dims the strip and drops every handler.
     pub enabled: bool,
 }
@@ -130,8 +134,8 @@ fn swatch_rgba(hex: &str) -> u32 {
 /// to `opacity-35` and stops taking presses.
 fn tool_button(
     id: &'static str,
-    glyph: &'static str,
-    glyph_size: f32,
+    icon_name: &'static str,
+    icon_size: f32,
     action: &'static str,
     active: bool,
     enabled: bool,
@@ -146,7 +150,6 @@ fn tool_button(
         .flex()
         .items_center()
         .justify_center()
-        .text_size(px(glyph_size))
         .text_color(rgb(theme::hex(theme::text::NORMAL)));
     if enabled {
         el = el
@@ -165,7 +168,11 @@ fn tool_button(
     } else {
         el = el.opacity(0.35);
     }
-    el.child(glyph)
+    el.child(crate::assets::icon(
+        icon_name,
+        icon_size,
+        theme::hex(theme::text::NORMAL),
+    ))
 }
 
 /// A row in `#command-suggestions`: `prefix+kind` in mono on the left,
@@ -271,10 +278,12 @@ fn swatch(
 }
 
 /// The zoom group's `h-7` buttons (`−`, `%`, `+`, fit) — smaller than
-/// `Kn`, same hover fill.
+/// `Kn`, same hover fill. `icon` carries the Lucide glyph (fit); text
+/// buttons leave it `None`.
 fn zoom_button(
     id: &'static str,
     label: String,
+    icon: Option<(&'static str, f32)>,
     min_w: f32,
     action: &'static str,
     mono: bool,
@@ -293,8 +302,18 @@ fn zoom_button(
         .justify_center()
         .text_size(px(if mono { 10.0 } else { 12.0 }))
         .when(mono, |el| el.font_family("Departure Mono"))
-        .text_color(rgb(theme::hex(theme::text::DIM)))
-        .child(label);
+        // `font-semibold` on −/+, `font-medium` on the % label.
+        .font_weight(if mono {
+            gpui::FontWeight::MEDIUM
+        } else {
+            gpui::FontWeight::SEMIBOLD
+        })
+        .text_color(rgb(theme::hex(theme::text::DIM)));
+    el = if let Some((name, size)) = icon {
+        el.child(crate::assets::icon(name, size, theme::hex(theme::text::DIM)))
+    } else {
+        el.child(label)
+    };
     if enabled {
         el = el
             .cursor_pointer()
@@ -316,8 +335,8 @@ fn zoom_button(
 }
 
 /// The strip itself — `Canvas Tools`. The caller owns the `fixed
-/// bottom-6 left-1/2 -translate-x-1/2` part; this returns the bar sized
-/// to its contents (`w_auto`, capped at the original's 780px).
+/// bottom-6 left-1/2 -translate-x-1/2` part; this returns the bar at the
+/// original's fixed `w-[min(780px,calc(100vw-24px))]`.
 pub fn toolbar_pane(
     state: &crate::views_toolbar::ToolbarState,
     cx: &mut Context<crate::canvas_view::CanvasView>,
@@ -326,8 +345,7 @@ pub fn toolbar_pane(
 
     let mut strip = div()
         .id("slate-toolbar")
-        .w_auto()
-        .max_w(px(780.0))
+        .w(px((state.window_width - 24.0).clamp(0.0, 780.0)))
         .h(px(STRIP_H))
         .flex()
         .flex_row()
@@ -438,7 +456,7 @@ pub fn toolbar_pane(
                 .child(text)
         };
         let menu_row = |id: &'static str,
-                        glyph: &'static str,
+                        icon_name: &'static str,
                         value: String,
                         action: &'static str,
                         enabled: bool,
@@ -459,8 +477,11 @@ pub fn toolbar_pane(
                 .child(
                     div()
                         .flex_none()
-                        .text_color(rgb(theme::hex(theme::text::FAINT)))
-                        .child(glyph),
+                        .child(crate::assets::icon(
+                            icon_name,
+                            14.0,
+                            theme::hex(theme::text::FAINT),
+                        )),
                 )
                 .child(div().min_w_0().truncate().child(value));
             if enabled {
@@ -512,7 +533,7 @@ pub fn toolbar_pane(
                     .gap(px(6.0))
                     .child(menu_row(
                         "slate-menu-workspace",
-                        "⌂",
+                        "folder-open",
                         if state.workspace_name.is_empty() {
                             "No folder".to_owned()
                         } else {
@@ -524,7 +545,7 @@ pub fn toolbar_pane(
                     ))
                     .child(menu_row(
                         "slate-menu-settings",
-                        "⚙",
+                        "settings",
                         "Settings".to_owned(),
                         "settings",
                         enabled,
@@ -675,7 +696,8 @@ pub fn toolbar_pane(
                         .gap(px(2.0))
                         .child(zoom_button(
                             "slate-zoom-fit",
-                            "⛶".to_owned(),
+                            String::new(),
+                            Some(("expand", 14.0)),
                             ZOOM_BTN,
                             "fit",
                             false,
@@ -685,6 +707,7 @@ pub fn toolbar_pane(
                         .child(zoom_button(
                             "slate-zoom-out",
                             "−".to_owned(),
+                            None,
                             ZOOM_BTN,
                             "zoom_out",
                             false,
@@ -694,6 +717,7 @@ pub fn toolbar_pane(
                         .child(zoom_button(
                             "slate-zoom-reset",
                             format!("{}%", state.zoom_percent),
+                            None,
                             42.0,
                             "zoom_reset",
                             true,
@@ -703,6 +727,7 @@ pub fn toolbar_pane(
                         .child(zoom_button(
                             "slate-zoom-in",
                             "+".to_owned(),
+                            None,
                             ZOOM_BTN,
                             "zoom_in",
                             false,
@@ -727,8 +752,11 @@ pub fn toolbar_pane(
             .child(
                 div()
                     .flex_none()
-                    .text_color(rgb(theme::hex(theme::text::FAINT)))
-                    .child("✕"),
+                    .child(crate::assets::icon(
+                        "trash-2",
+                        14.0,
+                        theme::hex(theme::text::FAINT),
+                    )),
             )
             .child("Clear all drawings");
         if enabled && state.has_strokes {
@@ -755,7 +783,7 @@ pub fn toolbar_pane(
     // ── The form: pencil → input → ↵ ──────────────────────────────────────
     strip = strip.child(tool_button(
         "slate-tool-draw",
-        "✎",
+        "pencil",
         16.0,
         "tool:draw",
         state.tool == "draw",
@@ -854,7 +882,7 @@ pub fn toolbar_pane(
     strip = strip
         .child(tool_button(
             "slate-tool-select",
-            "↖",
+            "mouse-pointer-2",
             15.0,
             "tool:select",
             state.tool == "select",
@@ -863,7 +891,7 @@ pub fn toolbar_pane(
         ))
         .child(tool_button(
             "slate-tool-erase",
-            "⌫",
+            "eraser",
             16.0,
             "tool:erase",
             state.tool == "erase",
@@ -872,7 +900,7 @@ pub fn toolbar_pane(
         ))
         .child(tool_button(
             "slate-tool-pan",
-            "✋",
+            "hand",
             16.0,
             "tool:pan",
             state.tool == "pan",
@@ -891,9 +919,12 @@ pub fn toolbar_pane(
             .flex()
             .items_center()
             .justify_center()
-            .text_size(px(16.0))
             .text_color(rgb(theme::hex(theme::text::NORMAL)))
-            .child("⋯");
+            .child(crate::assets::icon(
+                "ellipsis",
+                16.0,
+                theme::hex(theme::text::NORMAL),
+            ));
         if enabled {
             el = el
                 .cursor_pointer()
