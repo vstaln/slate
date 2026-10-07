@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 #![recursion_limit = "256"]
 
+pub mod assets;
 pub mod canvas_view;
 pub mod cli_run;
 pub mod engine;
@@ -222,7 +223,9 @@ fn main() -> Result<()> {
         });
     }
     let platform = gpui_platform::current_platform(headless);
-    gpui::Application::with_platform(platform).run(|cx: &mut gpui::App| {
+    gpui::Application::with_platform(platform)
+        .with_assets(crate::assets::EmbeddedAssets)
+        .run(|cx: &mut gpui::App| {
         // Graysite brand faces, embedded so the build looks right on any
         // machine without a fontconfig install: Plus Jakarta Sans is the UI
         // family, Departure Mono the terminal/code face, Brygada 1918 the

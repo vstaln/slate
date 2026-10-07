@@ -43,6 +43,9 @@ uuid = { version = "1", features = ["v4"] }
 # OSC 52 clipboard payloads arrive base64-encoded; the GUI decodes them into
 # the gpui clipboard.
 base64 = "0.22"
+# Pinned to the version already in Cargo.lock through gpui: used to CPU-blur
+# the canvas wallpaper (gpui has no image blur filter).
+image = "=0.25.10"
 log = "0.4"
 env_logger = "0.11"
 
