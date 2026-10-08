@@ -2357,7 +2357,7 @@ fn run_screenshot(url: &str, token: &str, parsed: &slate_app::cli::Args) -> Resu
     let worker = parsed
         .pick(&["worker", "to", "terminal", "widget"])
         .or_else(|| parsed.positionals().get(1).cloned());
-    let mut shot = request(
+    let shot = request(
         url,
         token,
         "POST",
@@ -2367,6 +2367,7 @@ fn run_screenshot(url: &str, token: &str, parsed: &slate_app::cli::Args) -> Resu
             worker.filter(|w| !w.is_empty()).map(Value::from),
         )])),
     )?;
+    let mut shot = data_of(&shot).clone();
     if let Some(out) = parsed
         .pick(&["out", "output", "save"])
         .filter(|out| !out.trim().is_empty())
