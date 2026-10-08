@@ -248,6 +248,11 @@ struct TerminalState {
     /// The child exit code when the waiter reported one — the marker prints
     /// `[Process exited (code N)]` like the shell did.
     exit_code: Option<u32>,
+    /// Orphaned-mode recovery — the shell's `terminalModeRecovery.ts`. Every
+    /// output chunk flows through its probes: echoed mouse reports and
+    /// console-title child exits are how a crashed TUI's leftover modes are
+    /// noticed when there is no process exit to hook.
+    recovery: slate_app::terminal_mode_recovery::ModeRecovery,
 }
 
 #[derive(Clone, Debug)]
@@ -718,9 +723,14 @@ impl TerminalManager {
             // announcing the fresh process.
             let restore = format!(
                 "{}\r\n\x1b[90m[Session restored — new process started]\x1b[0m\r\n",
-                Self::APP_OWNED_MODE_RESET
+                slate_app::terminal_mode_recovery::APP_OWNED_MODE_RESET
             );
             current.screen.process(restore.as_bytes());
+            // The history is terminal output that never passed through the
+            // output path, so the recovery probes never saw it — a child-exit
+            // title sitting at the tail is exactly the evidence a crashed
+            // agent's leftover modes are noticed by.
+            let _ = current.recovery.watch(output);
             let _ = current.screen.take_replies();
             let _ = current.screen.take_clipboard_writes();
             current.output.push_str(output);
@@ -1003,21 +1013,13 @@ impl TerminalManager {
         Ok(())
     }
 
-    /// Every mode a full-screen program may have armed, reset — the original's
-    /// `APP_OWNED_MODE_RESET`: mouse reporting off (incl. focus 1004 and SGR
-    /// variants), bracketed paste, synchronized output, alternate screen, cursor
-    /// visible, autowrap on, replace mode, save cursor, origin mode off, full
-    /// scrolling region, restore cursor. A TUI that dies without unwinding these
-    /// would leave the pane in a corrupt state otherwise.
-    const APP_OWNED_MODE_RESET: &str = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?2004l\x1b[?2026l\x1b[?1049l\x1b[?25h\x1b[?7h\x1b[4l\x1b7\x1b[?6l\x1b[r\x1b8";
-
     /// The process-exit marker: the full app-owned-mode reset followed by a
     /// dim `[Process exited]` line (with the code when the waiter saw one), so
     /// a crashed full-screen TUI never strands the pane in alternate-screen or
     /// mouse-reporting modes.
     pub fn mark_exited(&self, id: &str, code: Option<u32>) {
         if let Ok(handle) = self.handle(id) {
-            let reset = Self::APP_OWNED_MODE_RESET;
+            let reset = slate_app::terminal_mode_recovery::APP_OWNED_MODE_RESET;
             let marker = match code {
                 Some(code) => {
                     format!("{reset}\r\n\x1b[90m[Process exited (code {code})]\x1b[0m\r\n")
@@ -1082,12 +1084,39 @@ impl TerminalManager {
         event: &slate_app::terminal_screen::KeyInput,
     ) -> Result<(), String> {
         let handle = self.handle(id)?;
-        let bytes = lock_recover(&handle.state).screen.input(event);
+        let mut guard = lock_recover(&handle.state);
+        let state = &mut *guard;
+        let bytes = state.screen.input(event);
+        // Ctrl-C / Ctrl-D may kill the foreground TUI without cleanup,
+        // leaving origin mode or its scroll region behind — the "typing at
+        // the top" state. The armed check only acts on the self-evident
+        // corpse state, so a TUI that handled the key is never disturbed.
+        if bytes
+            .as_ref()
+            .is_some_and(|b| b.contains(&0x03) || b.contains(&0x04))
+        {
+            state.recovery.arm_interrupt(&mut state.screen);
+        }
+        drop(guard);
         let Some(bytes) = bytes else { return Ok(()) };
         if bytes.is_empty() {
             return Ok(());
         }
         enqueue_input(id, &handle, bytes)
+    }
+
+    /// Drive every terminal's recovery timers — the child-exit confirmation
+    /// and the Ctrl-C/D corpse-state check — from the view's refresh tick.
+    pub fn tick_mode_recovery(&self) {
+        let states: Vec<Arc<Mutex<TerminalState>>> = lock_recover(&self.inner.terminals)
+            .values()
+            .map(|handle| Arc::clone(&handle.state))
+            .collect();
+        for state in states {
+            let mut current = lock_recover(&state);
+            let current = &mut *current;
+            current.recovery.tick(&mut current.screen);
+        }
     }
 
     /// One pointer event translated to cell coordinates at the UI boundary.
@@ -1745,6 +1774,15 @@ fn read_output(
             current.last_output_at = now_millis_u64();
             current.output.push_str(&data);
             current.screen.process(data.as_bytes());
+            // The chunk is already parsed — this is the render-queue's
+            // `afterPending` position in the shell. An echoed mouse report
+            // means a dead application left tracking armed, so the reset
+            // lands immediately rather than on the next tick.
+            let echoed = current.recovery.watch(&data);
+            if echoed {
+                let state = &mut *current;
+                state.recovery.recover(&mut state.screen);
+            }
             // vt100 answers terminal queries itself (DSR, CPR, DA); the
             // program that asked is waiting on the PTY, so the reply must
             // be written back there or applications that probe stall.

@@ -1022,6 +1022,10 @@ impl CanvasView {
                 let alive = this
                     .update(cx, |view, cx| {
                         view.snapshots = view.manager.snapshots();
+                        // Recovery timers — the child-exit confirmation and
+                        // the Ctrl-C/D corpse check (the shell's
+                        // `modeRecoveryTimer`/`interruptRecoveryTimer`).
+                        view.manager.tick_mode_recovery();
                         for event in view.manager.drain_events() {
                             // The shell closed the widget when its process
                             // exited (`onProcessExit ?? onClose`) after writing

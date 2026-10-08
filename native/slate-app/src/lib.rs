@@ -34,6 +34,7 @@ pub mod resources;
 pub mod schema;
 pub mod settings;
 pub mod state;
+pub mod terminal_mode_recovery;
 pub mod terminal_names;
 pub mod terminal_protocol;
 pub mod terminal_screen;

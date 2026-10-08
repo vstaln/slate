@@ -1,6 +1,10 @@
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Control {
     Mode(u16, bool),
+    /// ANSI (non-private) `CSI Ps h` / `CSI Ps l` — mode 4 is IRM (insert),
+    /// which the orphaned-mode recovery reads. Everything else is emitted but
+    /// unconsumed.
+    AnsiMode(u16, bool),
     Cursor(u16),
     Reset,
     Status(u16, bool),
@@ -71,6 +75,14 @@ impl vte::Perform for Commands {
             (b"?", 'h' | 'l') => {
                 for param in params.iter().filter(|p| p.len() == 1) {
                     self.controls.push(Control::Mode(param[0], action == 'h'));
+                }
+            }
+            // Plain `CSI Ps h/l` — ANSI modes (4 = IRM). Emitted separately
+            // from the DEC-private `Mode` so the two namespaces never mix.
+            (b"", 'h' | 'l') => {
+                for param in params.iter().filter(|p| p.len() == 1) {
+                    self.controls
+                        .push(Control::AnsiMode(param[0], action == 'h'));
                 }
             }
             // DECRPM: `CSI ? Ps $ p` asks the screen to report a mode.
