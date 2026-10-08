@@ -1884,16 +1884,14 @@ fn widgets_route(request: &Request, segments: &[String], deps: &mut RouteDeps<'_
                     .unwrap_or_else(|| id.clone());
                 payload["title"] = json!(label);
             }
+            // `widgetType(kind)?.defaultSize ?? 520×360` — the registry's
+            // five entries; every other kind falls through to the fallback.
             let (default_w, default_h) = match kind.as_deref() {
+                Some("terminal") => (620.0, 380.0),
                 Some("planner") => (420.0, 520.0),
                 Some("files") => (580.0, 480.0),
+                Some("browser") => (720.0, 480.0),
                 Some("orchestration") => (520.0, 560.0),
-                Some("notes") | Some("links") => (360.0, 400.0),
-                Some("timer") => (320.0, 300.0),
-                Some("sys-monitor") => (420.0, 420.0),
-                Some("kanban") => (560.0, 480.0),
-                Some("calendar") => (420.0, 400.0),
-                Some("image") => (480.0, 360.0),
                 _ => (520.0, 360.0),
             };
             for (key, default) in [
