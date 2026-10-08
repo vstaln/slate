@@ -370,6 +370,27 @@ pub fn reduce(state: &CanvasState, event: &JournalEntry, clock: Clock) -> Canvas
                 object.insert("updatedAt".into(), json_number(event.at as f64));
             }
             if let Some(widget) = sanitize_widget(&seed, clock) {
+                // `control.add-widget`'s `from` — the shell auto-wired a
+                // connection from the named widget to the new one.
+                if let Some(from) = payload.get("from").and_then(Value::as_str) {
+                    if !from.is_empty()
+                        && from != widget.id
+                        && next.widgets.contains_key(from)
+                    {
+                        let pair_exists = next
+                            .connections
+                            .iter()
+                            .any(|c| c.from == from && c.to == widget.id);
+                        if !pair_exists && next.connections.len() < MAX_CONNECTIONS {
+                            next.connections.push(Connection {
+                                id: format!("conn-{}-{}", event.at, event.seq),
+                                from: from.to_owned(),
+                                to: widget.id.clone(),
+                                born_at: event.at as f64,
+                            });
+                        }
+                    }
+                }
                 next.widgets.insert(widget.id.clone(), widget);
             }
         }

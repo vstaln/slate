@@ -334,14 +334,20 @@ pub fn run() -> Result<(), String> {
 /// publishes to. Commands that only sometimes need the server (canvas focus)
 /// call this lazily so the rest of their surface works with the app closed.
 fn control() -> Result<(String, String), String> {
-    // `WORKSPACE_CONTROL_PORT` — the http override orc honoured before any
-    // socket path; a set port names a TCP control server instead.
-    let url = env::var("WORKSPACE_CONTROL_PORT")
+    // orc.mjs resolved SOCKET_PATH → URL → CONTROL_PORT. The port order
+    // matters here because nothing listens on TCP — a stale
+    // WORKSPACE_CONTROL_PORT must fall *behind* the socket the app is
+    // actually serving on, not ahead of it.
+    let url = env::var("SLATE_SOCKET_PATH")
         .ok()
         .filter(|s| !s.is_empty())
-        .map(|port| format!("http://127.0.0.1:{port}"))
-        .or_else(|| env::var("SLATE_SOCKET_PATH").ok().filter(|s| !s.is_empty()))
         .or_else(|| env::var("SLATE_URL").ok().filter(|s| !s.is_empty()))
+        .or_else(|| {
+            env::var("WORKSPACE_CONTROL_PORT")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(|port| format!("http://127.0.0.1:{port}"))
+        })
         .unwrap_or_else(|| slate_app::ipc::socket_path(slate_app::ipc::is_dev_environment()));
     let token = env::var("SLATE_TOKEN")
         .ok()
@@ -366,17 +372,11 @@ fn live_control() -> Option<(String, String)> {
 
 /// `POST /canvas/image`'s extension gate, mirrored client-side so the server
 /// path and the offline journal path reject the same files with the route's
-/// own message. Keep the list in step with the route's in http.rs.
+/// own message. The shared `classify_media` table keeps this in step with
+/// http.rs and `attachments::import_image`.
 fn check_image_path(path: &str) -> Result<(), String> {
-    let extension = std::path::Path::new(path)
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    if ![
-        "png", "jpg", "jpeg", "gif", "webp", "avif", "bmp", "svg", "heic", "tif", "tiff", "ico",
-    ]
-    .contains(&extension.as_str())
+    if slate_app::attachments::classify_media(std::path::Path::new(path))
+        != slate_app::attachments::MediaKind::Image
     {
         return Err(format!("{path} is not an image"));
     }
@@ -729,7 +729,7 @@ fn run_plan(parsed: &slate_app::cli::Args) -> Result<(), String> {
     let dir = slate_app::ipc::user_data_dir();
     let journal_path = dir.join("command-journal.ndjson");
     let doc_path = dir.join("workspace-planner.json");
-    let today = planner::today_utc();
+    let today = planner::today_local();
     let load_doc = |_: &()| -> Result<PlannerDocument, String> {
         let log = JournalLog::open(&journal_path).map_err(|e| e.to_string())?;
         PlannerDocument::recover(&doc_path, &log, &today)
@@ -788,6 +788,12 @@ fn run_plan(parsed: &slate_app::cli::Args) -> Result<(), String> {
             if !attachments.is_empty() {
                 payload["attachments"] = json!(attachments);
             }
+            // `createItem` stamped `order: nextOrder(day)` — max order among
+            // same-day items + 1 — so new tasks sort after their day-mates
+            // instead of all landing on 0.
+            let doc = load_doc(&())?;
+            let day = planner::safe_day(payload.get("day"), &today);
+            payload["order"] = json!(planner::next_order(doc.items.values(), day.as_deref()));
             let entry = journal
                 .commit("cli", "plan.create", "plan:new", payload)
                 .map_err(|e| e.to_string())?;
@@ -1155,9 +1161,6 @@ fn run_canvas(parsed: &slate_app::cli::Args) -> Result<(), String> {
                 .pick(&["kind"])
                 .or_else(|| parsed.positionals().get(2).cloned())
                 .ok_or("canvas place needs <kind> or --kind <kind>")?;
-            if kind == "browser" {
-                return Err("browser widgets are not supported in the native build".into());
-            }
             let image_path = parsed
                 .pick(&["path", "image", "file"])
                 .or_else(|| parsed.positionals().get(3).cloned());
@@ -1176,6 +1179,7 @@ fn run_canvas(parsed: &slate_app::cli::Args) -> Result<(), String> {
                 "calendar",
                 "links",
                 "image",
+                "browser",
             ];
             if !known.contains(&kind.as_str()) {
                 return Err(format!(
@@ -2714,14 +2718,13 @@ fn parse_response(response: &[u8]) -> Result<Value, String> {
 
 /// A second `slate --gui` hands off to the running instance — the shell's
 /// `requestSingleInstanceLock` + `second-instance` → `focusMainWindow`.
-/// Returns true when the running app acknowledged the raise.
-pub fn raise_existing_instance() -> bool {
-    let Ok((url, token)) = control() else {
-        return false;
-    };
-    request(&url, &token, "POST", "/raise", Some(json!({})))
-        .map(|_| ())
-        .is_ok()
+/// `dir` rides along when the invocation named a workspace path (the
+/// shell's `handleSecondInstanceArgs` → `setWorkspaceDir`). `Ok` means the
+/// running app acknowledged the raise; `Err` carries the refusal (a
+/// headless instance has no window to raise).
+pub fn raise_existing_instance(dir: Option<&str>) -> Result<(), String> {
+    let (url, token) = control()?;
+    request(&url, &token, "POST", "/raise", Some(json!({ "dir": dir }))).map(|_| ())
 }
 
 #[cfg(test)]

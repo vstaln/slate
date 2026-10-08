@@ -31,10 +31,11 @@
 //! - `"toggle"`      `{}` — the `»`/`«` buttons flipping rail ⇄ panel
 //!   (`native-ui.json` `sidebar_open`).
 //!
-//! What did not port: the folders flyout and the account/settings
-//! affordances have no `sidebar_command` verb — the current workspace is
-//! a read-only row standing in for the old `Folders · current:` tooltip,
-//! and recents stay in `workspace.json` until a verb exists to open them.
+//! - `"settings"`    `{}` — the account footer's settings affordance.
+//!
+//! What did not port: the folders flyout — the current workspace is a
+//! read-only row standing in for the old `Folders · current:` tooltip,
+//! and recents open through the Overview's workspace picker instead.
 
 use gpui::*;
 use serde_json::{json, Value};
@@ -139,7 +140,8 @@ fn caption(label: &str, count: Option<usize>) -> Div {
         .px_1()
         .child(
             div()
-                .text_xs()
+                .font_family("Departure Mono")
+                .text_size(px(10.0))
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(rgb(theme::hex(theme::text::FAINT)))
                 .child(label.to_uppercase()),
@@ -155,9 +157,10 @@ fn caption(label: &str, count: Option<usize>) -> Div {
     row
 }
 
-/// The rail's `IconButton`: a 38px pill whose label lived in a hover
-/// flyout — here the hover fill alone carries it. `badge` is the accent
-/// pill (`bg-accent text-bg` → `status::INFO` on `BASE`) for counts.
+/// The rail's `IconButton`: a 38px square button whose label lived in a
+/// hover flyout — here the hover fill alone carries it. `badge` is the
+/// accent chip (`bg-accent text-bg` → the sand accent on `BASE`) for
+/// counts.
 fn rail_button(
     id: impl Into<ElementId>,
     glyph: &'static str,
@@ -175,7 +178,6 @@ fn rail_button(
         .w(px(38.0))
         .h(px(38.0))
         .flex_none()
-        .rounded_full()
         .cursor_pointer()
         .text_sm()
         .text_color(rgb(theme::hex(theme::text::DIM)))
@@ -200,11 +202,10 @@ fn rail_button(
                 .min_w(px(15.0))
                 .h(px(15.0))
                 .px(px(3.0))
-                .rounded_full()
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(rgb(theme::hex(theme::status::INFO)))
+                .bg(rgb(theme::hex(theme::accent::SAND)))
                 .text_size(px(9.0))
                 .text_color(rgb(theme::hex(theme::monochrome::BASE)))
                 .child(badge.to_string()),
@@ -232,7 +233,6 @@ fn widget_row(
         .gap_1()
         .h(px(30.0))
         .px_2()
-        .rounded_md()
         .cursor_pointer()
         .hover(|el| el.bg(rgb(theme::hex(theme::monochrome::RAISED))))
         .child(
@@ -247,6 +247,7 @@ fn widget_row(
         .child(
             div()
                 .flex_none()
+                .font_family("Departure Mono")
                 .text_size(px(9.0))
                 .text_color(rgb(theme::hex(theme::text::FAINT)))
                 .child(kind),
@@ -256,7 +257,6 @@ fn widget_row(
                 .id(format!("sidebar-close-{}", widget.id))
                 .flex_none()
                 .px_1()
-                .rounded_md()
                 .text_xs()
                 .invisible()
                 .group_hover(group, |el| el.visible())
@@ -285,7 +285,7 @@ fn widget_row(
         )
 }
 
-/// One unchecked planner item: the pane's round check button plus the
+/// One unchecked planner item: the pane's check box plus the
 /// title (and the project when it has one). Press → `plan_toggle`; every
 /// row here is open, so `done` goes out `true`.
 fn plan_row(
@@ -301,7 +301,6 @@ fn plan_row(
         .gap_2()
         .px_2()
         .py(px(4.0))
-        .rounded_md()
         .cursor_pointer()
         .text_xs()
         .text_color(rgb(theme::hex(theme::text::DIM)))
@@ -314,7 +313,6 @@ fn plan_row(
                 .flex_none()
                 .w(px(12.0))
                 .h(px(12.0))
-                .rounded_full()
                 .border_1()
                 .border_color(rgb(theme::hex(theme::hairline::FAINT))),
         )
@@ -330,6 +328,7 @@ fn plan_row(
         row = row.child(
             div()
                 .flex_none()
+                .font_family("Departure Mono")
                 .text_size(px(9.0))
                 .text_color(rgb(theme::hex(theme::text::FAINT)))
                 .truncate()
@@ -359,15 +358,15 @@ fn spawn_chip(
         .flex_none()
         .border_1()
         .border_color(rgb(theme::hex(theme::hairline::SOFT)))
-        .rounded_md()
         .cursor_pointer()
+        .font_family("Departure Mono")
         .text_size(px(10.0))
         .text_color(rgb(theme::hex(theme::text::DIM)))
         .hover(|el| {
             el.bg(rgb(theme::hex(theme::monochrome::RAISED)))
                 .text_color(rgb(theme::hex(theme::text::NORMAL)))
         })
-        .child(format!("+ {label}"))
+        .child(format!("+ {}", label.to_uppercase()))
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, _event, _window, cx| {
@@ -446,6 +445,7 @@ fn collapsed_rail(
 fn expanded_panel(
     canvas: &slate_app::projection::CanvasState,
     planner_items: &Value,
+    user_name: &str,
     cx: &mut Context<crate::canvas_view::CanvasView>,
 ) -> Div {
     // Open widgets in stacking order — bottom to top, matching the list a
@@ -472,7 +472,8 @@ fn expanded_panel(
             .border_color(rgb(theme::hex(theme::hairline::FAINT)))
             .child(
                 div()
-                    .text_xs()
+                    .font_family("Departure Mono")
+                    .text_size(px(10.0))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(rgb(theme::hex(theme::text::FAINT)))
                     .child("CANVAS"),
@@ -481,7 +482,6 @@ fn expanded_panel(
                 div()
                     .id("sidebar-collapse")
                     .px_1()
-                    .rounded_md()
                     .cursor_pointer()
                     .text_xs()
                     .text_color(rgb(theme::hex(theme::text::DIM)))
@@ -510,7 +510,10 @@ fn expanded_panel(
         .min_h_0()
         .overflow_y_scroll()
         .px_2()
-        .py_2();
+        // Extra bottom clearance — the last Add chip row sat flush
+        // against the footer's hairline at the scroll end.
+        .pt_2()
+        .pb_4();
 
     // Workspace area — the rail tooltip's `Folders · current: {name}`
     // flattened to one read-only row. Pressing it spawns Files, the
@@ -534,7 +537,6 @@ fn expanded_panel(
                         .flex()
                         .flex_col()
                         .gap(px(1.0))
-                        .rounded_md()
                         .px_2()
                         .py(px(6.0))
                         .cursor_pointer()
@@ -652,10 +654,10 @@ fn expanded_panel(
             .items_center()
             .justify_center()
             .gap_2()
-            .rounded_md()
             .border_1()
             .border_color(rgb(theme::hex(theme::hairline::SOFT)))
             .bg(rgb(theme::hex(theme::monochrome::ELEVATED)))
+            .font_family("Departure Mono")
             .text_size(px(11.0))
             .text_color(rgb(theme::hex(theme::text::DIM)))
             .cursor_pointer()
@@ -663,13 +665,108 @@ fn expanded_panel(
                 el.bg(rgb(theme::hex(theme::monochrome::RAISED)))
                     .text_color(rgb(theme::hex(theme::text::NORMAL)))
             })
-            .child("+ New terminal")
+            .child("+ NEW TERMINAL")
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _event, _window, cx| {
                     cx.stop_propagation();
                     this.sidebar_command("spawn", json!({"kind": "terminal"}), cx);
                 }),
+            ),
+    );
+
+    // ── Account footer — the shell's `border-t` footer row: avatar
+    // initials + name opening account settings, gear for the settings
+    // modal. The initials circle is squared off like every other tile.
+    let initials: String = {
+        let mut chars = user_name.trim().chars().filter(|c| c.is_alphanumeric());
+        let first = chars.next().map(|c| c.to_ascii_uppercase());
+        let second = chars.next().map(|c| c.to_ascii_uppercase());
+        match (first, second) {
+            (Some(a), Some(b)) => format!("{a}{b}"),
+            (Some(a), None) => a.to_string(),
+            _ => "YO".to_owned(),
+        }
+    };
+    panel = panel.child(
+        div()
+            .flex_none()
+            .h(px(40.0))
+            .px_2()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .border_t_1()
+            .border_color(rgb(theme::hex(theme::hairline::FAINT)))
+            .child(
+                div()
+                    .id("sidebar-account")
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _event, _window, cx| {
+                            cx.stop_propagation();
+                            this.sidebar_command("settings", json!({}), cx);
+                        }),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .size(px(22.0))
+                            .border_1()
+                            .border_color(rgb(theme::hex(theme::hairline::SOFT)))
+                            .bg(rgb(theme::hex(theme::monochrome::RAISED)))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .font_family("Departure Mono")
+                            .text_size(px(9.0))
+                            .text_color(rgb(theme::hex(theme::accent::SAND)))
+                            .child(initials),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .font_family("Departure Mono")
+                            .text_size(px(11.0))
+                            .text_color(rgb(theme::hex(theme::text::DIM)))
+                            .child(user_name.to_owned()),
+                    ),
+            )
+            .child(
+                div()
+                    .id("sidebar-account-settings")
+                    .flex_none()
+                    .size(px(22.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .text_color(rgb(theme::hex(theme::text::FAINT)))
+                    .hover(|el| {
+                        el.bg(rgb(theme::hex(theme::monochrome::RAISED)))
+                            .text_color(rgb(theme::hex(theme::text::NORMAL)))
+                    })
+                    .child(crate::assets::icon(
+                        "settings",
+                        13.0,
+                        theme::hex(theme::text::FAINT),
+                    ))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _event, _window, cx| {
+                            cx.stop_propagation();
+                            this.sidebar_command("settings", json!({}), cx);
+                        }),
+                    ),
             ),
     );
 
@@ -683,6 +780,7 @@ pub fn sidebar_pane(
     canvas: &slate_app::projection::CanvasState,
     planner_items: &Value,
     open: bool,
+    user_name: &str,
     cx: &mut Context<crate::canvas_view::CanvasView>,
 ) -> impl IntoElement {
     let width = if open {
@@ -708,7 +806,7 @@ pub fn sidebar_pane(
             cx.listener(|_this, _event, _window, cx| cx.stop_propagation()),
         )
         .child(if open {
-            expanded_panel(canvas, planner_items, cx)
+            expanded_panel(canvas, planner_items, user_name, cx)
         } else {
             collapsed_rail(canvas, planner_items, cx)
         })

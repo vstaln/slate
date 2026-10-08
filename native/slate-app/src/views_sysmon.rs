@@ -25,9 +25,15 @@ const CPU_BLUE: u32 = 0x7aa2f7;
 const RAM_GREEN: u32 = 0x7fd99a;
 const WARN_AMBER: u32 = 0xe6c07b;
 
-/// (idle_ticks, total_ticks) from the previous render — the only way a
-/// sampling pane gets a percentage without sleeping: diff consecutive views.
-static LAST_CPU: std::sync::Mutex<Option<(u64, u64)>> = std::sync::Mutex::new(None);
+/// (idle_ticks, total_ticks) per widget from the previous render — the only
+/// way a sampling pane gets a percentage without sleeping: diff consecutive
+/// views. Keyed by widget id so two sys-monitor cards don't pollute each
+/// other's delta.
+static LAST_CPU: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<std::string::String, (u64, u64)>>,
+> = std::sync::LazyLock::new(|| {
+    std::sync::Mutex::new(std::collections::HashMap::new())
+});
 
 #[derive(Default)]
 pub struct Snapshot {
@@ -64,10 +70,15 @@ fn read_cpu_ticks() -> Option<(u64, u64)> {
     Some((idle, total))
 }
 
-fn sample_cpu_percent(load: Option<[f64; 3]>, cores: usize) -> Option<f32> {
+fn sample_cpu_percent(
+    key: &str,
+    load: Option<[f64; 3]>,
+    cores: usize,
+) -> Option<f32> {
     let now = read_cpu_ticks();
-    let mut last = LAST_CPU.lock().ok()?;
-    let percent = match (now, *last) {
+    let mut map = LAST_CPU.lock().ok()?;
+    let last = map.get(key).copied();
+    let percent = match (now, last) {
         (Some((idle, total)), Some((prev_idle, prev_total))) => {
             let busy =
                 (total.saturating_sub(prev_total)).saturating_sub(idle.saturating_sub(prev_idle));
@@ -85,7 +96,10 @@ fn sample_cpu_percent(load: Option<[f64; 3]>, cores: usize) -> Option<f32> {
         }
         (None, _) => None,
     };
-    *last = now;
+    match now {
+        Some(ticks) => map.insert(key.to_owned(), ticks),
+        None => map.remove(key),
+    };
     percent
 }
 
@@ -152,13 +166,15 @@ fn read_hostname() -> Option<String> {
 
 /// One render's worth of `/proc` — every field optional so a non-Linux host
 /// (or a locked-down proc) degrades to `—` rows rather than an empty pane.
-pub fn snapshot() -> Snapshot {
+/// `key` scopes the CPU delta to one widget (two sysmon widgets render per
+/// tick and would otherwise halve each other's sample window).
+pub fn snapshot(key: &str) -> Snapshot {
     let (cpu_model, cpu_count) = read_cpuinfo();
     let load = read_load();
     let cores = cpu_count.unwrap_or(1);
     let (mem_total_kb, mem_used_kb) = read_meminfo();
     Snapshot {
-        cpu_percent: sample_cpu_percent(load, cores),
+        cpu_percent: sample_cpu_percent(key, load, cores),
         load,
         mem_total_kb,
         mem_used_kb,
@@ -229,7 +245,6 @@ fn card(children: Vec<AnyElement>) -> Div {
         .flex()
         .flex_col()
         .gap_1()
-        .rounded_md()
         .border_1()
         .border_color(rgb(theme::hex(theme::hairline::SOFT)))
         .bg(rgb(theme::hex(theme::monochrome::ELEVATED)))
@@ -267,14 +282,12 @@ fn meter(fraction: f32, fill: u32) -> impl IntoElement {
     div()
         .h(px(6.0))
         .w_full()
-        .rounded_full()
         .overflow_hidden()
         .bg(rgb(theme::hex(theme::hairline::FAINT)))
         .child(
             div()
                 .h_full()
                 .w(relative(fraction.clamp(0.02, 1.0)))
-                .rounded_full()
                 .bg(rgb(fill)),
         )
 }
@@ -290,11 +303,14 @@ fn meter_color(percent: f32, base: u32, warn_at: f32, danger_at: f32) -> u32 {
     }
 }
 
-pub fn sysmon_pane(cx: &mut Context<crate::canvas_view::CanvasView>) -> impl IntoElement {
+pub fn sysmon_pane(
+    widget_id: &str,
+    cx: &mut Context<crate::canvas_view::CanvasView>,
+) -> impl IntoElement {
     // Read-only pane: /proc sampling happens per render tick; the context is
     // accepted for signature uniformity but unused.
     let _ = cx;
-    let snap = snapshot();
+    let snap = snapshot(widget_id);
     let mut col = div().flex().flex_col().gap_2().p_2();
 
     if snap.cpu_percent.is_none()

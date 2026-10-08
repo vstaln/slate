@@ -185,6 +185,18 @@ fn is_safe_url(url: &str) -> bool {
     {
         return true;
     }
+    // `file%3a/etc/passwd` has no raw scheme and would pass as relative — the
+    // original re-extracted the scheme from the *decoded* string and checked
+    // it against BLOCKED_PROTOCOLS, which is what catches it.
+    if let Some(decoded) = scheme_of(&decoded_for_sniff(&trimmed)) {
+        if matches!(
+            decoded.as_str(),
+            "javascript:" | "data:" | "vbscript:" | "file:" | "blob:"
+        ) || looks_dangerous(&decoded)
+        {
+            return false;
+        }
+    }
     match scheme_of(&trimmed).as_deref() {
         // No scheme at all → a plain relative path/name.
         None => true,
@@ -276,7 +288,6 @@ fn link_row<'a>(
         .flex_row()
         .items_center()
         .gap_2()
-        .rounded_md()
         .border_1()
         .border_color(rgb(theme::hex(theme::hairline::SOFT)))
         .px_2()
@@ -328,7 +339,6 @@ fn link_row<'a>(
             div()
                 .flex_none()
                 .px_1()
-                .rounded_md()
                 .text_xs()
                 .text_color(rgb(theme::hex(theme::text::FAINT)))
                 .cursor_pointer()
@@ -379,7 +389,6 @@ pub fn links_pane(
                 .child(
                     div()
                         .px_1()
-                        .rounded_md()
                         .cursor_pointer()
                         .text_xs()
                         .text_color(rgb(theme::hex(theme::text::DIM)))

@@ -27,6 +27,10 @@ pub struct UiPreferences {
     /// `orcspace-arrange-free-layout` — the pre-arrange snapshot; saved on
     /// the first non-free arrange and cleared when Free replays it.
     pub arrange_free_layout: HashMap<String, FreeRect>,
+    /// `orcspace-flip-terminals` — the TitleBar toggle that swapped every
+    /// terminal's xterm for its flip card; localStorage in the shell,
+    /// `terminalsFlipped` here.
+    pub terminals_flipped: bool,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
@@ -34,12 +38,13 @@ pub struct UiPreferences {
 impl Default for UiPreferences {
     fn default() -> Self {
         Self {
-            sidebar_open: true,
+            sidebar_open: false,
             auto_names: true,
             layout: CodeLayout::Auto,
             three_way_split: [0.5, 0.5],
             arrange_mode: ArrangeMode::Free,
             arrange_free_layout: HashMap::new(),
+            terminals_flipped: false,
             extra: Default::default(),
         }
     }

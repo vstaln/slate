@@ -37,6 +37,13 @@ pub struct TerminalScreen {
     mouse_buttons: [bool; 3],
     mouse_position: Option<(u16, u16)>,
     cursor_blink: bool,
+    /// Modes vt100 tracks internally but never exposes — the orphaned-mode
+    /// recovery (`terminal_mode_recovery`) reads these flags: a dead TUI that
+    /// left DECOM (?6), IRM (4) or a cleared DECAWM (?7) behind strands the
+    /// shell's prompt just as surely as armed mouse reporting.
+    origin_mode: bool,
+    insert_mode: bool,
+    wraparound: bool,
     sync_started: Option<Instant>,
     sync_buffer: Vec<u8>,
     pending_controls: Vec<(usize, Control)>,
@@ -140,6 +147,9 @@ impl Default for TerminalScreen {
             mouse_buttons: [false; 3],
             mouse_position: None,
             cursor_blink: true,
+            origin_mode: false,
+            insert_mode: false,
+            wraparound: true,
             sync_started: None,
             sync_buffer: Vec::new(),
             controls: Decoder::default(),
@@ -328,9 +338,15 @@ impl TerminalScreen {
             offset = end;
             match control {
                 Control::Mode(12, enabled) => self.cursor_blink = enabled,
-                // 9 is the X10 mode (press only); 1000/1002/1003 widen to
-                // release, button-motion, any-motion tracking.
-                Control::Mode(mode @ (9 | 1000 | 1002 | 1003), enabled) => {
+                // Mirrored for the recovery check; vt100 applies both to the
+                // grid itself. 6 is DECOM (origin), 7 is DECAWM (autowrap).
+                Control::Mode(6, enabled) => self.origin_mode = enabled,
+                Control::Mode(7, enabled) => self.wraparound = enabled,
+                // ANSI mode 4 is IRM (insert). vt100 applies it internally.
+                Control::AnsiMode(4, enabled) => self.insert_mode = enabled,
+                // 9 is the X10 mode (press only); 1000/1001/1002/1003 widen to
+                // release, highlight, button-motion, any-motion tracking.
+                Control::Mode(mode @ (9 | 1000 | 1001 | 1002 | 1003), enabled) => {
                     if enabled {
                         self.mouse_mode = mode;
                     } else if self.mouse_mode == mode {
@@ -366,6 +382,9 @@ impl TerminalScreen {
                     self.mouse_encoding = MouseEncoding::Default;
                     self.mouse_buttons = [false; 3];
                     self.mouse_position = None;
+                    self.origin_mode = false;
+                    self.insert_mode = false;
+                    self.wraparound = true;
                     self.kitty_stack.clear();
                     self.kitty_stack.push(0);
                 }
@@ -499,6 +518,7 @@ impl TerminalScreen {
                             && last.bg == bg
                             && last.bold == style.bold
                             && last.italic == style.italic
+                            && last.underline == style.underline
                         {
                             last.text.push_str(text);
                             continue;
@@ -510,6 +530,7 @@ impl TerminalScreen {
                         bg,
                         bold: style.bold || is_cursor,
                         italic: style.italic,
+                        underline: style.underline,
                         cursor: is_cursor,
                     });
                 }
@@ -784,6 +805,27 @@ impl TerminalScreen {
         self.mouse_mode != 0
     }
 
+    /// True while the emulator sits on the alternate buffer — a full-screen
+    /// program owns the terminal. The initial-command gate reads this.
+    pub fn alternate_screen(&self) -> bool {
+        self.screen().alternate_screen()
+    }
+
+    /// Whether the emulator is holding modes that no longer belong to
+    /// anything — `hasOrphanedModes` in the shell's terminalModeRecovery.ts.
+    /// A shell prompt never wants mouse tracking, the alternate buffer,
+    /// origin mode, an open synchronized-output frame or insert mode, and it
+    /// never turns autowrap off: any of them armed means the application that
+    /// asked for them died without unwinding.
+    pub fn has_orphaned_modes(&self) -> bool {
+        self.mouse_reporting()
+            || self.alternate_screen()
+            || self.origin_mode
+            || self.sync_started.is_some()
+            || self.insert_mode
+            || !self.wraparound
+    }
+
     /// True while DECSET 1016 is the active mouse encoding — reports then
     /// carry pixel coordinates, so `mouse_event` callers should pass the
     /// pointer's pixel position rather than a cell.
@@ -1022,7 +1064,9 @@ impl TerminalScreen {
     fn mode_state(&self, mode: u16) -> u8 {
         let set = match mode {
             1 => self.screen().application_cursor(),
-            9 | 1000 | 1002 | 1003 => self.mouse_mode == mode,
+            6 => self.origin_mode,
+            7 => self.wraparound,
+            9 | 1000 | 1001 | 1002 | 1003 => self.mouse_mode == mode,
             12 => self.cursor_blink,
             25 => !self.screen().hide_cursor(),
             1004 => self.focus_reporting,
@@ -1385,6 +1429,7 @@ pub struct StyledRun {
     pub bg: CellRgb,
     pub bold: bool,
     pub italic: bool,
+    pub underline: bool,
     /// True for the single run that is the cursor cell; its colours are
     /// already swapped, this flag only exists so a neighbour never merges
     /// into it.
@@ -1399,6 +1444,7 @@ struct CellStyle {
     bg: CellRgb,
     bold: bool,
     italic: bool,
+    underline: bool,
 }
 
 impl CellStyle {
@@ -1423,6 +1469,7 @@ impl CellStyle {
             bg,
             bold: cell.bold(),
             italic: cell.italic(),
+            underline: cell.underline(),
         }
     }
 }

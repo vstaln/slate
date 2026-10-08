@@ -202,9 +202,10 @@ fn move_target(day: Option<&str>, today: &str, week_end: &str) -> (Scope, Option
 pub fn planner_items() -> (Vec<PlannerRow>, Option<String>) {
     let dir = slate_app::ipc::user_data_dir();
     let log = slate_app::journal_log::JournalLog::open(dir.join("command-journal.ndjson"));
-    // `today_utc` like `cli_run.rs`'s recover — the fold resolves "today" /
-    // "tomorrow" strings in the journal tail, and both surfaces must agree.
-    let today = slate_app::planner::today_utc();
+    // `today_local` like `cli_run.rs`'s recover and the HTTP fold — the
+    // Electron store resolved "today" / "tomorrow" against `localDayKey`,
+    // the machine's local calendar day, and every surface must agree.
+    let today = slate_app::planner::today_local();
     let (items, error) = match log {
         Ok(log) => match slate_app::planner_document::PlannerDocument::recover(
             dir.join("workspace-planner.json"),
@@ -247,7 +248,6 @@ fn row_button<'a>(
     div()
         .text_xs()
         .cursor_pointer()
-        .rounded_md()
         .px_1()
         .invisible()
         .group_hover(group, |el| el.visible())
@@ -303,7 +303,6 @@ fn planner_row<'a>(
                 .flex_none()
                 .w(px(14.))
                 .h(px(14.))
-                .rounded_full()
                 .border_1()
                 .border_color(rgb(theme::hex(if row.done {
                     theme::status::OK
@@ -406,7 +405,6 @@ fn planner_row<'a>(
         .group(format!("plan-row-{}", row.id))
         .flex()
         .flex_col()
-        .rounded_md()
         .px_1()
         .py_1()
         .hover(|el| el.bg(rgb(theme::hex(theme::monochrome::RAISED))))
@@ -437,7 +435,7 @@ pub fn planner_pane(
         .map(str::to_owned);
 
     // The original's `q = ln()` — the *local* day, matching what the user
-    // sees. `today_utc` stays on the fold path (journal replay) only.
+    // sees and what the fold path resolves.
     let today = slate_app::planner::today_local().0;
     let week_end = shift_day(&today, 6);
 
@@ -510,7 +508,6 @@ pub fn planner_pane(
             div()
                 .text_xs()
                 .cursor_pointer()
-                .rounded_md()
                 .px_1()
                 .text_color(rgb(theme::hex(theme::text::FAINT)))
                 .hover(|el| {
@@ -542,7 +539,6 @@ pub fn planner_pane(
             .child(
                 div()
                     .flex_none()
-                    .rounded_full()
                     .border_1()
                     .border_color(rgb(theme::hex(theme::hairline::SOFT)))
                     .px_2()
@@ -567,7 +563,6 @@ pub fn planner_pane(
             div()
                 .text_xs()
                 .cursor_pointer()
-                .rounded_full()
                 .px_2()
                 .py_1()
                 .text_color(rgb(theme::hex(if selected {
@@ -608,7 +603,6 @@ pub fn planner_pane(
             div()
                 .text_xs()
                 .cursor_pointer()
-                .rounded_md()
                 .px_1()
                 .text_color(rgb(theme::hex(if any_selected {
                     theme::text::NORMAL
@@ -648,7 +642,6 @@ pub fn planner_pane(
                 div()
                     .text_xs()
                     .cursor_pointer()
-                    .rounded_md()
                     .px_1()
                     .truncate()
                     .text_color(rgb(theme::hex(if selected {
@@ -700,7 +693,6 @@ pub fn planner_pane(
             div()
                 .text_sm()
                 .cursor_pointer()
-                .rounded_md()
                 .mx_1()
                 .px_2()
                 .py_1()

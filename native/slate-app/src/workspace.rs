@@ -177,13 +177,23 @@ impl WorkspaceState {
         self.recent.retain(|r| r.path != path);
     }
 
-    /// The picker's rename affordance — display name only.
+    /// The picker's rename affordance — display name only. Mirrors the
+    /// shell's `renameRecent` validation: ≤80 chars, not `.`/`..`, no
+    /// `<>:"/\|?*`, no trailing dot or space.
     pub fn rename_recent(&mut self, path: &str, name: &str) {
+        let name = name.trim();
+        let valid = !name.is_empty()
+            && name.len() <= 80
+            && name != "."
+            && name != ".."
+            && !name.chars().any(|c| "<>:\"/\\|?*".contains(c))
+            && !name.ends_with('.')
+            && !name.ends_with(' ');
+        if !valid {
+            return;
+        }
         if let Some(entry) = self.recent.iter_mut().find(|r| r.path == path) {
-            let name = name.trim();
-            if !name.is_empty() {
-                entry.name = name.to_owned();
-            }
+            entry.name = name.to_owned();
         }
     }
 

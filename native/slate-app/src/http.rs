@@ -2254,13 +2254,21 @@ fn canvas_route(request: &Request, segments: &[String], deps: &mut RouteDeps<'_>
                 Err(response) => response,
             }
         }
-        // `/canvas/media` imported any file into a Browser widget; the native
-        // build has no webview, so only `image` survives.
-        ("POST", Some("media")) => Response::from_error(&CommandError::new(
-            ErrorCode::Failed,
-            "media widgets are not supported in the native build",
-        )),
-        ("POST", Some("image")) => {
+        // `/canvas/media` and `/canvas/image` are the original's one route:
+        // the file imports into the media store, then `widget.create` places
+        // it — `image` keeps the image-only extension gate and lands an
+        // `image` widget; `media` takes any file into a `browser` widget and
+        // reports the classified `kind`. The shell then broadcast
+        // `control:open-media` so the fresh widget learned what to show —
+        // natively that reference rides in the widget's journaled
+        // `state.media`, the same `{mediaUrl, path, name, kind}` shape.
+        ("POST", Some(kind @ ("media" | "image"))) => {
+            let image_widget = kind == "image";
+            let route = if image_widget {
+                "POST /canvas/image"
+            } else {
+                "POST /canvas/media"
+            };
             let source = request
                 .text("path")
                 .or_else(|| request.text("image"))
@@ -2275,31 +2283,23 @@ fn canvas_route(request: &Request, segments: &[String], deps: &mut RouteDeps<'_>
             if source.starts_with("\\\\") || source.starts_with("//") || !path.is_absolute() {
                 return invalid(format!("path must be absolute and local: {source}"));
             }
-            let extension = path
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            if ![
-                "png", "jpg", "jpeg", "gif", "webp", "avif", "bmp", "svg", "heic", "tif", "tiff",
-                "ico",
-            ]
-            .contains(&extension.as_str())
-            {
+            let media_kind = crate::attachments::classify_media(path);
+            if image_widget && media_kind != crate::attachments::MediaKind::Image {
                 return invalid(format!("{source} is not an image"));
             }
             let media_dir = match environment(
                 deps,
-                "POST /canvas/image",
+                route,
                 "importing a file needs the media store",
             ) {
                 Ok(env) => env.data_dir().join("media"),
                 Err(response) => return response,
             };
-            let imported = match crate::attachments::import_image(path, &media_dir) {
+            let imported = match crate::attachments::import_media(path, &media_dir) {
                 Ok(path) => path,
                 Err(message) => return invalid(message),
             };
+            // `file.name` — the content-addressed store name.
             let name = imported
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
@@ -2310,19 +2310,22 @@ fn canvas_route(request: &Request, segments: &[String], deps: &mut RouteDeps<'_>
                 .filter(|title| !title.is_empty())
                 .map(str::to_owned)
                 .or_else(|| path.file_name().map(|n| n.to_string_lossy().into_owned()))
-                .unwrap_or_else(|| "Image".to_owned());
+                .unwrap_or_else(|| {
+                    if image_widget {
+                        "Image".to_owned()
+                    } else {
+                        "Browser".to_owned()
+                    }
+                });
+            let widget_kind = if image_widget { "image" } else { "browser" };
             let id = format!(
-                "image-{}-{}",
+                "{widget_kind}-{}-{}",
                 deps.now,
                 &uuid::Uuid::new_v4().simple().to_string()[..5]
             );
-            let canvas = environment(
-                deps,
-                "POST /canvas/image",
-                "placing the widget refolds the journal",
-            )
-            .ok()
-            .and_then(|env| folded_canvas(env).ok());
+            let canvas = environment(deps, route, "placing the widget refolds the journal")
+                .ok()
+                .and_then(|env| folded_canvas(env).ok());
             let z = canvas
                 .as_ref()
                 .map(|canvas| canvas.widgets.values().map(|w| w.z).fold(0.0_f64, f64::max) + 1.0)
@@ -2347,20 +2350,37 @@ fn canvas_route(request: &Request, segments: &[String], deps: &mut RouteDeps<'_>
                         .map(|canvas| canvas.camera.y + 80.0)
                         .unwrap_or(0.0)
                 });
-            match journal_commit(
-                deps,
-                request,
-                "widget.create",
-                "widget:new",
-                json!({
-                    "id": id, "title": title, "kind": "image",
-                    "x": x, "y": y, "w": 480.0, "h": 360.0, "z": z,
-                    "maximized": false,
-                    "imagePath": imported.to_string_lossy(),
-                    "imageName": name,
-                }),
-                "POST /canvas/image",
-            ) {
+            // Widget defaults — the registry's `defaultSize` for each kind.
+            let (w, h) = if image_widget {
+                (480.0, 360.0)
+            } else {
+                (720.0, 480.0)
+            };
+            // `mediaKindOf` — the route's five-bucket kind, which the
+            // response and the widget's media record both report.
+            let kind = crate::attachments::media_kind_of(path);
+            let mut payload = json!({
+                "id": id, "title": title, "kind": widget_kind,
+                "x": x, "y": y, "w": w, "h": h, "z": z,
+                "maximized": false,
+            });
+            if image_widget {
+                payload["imagePath"] = json!(imported.to_string_lossy());
+                payload["imageName"] = json!(name);
+            } else {
+                payload["state"] = json!({
+                    "media": {
+                        "mediaUrl": format!("orc://media/{name}"),
+                        "path": imported.to_string_lossy(),
+                        "name": path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| title.clone()),
+                        "kind": kind,
+                    }
+                });
+            }
+            match journal_commit(deps, request, "widget.create", "widget:new", payload, route) {
                 Ok(entry) => accepted(
                     &entry,
                     201,
@@ -2369,8 +2389,8 @@ fn canvas_route(request: &Request, segments: &[String], deps: &mut RouteDeps<'_>
                         "title": title,
                         "path": imported.to_string_lossy(),
                         "name": name,
-                        "kind": "image",
-                        "widgetKind": "image",
+                        "kind": kind,
+                        "widgetKind": widget_kind,
                     }),
                 ),
                 Err(response) => response,
@@ -2452,6 +2472,26 @@ fn planner_route(request: &Request, segments: &[String], deps: &mut RouteDeps<'_
                     {
                         return invalid(invalid_day.0);
                     }
+                }
+            }
+            // `createItem` stamped `order: nextOrder(day)` — max order among
+            // same-day items + 1 — so new items sort after their day-mates.
+            {
+                let env = match environment(
+                    deps,
+                    "POST /planner",
+                    "the planner folds the journal",
+                ) {
+                    Ok(env) => env,
+                    Err(response) => return response,
+                };
+                if let Ok(items) = plan_items(env) {
+                    let day = crate::planner::safe_day(
+                        payload.get("day"),
+                        &crate::planner::today_local(),
+                    );
+                    payload["order"] =
+                        json!(crate::planner::next_order(items.iter(), day.as_deref()));
                 }
             }
             // The TypeScript target was `plan:new` and the reducer minted the
@@ -3218,7 +3258,7 @@ fn browser_route(request: &Request, segments: &[String], deps: &mut RouteDeps<'_
 
 /// `GET /media/{name}` — the control-socket port of the shell's `orc://media`
 /// scheme and `media.dataUrl` IPC. The store is `{data_dir}/media`, where
-/// `attachments::import_image` writes each import as `<sha256>.<ext>`; the
+/// `attachments::import_media` writes each import as `<sha256>.<ext>`; the
 /// wire `Response` carries a JSON `body` only, so the bytes answer as a
 /// `data:` URL through `Response::bytes` rather than as a raw body.
 fn media_route(request: &Request, segments: &[String], deps: &mut RouteDeps<'_>) -> Response {
@@ -3238,20 +3278,16 @@ fn media_route(request: &Request, segments: &[String], deps: &mut RouteDeps<'_>)
         .and_then(|ext| ext.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    // The same extension list `POST /canvas/image` accepts, mapped to the
-    // Content-Type a raw serve would send.
-    let content_type = match extension.as_str() {
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "svg" => "image/svg+xml",
-        "avif" => "image/avif",
-        "bmp" => "image/bmp",
-        "heic" => "image/heic",
-        "tif" | "tiff" => "image/tiff",
-        "ico" => "image/x-icon",
-        _ => return not_found(format!("no such media: {name}")),
+    // `mimeTypeForPath` over the full `MEDIA_MIME_BY_EXT` — every imported
+    // kind is servable, not just images; an unknown spelling answers
+    // `application/octet-stream`. `orc://media` refused to serve
+    // `ACTIVE_EXTS` under their real type (markup/script would execute inside
+    // the shell) and downgraded them to text/plain + attachment; over this
+    // socket the downgrade is what survives.
+    let content_type = if crate::attachments::is_active_extension(&extension) {
+        "text/plain; charset=utf-8"
+    } else {
+        crate::attachments::mime_type_for_extension(&extension)
     };
     let env = match environment(deps, "GET /media", "media files live beside the journal") {
         Ok(env) => env,

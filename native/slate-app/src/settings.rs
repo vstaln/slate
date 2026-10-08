@@ -24,7 +24,8 @@ const RETIRED_WIDGETS: [&str; 3] = ["translator", "id-generator", "note"];
 
 /// `zi` — agent ids the built-ins own; a custom agent may not reuse one
 /// (`zi.has(c.toLowerCase())` — the reserved check is case-insensitive).
-const RESERVED_AGENT_IDS: [&str; 9] = [
+const RESERVED_AGENT_IDS: [&str; 10] = [
+    "gray",
     "claude",
     "codex",
     "antigravity",

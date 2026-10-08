@@ -137,8 +137,14 @@ struct Inner {
     camera_request: Mutex<Option<CameraRequest>>,
     /// The same one-slot mailbox for `POST /raise`: the socket thread cannot
     /// touch the window, so it leaves a flag the view picks up and clears on
-    /// its next tick.
-    raise_requested: Mutex<bool>,
+    /// its next tick. `Some(None)` is a bare raise; `Some(Some(dir))` also
+    /// hands a workspace dir off — the shell's `handleSecondInstanceArgs`
+    /// `setWorkspaceDir` call.
+    raise_requested: Mutex<Option<Option<String>>>,
+    /// `--headless` instances run the control server without a window — the
+    /// `/raise` route reads this so it can refuse instead of pretending a
+    /// raise happened.
+    headless: Mutex<bool>,
 }
 
 /// What `POST /canvas/focus` wants the camera to do. Either center on a
@@ -242,6 +248,11 @@ struct TerminalState {
     /// The child exit code when the waiter reported one — the marker prints
     /// `[Process exited (code N)]` like the shell did.
     exit_code: Option<u32>,
+    /// Orphaned-mode recovery — the shell's `terminalModeRecovery.ts`. Every
+    /// output chunk flows through its probes: echoed mouse reports and
+    /// console-title child exits are how a crashed TUI's leftover modes are
+    /// noticed when there is no process exit to hook.
+    recovery: slate_app::terminal_mode_recovery::ModeRecovery,
 }
 
 #[derive(Clone, Debug)]
@@ -258,6 +269,10 @@ pub struct TerminalSnapshot {
     /// 1003) — the GUI routes pointer/wheel events to the PTY then instead of
     /// treating them as widget clicks and scrollback scrolls.
     pub mouse_reporting: bool,
+    /// True while the emulator is on the alternate buffer — a full-screen
+    /// application owns the screen. The initial-command verdict reads this
+    /// alongside `mouse_reporting` (the shell's `bufferType` check).
+    pub alternate: bool,
     /// Active drag-selection highlight, `(visible_row, start_col, end_col)`.
     pub selection: Vec<(u16, u16, u16)>,
     /// Unix-millis of the last output chunk, 0 when the terminal has been
@@ -320,7 +335,8 @@ impl TerminalManager {
                 control_socket: Mutex::new(None),
                 names: Mutex::new(HashMap::new()),
                 camera_request: Mutex::new(None),
-                raise_requested: Mutex::new(false),
+                raise_requested: Mutex::new(None),
+                headless: Mutex::new(false),
             }),
         }
     }
@@ -350,14 +366,29 @@ impl TerminalManager {
 
     /// `POST /raise` parks a flag; the canvas view picks it up and raises the
     /// window on its next tick (`slate` second-instance behaviour).
-    pub fn request_raise(&self) {
-        *lock_recover(&self.inner.raise_requested) = true;
+    pub fn request_raise(&self, dir: Option<String>) {
+        let mut slot = lock_recover(&self.inner.raise_requested);
+        // Two raises collapsing into one tick keep whichever dir was asked
+        // for — a bare raise must not erase a pending workspace handoff.
+        let dir = dir.or_else(|| slot.take().flatten());
+        *slot = Some(dir);
     }
 
-    /// One-shot read, same mailbox shape as `take_camera_request` — a bool
-    /// slot that clears when the view consumes it.
-    pub fn take_raise_request(&self) -> bool {
-        std::mem::replace(&mut *lock_recover(&self.inner.raise_requested), false)
+    /// One-shot read, same mailbox shape as `take_camera_request` — the
+    /// slot clears when the view consumes it. `Some(dir)` means a
+    /// workspace handoff rode along with the raise.
+    pub fn take_raise_request(&self) -> Option<Option<String>> {
+        lock_recover(&self.inner.raise_requested).take()
+    }
+
+    /// Set once at startup before the control server binds — `/raise` only
+    /// has a window to raise when the instance is not headless.
+    pub fn set_headless(&self, headless: bool) {
+        *lock_recover(&self.inner.headless) = headless;
+    }
+
+    pub fn is_headless(&self) -> bool {
+        *lock_recover(&self.inner.headless)
     }
 
     /// Turns whatever a caller typed — an id, `@name`, a case-insensitive or
@@ -510,8 +541,12 @@ impl TerminalManager {
 
     pub fn spawn(&self, id: impl Into<String>) -> Result<(), String> {
         self.spawn_with_options(id, 120, 32, None, shell_command(), HashMap::new())
+            .map(|_| ())
     }
 
+    /// Spawns the PTY, or adopts the existing one when `id` is already
+    /// alive — the shell's `terminal.create` `live` flag as the return
+    /// value: `Ok(true)` means the terminal was already running.
     pub fn spawn_with_options(
         &self,
         id: impl Into<String>,
@@ -520,7 +555,7 @@ impl TerminalManager {
         cwd: Option<String>,
         shell: String,
         extra_env: HashMap<String, String>,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         let id = id.into();
         // Fast check under the lock; the slow PTY work below runs unlocked so
         // one spawn can never stall every other terminal operation.
@@ -528,7 +563,7 @@ impl TerminalManager {
             let terminals = lock_recover(&self.inner.terminals);
             if let Some(existing) = terminals.get(&id) {
                 if lock_recover(&existing.state).alive {
-                    return Ok(());
+                    return Ok(true);
                 }
             }
         }
@@ -688,9 +723,14 @@ impl TerminalManager {
             // announcing the fresh process.
             let restore = format!(
                 "{}\r\n\x1b[90m[Session restored — new process started]\x1b[0m\r\n",
-                Self::APP_OWNED_MODE_RESET
+                slate_app::terminal_mode_recovery::APP_OWNED_MODE_RESET
             );
             current.screen.process(restore.as_bytes());
+            // The history is terminal output that never passed through the
+            // output path, so the recovery probes never saw it — a child-exit
+            // title sitting at the tail is exactly the evidence a crashed
+            // agent's leftover modes are noticed by.
+            let _ = current.recovery.watch(output);
             let _ = current.screen.take_replies();
             let _ = current.screen.take_clipboard_writes();
             current.output.push_str(output);
@@ -795,7 +835,7 @@ impl TerminalManager {
                         kill_process_tree(pid);
                     }
                     let _ = control_tx.send(ControlCommand::Dispose);
-                    return Ok(());
+                    return Ok(true);
                 }
                 terminals.remove(&id);
             }
@@ -816,7 +856,7 @@ impl TerminalManager {
         if let Some(name) = saved_name {
             self.set_name(&id, &name);
         }
-        Ok(())
+        Ok(false)
     }
 
     /// Snapshot every live terminal's scrollback tail + tracked cwd to
@@ -973,21 +1013,13 @@ impl TerminalManager {
         Ok(())
     }
 
-    /// Every mode a full-screen program may have armed, reset — the original's
-    /// `APP_OWNED_MODE_RESET`: mouse reporting off (incl. focus 1004 and SGR
-    /// variants), bracketed paste, synchronized output, alternate screen, cursor
-    /// visible, autowrap on, replace mode, save cursor, origin mode off, full
-    /// scrolling region, restore cursor. A TUI that dies without unwinding these
-    /// would leave the pane in a corrupt state otherwise.
-    const APP_OWNED_MODE_RESET: &str = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?2004l\x1b[?2026l\x1b[?1049l\x1b[?25h\x1b[?7h\x1b[4l\x1b7\x1b[?6l\x1b[r\x1b8";
-
     /// The process-exit marker: the full app-owned-mode reset followed by a
     /// dim `[Process exited]` line (with the code when the waiter saw one), so
     /// a crashed full-screen TUI never strands the pane in alternate-screen or
     /// mouse-reporting modes.
     pub fn mark_exited(&self, id: &str, code: Option<u32>) {
         if let Ok(handle) = self.handle(id) {
-            let reset = Self::APP_OWNED_MODE_RESET;
+            let reset = slate_app::terminal_mode_recovery::APP_OWNED_MODE_RESET;
             let marker = match code {
                 Some(code) => {
                     format!("{reset}\r\n\x1b[90m[Process exited (code {code})]\x1b[0m\r\n")
@@ -1052,12 +1084,39 @@ impl TerminalManager {
         event: &slate_app::terminal_screen::KeyInput,
     ) -> Result<(), String> {
         let handle = self.handle(id)?;
-        let bytes = lock_recover(&handle.state).screen.input(event);
+        let mut guard = lock_recover(&handle.state);
+        let state = &mut *guard;
+        let bytes = state.screen.input(event);
+        // Ctrl-C / Ctrl-D may kill the foreground TUI without cleanup,
+        // leaving origin mode or its scroll region behind — the "typing at
+        // the top" state. The armed check only acts on the self-evident
+        // corpse state, so a TUI that handled the key is never disturbed.
+        if bytes
+            .as_ref()
+            .is_some_and(|b| b.contains(&0x03) || b.contains(&0x04))
+        {
+            state.recovery.arm_interrupt(&mut state.screen);
+        }
+        drop(guard);
         let Some(bytes) = bytes else { return Ok(()) };
         if bytes.is_empty() {
             return Ok(());
         }
         enqueue_input(id, &handle, bytes)
+    }
+
+    /// Drive every terminal's recovery timers — the child-exit confirmation
+    /// and the Ctrl-C/D corpse-state check — from the view's refresh tick.
+    pub fn tick_mode_recovery(&self) {
+        let states: Vec<Arc<Mutex<TerminalState>>> = lock_recover(&self.inner.terminals)
+            .values()
+            .map(|handle| Arc::clone(&handle.state))
+            .collect();
+        for state in states {
+            let mut current = lock_recover(&state);
+            let current = &mut *current;
+            current.recovery.tick(&mut current.screen);
+        }
     }
 
     /// One pointer event translated to cell coordinates at the UI boundary.
@@ -1149,6 +1208,7 @@ impl TerminalManager {
             // than whatever cwd the terminal was spawned in.
             cwd: state.screen.cwd().unwrap_or_else(|| state.cwd.clone()),
             mouse_reporting: state.screen.mouse_reporting(),
+            alternate: state.screen.alternate_screen(),
             selection: state.screen.selection_ranges(),
             last_data_at: state.last_output_at,
         })
@@ -1714,6 +1774,15 @@ fn read_output(
             current.last_output_at = now_millis_u64();
             current.output.push_str(&data);
             current.screen.process(data.as_bytes());
+            // The chunk is already parsed — this is the render-queue's
+            // `afterPending` position in the shell. An echoed mouse report
+            // means a dead application left tracking armed, so the reset
+            // lands immediately rather than on the next tick.
+            let echoed = current.recovery.watch(&data);
+            if echoed {
+                let state = &mut *current;
+                state.recovery.recover(&mut state.screen);
+            }
             // vt100 answers terminal queries itself (DSR, CPR, DA); the
             // program that asked is waiting on the PTY, so the reply must
             // be written back there or applications that probe stall.
@@ -2052,7 +2121,8 @@ struct HttpState {
 /// running, guessed from its title prefix or its output tail. The `~` prefix
 /// marks a heuristic guess, distinguishing it from a dispatch-recorded agent.
 fn detect_running(title: &str, tail: &str) -> Option<String> {
-    const KNOWN_TOOLS: [&str; 10] = [
+    const KNOWN_TOOLS: [&str; 11] = [
+        "gray",
         "antigravity",
         "claude",
         "codex",
@@ -2064,7 +2134,8 @@ fn detect_running(title: &str, tail: &str) -> Option<String> {
         "cursor",
         "cline",
     ];
-    const TAIL_TOOLS: [&str; 8] = [
+    const TAIL_TOOLS: [&str; 9] = [
+        "gray",
         "antigravity",
         "claude",
         "codex",
@@ -2873,10 +2944,30 @@ async fn presence(
 async fn raise_window(
     State(state): State<HttpState>,
     headers: HeaderMap,
+    body: axum::body::Bytes,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     authenticate(&headers, &state.token)?;
     check_rate_limit(&state, &headers, None)?;
-    state.manager.request_raise();
+    // A headless instance has no window to raise — refuse so the second
+    // `slate` reports the conflict instead of exiting on a raise that
+    // parked a flag no canvas view will ever consume.
+    if state.manager.is_headless() {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "instance is running headless — no window to raise",
+                "code": "conflict",
+            })),
+        ));
+    }
+    // Optional workspace handoff — the shell's `handleSecondInstanceArgs`
+    // turned a path argv into `setWorkspaceDir`. A non-dir payload is
+    // ignored, not fatal: the raise still applies.
+    let dir = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v.get("dir").and_then(|d| d.as_str()).map(str::to_owned))
+        .filter(|d| std::path::Path::new(d).is_dir());
+    state.manager.request_raise(dir);
     Ok(Json(serde_json::json!({"ok": true})))
 }
 
@@ -3042,9 +3133,11 @@ async fn screenshot(
 }
 
 /// `GET /media/{name}` — the raw-bytes counterpart of http.rs `media_route`
-/// (which answers the JSON socket protocol). Same single-component name and
-/// the same image extension list, so a real HTTP client — an <img> in a
-/// widget, curl — gets the file itself with its Content-Type.
+/// (which answers the JSON socket protocol) and the port of the shell's
+/// `orc://media` handler. Same single-component name guard; the Content-Type
+/// is `mimeTypeForPath` over the full media table. Like the original's
+/// `ACTIVE_EXTS` downgrade, markup/script extensions are served as plain text
+/// with an attachment disposition so a fetched page can never execute.
 async fn serve_media(
     State(state): State<HttpState>,
     headers: HeaderMap,
@@ -3054,40 +3147,30 @@ async fn serve_media(
     let mut components = std::path::Path::new(&name).components();
     let single_name = matches!(components.next(), Some(std::path::Component::Normal(_)))
         && components.next().is_none();
-    let content_type = single_name
-        .then(|| {
-            match std::path::Path::new(&name)
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .unwrap_or("")
-                .to_ascii_lowercase()
-                .as_str()
-            {
-                "png" => Some("image/png"),
-                "jpg" | "jpeg" => Some("image/jpeg"),
-                "gif" => Some("image/gif"),
-                "webp" => Some("image/webp"),
-                "svg" => Some("image/svg+xml"),
-                "avif" => Some("image/avif"),
-                "bmp" => Some("image/bmp"),
-                "heic" => Some("image/heic"),
-                "tif" | "tiff" => Some("image/tiff"),
-                "ico" => Some("image/x-icon"),
-                _ => None,
-            }
-        })
-        .flatten();
-    let Some(content_type) = content_type else {
-        return Err(bad_request(
-            "media needs a single image file name".to_owned(),
-        ));
+    if !single_name {
+        return Err(bad_request("media needs a file name, not a path".to_owned()));
+    }
+    let extension = std::path::Path::new(&name)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let active = slate_app::attachments::is_active_extension(&extension);
+    let content_type = if active {
+        "text/plain; charset=utf-8"
+    } else {
+        slate_app::attachments::mime_type_for_extension(&extension)
     };
     let file = slate_app::ipc::user_data_dir().join("media").join(&name);
     let bytes = std::fs::read(&file).map_err(|_| bad_request(format!("no such media: {name}")))?;
-    Ok(axum::response::Response::builder()
+    let mut builder = axum::response::Response::builder()
         .header("content-type", content_type)
-        .body(axum::body::Body::from(bytes))
-        .unwrap())
+        .header("x-content-type-options", "nosniff")
+        .header("content-security-policy", "default-src 'none'; sandbox");
+    if active {
+        builder = builder.header("content-disposition", "attachment");
+    }
+    Ok(builder.body(axum::body::Body::from(bytes)).unwrap())
 }
 
 /// The windowed portion of a screenshot request: find the Slate window, crop
@@ -3618,11 +3701,12 @@ fn authenticate(
     if constant_time_token_eq(supplied, token) {
         Ok(())
     } else {
+        // One body for every 401 — the shell answered "a valid control
+        // token is required" on routed and axum paths alike.
         Err((
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({
-                "error": "invalid control token",
-                "code": "unauthorized",
+                "error": "a valid control token is required",
             })),
         ))
     }
@@ -3933,7 +4017,8 @@ mod tests {
             control_socket: std::sync::Mutex::new(None),
             names: std::sync::Mutex::new(std::collections::HashMap::new()),
             camera_request: std::sync::Mutex::new(None),
-            raise_requested: std::sync::Mutex::new(false),
+            raise_requested: std::sync::Mutex::new(None),
+            headless: std::sync::Mutex::new(false),
         });
 
         let first = "a".repeat(MAX_PENDING_EVENT_BYTES / 2);
@@ -3986,7 +4071,8 @@ mod tests {
             control_socket: std::sync::Mutex::new(None),
             names: std::sync::Mutex::new(std::collections::HashMap::new()),
             camera_request: std::sync::Mutex::new(None),
-            raise_requested: std::sync::Mutex::new(false),
+            raise_requested: std::sync::Mutex::new(None),
+            headless: std::sync::Mutex::new(false),
         });
         super::push_event(
             &inner,

@@ -18,35 +18,47 @@
 //!     button (`h-10 w-[46px]`, close hovering `#e04343` → white).
 //!
 //! This port keeps the grid, the surface/hairline chrome, the divider and
-//! the window controls; the rest is adapted to what this build can back:
+//! the window controls, and now backs most of the rest:
 //!
-//! - **View tabs** — Slate is canvas-only, so the centre slot carries the
-//!   workspace folder's name instead: the title a native title bar shows.
-//! - **Arrange** — already ported, as the status bar's `arrange:` chip.
-//! - **Undo/Redo, Flip terminals, Git pill** — `CanvasView::
-//!   titlebar_command` only takes the five actions below; dead buttons
-//!   are worse than none. `undo()`/`undo_stack`/`redo_stack` exist on
-//!   `CanvasView` for when the command gains those arms.
-//! - **presence** — the count is `snapshots.len()` (live terminals); the
-//!   original's closest kin was the git dirty dot, so this renders the
-//!   same way — a status dot + dim count — and hides at `0`.
+//! - **Undo/Redo** — the shell's arrows dispatched `orcspace:canvas-undo`
+//!   /`-redo`; here the `undo`/`redo` commands pop `CanvasView`'s
+//!   `undo_stack`/`redo_stack` directly, dimmed to white/25 when empty.
+//! - **View tabs** — the centre pill is the real `tablist` again: Canvas,
+//!   Code and Overview all switch through `titlebar_command("view")`, the
+//!   active one wearing the raised `bg-bg-hover` paint.
+//! - **Flip terminals** — `orcspace-flip-terminals`, persisted on
+//!   `UiPreferences::terminals_flipped`. Terminal bodies honour it with
+//!   the flip card (`terminal-flip-card`) in `canvas_view::widget_body`.
+//! - **Git pill** — `read_git_chip` runs the same porcelain read the
+//!   `/git/status` route does (`http::git_status`), on the background
+//!   executor every `GIT_POLL_EVERY` like the shell's 8s focused poll.
+//!   The checkout panel isn't ported; a click repolls and flashes the
+//!   branch/dirty summary the original showed as a tooltip.
+//! - **Arrange** — the `LayoutGrid` button between flip and git; its menu
+//!   is `CanvasView`'s `arrange_menu` re-anchored under the bar, where
+//!   the shell's `top-[36px]` popover sat.
 //!
 //! Every control dispatches through `CanvasView::titlebar_command`
-//! (`cx.listener`, `json!({})` payloads): "sidebar" toggles
-//! `prefs.sidebar_open`, "settings" opens the settings modal, "minimize"
-//! → `window.minimize_window()`, "maximize" → `window.zoom_window()` — a
-//! toggle, the original's `toggleMaximize` — and "close" → `cx.quit()`.
-//! The controls row is compiled out on macOS, the original's `!vt` guard
-//! (the traffic lights own that corner there, and the bar's left padding
-//! grows to 78px to clear them). Gpui always answers minimize/zoom/close
-//! on Linux; a platform that can't can gate inside `titlebar_command` via
+//! (`cx.listener`, `json!` payloads): "undo"/"redo" pop the history
+//! rings, "view" switches `CanvasView`'s `active_view` (Canvas | Code |
+//! Overview, each rendering its own `<main>` fill), "flip" toggles
+//! `prefs.terminals_flipped`, "git" repolls the
+//! chip early, "sidebar" toggles `prefs.sidebar_open`, "settings" opens
+//! the settings modal, "minimize" → `window.minimize_window()`,
+//! "maximize" → `window.zoom_window()` — a toggle, the original's
+//! `toggleMaximize` — and "close" → `cx.quit()`. The controls row is
+//! compiled out on macOS, the original's `!vt` guard (the traffic lights
+//! own that corner there, and the bar's left padding grows to 78px to
+//! clear them). Gpui always answers minimize/zoom/close on Linux; a
+//! platform that can't can gate inside `titlebar_command` via
 //! `window.window_controls()`.
 //!
-//! The spacers and title are the `WebkitAppRegion: drag` areas: press
-//! calls `window.start_window_move()` (the `_NET_WM_MOVERESIZE` /
-//! `xdg_toplevel.move` path), right-press opens the native window menu
-//! where the platform has one. Every handler stops propagation — a press
-//! on the bar must never reach the canvas's pan/draw handlers.
+//! The spacers and the workspace title are the `WebkitAppRegion: drag`
+//! areas: press calls `window.start_window_move()` (the
+//! `_NET_WM_MOVERESIZE` / `xdg_toplevel.move` path), right-press opens
+//! the native window menu where the platform has one. Every handler
+//! stops propagation — a press on the bar must never reach the canvas's
+//! pan/draw handlers.
 
 use gpui::*;
 use serde_json::json;
@@ -64,6 +76,165 @@ const CLOSE_HOVER: u32 = 0xE04343;
 const PILL_H: f32 = 30.0;
 /// `Ft` — pill buttons were `h-[24px]` inside the wrap.
 const BUTTON_H: f32 = 24.0;
+/// The shell's disabled-button colour, `text-white/25`.
+const DISABLED_TEXT: u32 = 0xFFFFFF40;
+/// The git chip's refresh cadence — the shell polled `git.status()` every
+/// 8s while focused (30s while hidden; the native window doesn't track
+/// document focus, so the focused rate is kept).
+pub const GIT_POLL_EVERY: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// The right-cluster git chip's state — a trimmed `git status` read: the
+/// `##` header's branch (the original's `gitStatus.branch`, `HEAD` when
+/// detached) and the dirty count it summed over modified+untracked+
+/// staged+conflicted — which is just the porcelain row count.
+#[derive(Clone, Debug, Default)]
+pub struct GitChip {
+    /// The workspace answered `git status` — it is a repository.
+    pub repo: bool,
+    /// `##` header name before `...upstream`; "HEAD" when detached, like
+    /// the chip's `gitStatus.branch || 'HEAD'` fallback.
+    pub branch: String,
+    /// Porcelain row count — the shell's `dirtyCount` over all buckets.
+    pub dirty: u32,
+}
+
+/// `readGitStatus` reduced to what the chip draws: the same
+/// `git -C <dir> status --porcelain=v1 -b -z` the `/git/status` route
+/// runs (`http::git_status`), parsed the same way — `##` header for the
+/// branch, one dirty count per porcelain row, renames/copies counting
+/// once. Never throws: a non-repo, a missing git and a failed read all
+/// land as `repo: false`, the shell's EMPTY status. Run off the UI
+/// thread — this is a subprocess.
+pub fn read_git_chip(dir: &std::path::Path) -> GitChip {
+    let Ok(output) = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args([
+            "status",
+            "--porcelain=v1",
+            "-b",
+            "-z",
+            "--untracked-files=normal",
+        ])
+        .output()
+    else {
+        return GitChip::default();
+    };
+    if !output.status.success() {
+        return GitChip::default();
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let normalized = text.replace("\r\0", "\0").replace("\r\n", "\n");
+    let entries: Vec<&str> = normalized
+        .split('\0')
+        .filter(|line| !line.is_empty())
+        .collect();
+    // `parseHeader` — "## main...origin/main [ahead 1, behind 2]", or
+    // "## HEAD (no branch)" detached, or "## No commits yet on main".
+    let header = entries
+        .first()
+        .filter(|line| line.starts_with("##"))
+        .copied()
+        .unwrap_or_default();
+    let body = header.get(2..).unwrap_or("").trim();
+    let branches = body.split_once(" [").map(|(a, _)| a).unwrap_or(body);
+    let name = branches
+        .split_once("...")
+        .map(|(a, _)| a)
+        .unwrap_or(branches)
+        .replace("No commits yet on ", "");
+    let branch = if name.starts_with("HEAD") {
+        "HEAD".to_owned()
+    } else {
+        name
+    };
+    let mut dirty = 0u32;
+    let mut iter = entries
+        .iter()
+        .skip(if header.is_empty() { 0 } else { 1 })
+        .peekable();
+    while let Some(entry) = iter.next() {
+        if entry.len() < 2 {
+            continue;
+        }
+        dirty += 1;
+        // Renames and copies carry a second NUL-separated path that is
+        // not a second changed file.
+        if entry.starts_with('R') || entry.starts_with('C') {
+            iter.next();
+        }
+    }
+    GitChip {
+        repo: !header.is_empty(),
+        branch,
+        dirty,
+    }
+}
+
+/// What the bar needs from `CanvasView` — same role as
+/// `views_toolbar::ToolbarState`: plain data in, one element out.
+pub struct TitlebarState<'a> {
+    /// `undo_stack`/`redo_stack` non-empty — the history arrows' enabled.
+    pub can_undo: bool,
+    pub can_redo: bool,
+    /// `activeView` — `"canvas"`, `"code"` or `"overview"`; the tablist's
+    /// active paint.
+    pub active_view: &'a str,
+    /// `orcspace-flip-terminals` — paints the toggle's active state.
+    pub terminals_flipped: bool,
+    /// The last lazy poll's repo read (`CanvasView::git_chip`).
+    pub git: &'a GitChip,
+    /// Window width — the git label is `hidden min-[1000px]:inline` in
+    /// the shell, so it only exists at 1000px and wider.
+    pub window_width: f32,
+    /// `isMaximized` — swaps the maximize glyph for the restore (Copy)
+    /// icon and title like the shell's `maximized` state did.
+    pub window_maximized: bool,
+}
+
+/// The git pill's laid-out width — the Arrange menu is `absolute right-0`
+/// of the arrange button's `relative mr-1` wrapper, which sits
+/// `git-pill + divider + window-controls` from the window's right edge,
+/// so `canvas_view` needs this to anchor the popover the same way.
+pub fn git_chip_width(chip: &GitChip, window_width: f32, window: &Window) -> f32 {
+    // `Ft`: `h-[24px] px-[9px] gap-1.5` holding the 14px branch icon.
+    let mut width = 9.0 + 14.0;
+    if window_width >= 1000.0 {
+        let label = git_chip_label(chip);
+        let mut font = gpui::font("Departure Mono");
+        font.weight = FontWeight::MEDIUM;
+        let line = window.text_system().shape_line(
+            label.clone().into(),
+            px(11.0),
+            &[gpui::TextRun {
+                len: label.len(),
+                font,
+                color: rgb(0xFFFFFF).into(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            }],
+            None,
+        );
+        // `max-w-[110px] truncate` on the label span.
+        width += 6.0 + f32::from(line.width).min(110.0);
+    }
+    if chip.dirty > 0 {
+        // gap-1.5 + `h-1.5 w-1.5` dirty dot.
+        width += 6.0 + 6.0;
+    }
+    width + 9.0
+}
+
+fn git_chip_label(chip: &GitChip) -> String {
+    if !chip.repo {
+        "Git".to_owned()
+    } else if chip.branch.is_empty() {
+        "HEAD".to_owned()
+    } else {
+        chip.branch.clone()
+    }
+}
 
 /// `WebkitAppRegion: drag` — dead space that moves the window. A left
 /// press hands the drag to the compositor; a right press asks for the
@@ -92,31 +263,50 @@ fn drag_space(cx: &mut Context<crate::canvas_view::CanvasView>) -> Div {
         )
 }
 
-/// `Ft` — the bar's pill button: 24px tall, rounded, dim until hover.
+/// `en` — the bordered wrap: `h-[30px] rounded-pill border-bg-raise
+/// bg-bg p-[3px]` in the shell, square here. The history switch, the
+/// sidebar toggle, the view tabs, flip and git all sit inside one.
+fn pill_wrap() -> Div {
+    div()
+        .h(px(PILL_H))
+        .flex()
+        .flex_row()
+        .items_center()
+        .border_1()
+        .border_color(rgb(theme::hex(theme::monochrome::RAISED)))
+        .bg(rgb(theme::hex(theme::monochrome::BASE)))
+        .px(px(3.0))
+        .flex_none()
+}
+
+/// `Ft` — the bar's pill button: 24px tall, square, dim until hover.
 /// One `action` verb, dispatched with the contract's empty payload.
 fn action_button(
-    glyph: &'static str,
+    icon_name: &'static str,
+    icon_size: f32,
     action: &'static str,
     cx: &mut Context<crate::canvas_view::CanvasView>,
 ) -> Div {
     div()
         .h(px(BUTTON_H))
-        .min_w(px(30.0))
-        .px_2()
+        .px(px(8.0))
         .flex_none()
         .flex()
         .items_center()
         .justify_center()
-        .rounded_full()
         .text_size(px(12.0))
         .font_weight(FontWeight::MEDIUM)
         .text_color(rgb(theme::hex(theme::text::DIM)))
         .cursor_pointer()
         .hover(|el| {
-            el.bg(rgb(theme::hex(theme::monochrome::RAISED)))
+            el.bg(rgb(theme::hex(theme::hairline::FAINT)))
                 .text_color(rgb(theme::hex(theme::text::NORMAL)))
         })
-        .child(glyph)
+        .child(crate::assets::icon(
+            icon_name,
+            icon_size,
+            theme::hex(theme::text::DIM),
+        ))
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, _event, window, cx| {
@@ -126,11 +316,235 @@ fn action_button(
         )
 }
 
+/// `Ft` — a history arrow (`title-bar-history-switch`'s Undo/Redo):
+/// the pill button while the stack has entries, the shell's
+/// `cursor-default text-white/25` and no click when it's empty.
+fn history_button(
+    icon_name: &'static str,
+    action: &'static str,
+    enabled: bool,
+    cx: &mut Context<crate::canvas_view::CanvasView>,
+) -> Div {
+    let mut el = div()
+        .h(px(BUTTON_H))
+        .px(px(11.0))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_size(px(12.0))
+        .font_weight(FontWeight::MEDIUM)
+        .child(crate::assets::icon(
+            icon_name,
+            15.0,
+            theme::hex(if enabled {
+                theme::text::DIM
+            } else {
+                theme::text::FAINT
+            }),
+        ));
+    if enabled {
+        el = el
+            .text_color(rgb(theme::hex(theme::text::DIM)))
+            .cursor_pointer()
+            .hover(|el| {
+                el.bg(rgb(theme::hex(theme::hairline::FAINT)))
+                    .text_color(rgb(theme::hex(theme::text::NORMAL)))
+            })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _event, window, cx| {
+                    cx.stop_propagation();
+                    this.titlebar_command(action, json!({}), window, cx);
+                }),
+            );
+    } else {
+        el = el.text_color(rgba(DISABLED_TEXT));
+    }
+    el
+}
+
+/// `Ft` — a Workspace View tab (`title-bar-view-tab`): the active view
+/// wears `bg-bg-hover` with the sand accent text, a live inactive one
+/// `text-white/60` with the hover pair, and a disabled one the shell's
+/// white/25. The click dispatches "view" — `CanvasView` switches
+/// `active_view` and the matching pane fills `<main>`.
+fn view_tab(
+    label: &'static str,
+    view: &'static str,
+    active: bool,
+    enabled: bool,
+    cx: &mut Context<crate::canvas_view::CanvasView>,
+) -> Div {
+    let mut el = div()
+        .h(px(BUTTON_H))
+        .flex_none()
+        .px(px(11.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .font_family("Departure Mono")
+        .text_size(px(11.0))
+        .font_weight(FontWeight::MEDIUM)
+        .child(label);
+    if active {
+        el = el
+            .bg(rgb(theme::hex(theme::monochrome::RAISED)))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(rgb(theme::hex(theme::accent::SAND)));
+    } else if enabled {
+        el = el
+            .text_color(rgb(theme::hex(theme::text::DIM)))
+            .cursor_pointer()
+            .hover(|el| {
+                el.bg(rgb(theme::hex(theme::hairline::FAINT)))
+                    .text_color(rgb(theme::hex(theme::text::NORMAL)))
+            });
+    } else {
+        el = el.text_color(rgba(DISABLED_TEXT));
+    }
+    el.on_mouse_down(
+        MouseButton::Left,
+        cx.listener(move |this, _event, window, cx| {
+            cx.stop_propagation();
+            this.titlebar_command("view", json!({ "view": view }), window, cx);
+        }),
+    )
+}
+
+/// The "Flip terminals" toggle (`title-bar-flip-terminals`): `VIEW_TAB`
+/// with the eye glyph and the state-flipping label — EyeOff "Flip
+/// terminals" at rest, Eye "Show terminals" while flipped — and the
+/// active paint the tabs use.
+fn flip_button(flipped: bool, cx: &mut Context<crate::canvas_view::CanvasView>) -> Div {
+    let mut el = div()
+        .h(px(BUTTON_H))
+        .flex_none()
+        .px(px(9.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .gap(px(6.0))
+        .font_family("Departure Mono")
+        .text_size(px(11.0))
+        .font_weight(FontWeight::MEDIUM)
+        .cursor_pointer()
+        .child(crate::assets::icon(
+            if flipped { "eye" } else { "eye-off" },
+            14.0,
+            theme::hex(if flipped {
+                theme::text::NORMAL
+            } else {
+                theme::text::FAINT
+            }),
+        ))
+        .child(if flipped {
+            "SHOW TERMINALS"
+        } else {
+            "FLIP TERMINALS"
+        });
+    if flipped {
+        el = el
+            .bg(rgb(theme::hex(theme::monochrome::RAISED)))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(rgb(theme::hex(theme::text::NORMAL)));
+    } else {
+        el = el
+            .text_color(rgb(theme::hex(theme::text::DIM)))
+            .hover(|el| {
+                el.bg(rgb(theme::hex(theme::hairline::FAINT)))
+                    .text_color(rgb(theme::hex(theme::text::NORMAL)))
+            });
+    }
+    el.on_mouse_down(
+        MouseButton::Left,
+        cx.listener(move |this, _event, window, cx| {
+            cx.stop_propagation();
+            this.titlebar_command("flip", json!({}), window, cx);
+        }),
+    )
+}
+
+/// The git pill (`title-bar-git`): `GitBranch` + branch + dirty dot inside
+/// the same bordered wrap. The icon is the white accent while the tree is
+/// dirty, dim on a clean repo, faint off one; the dot is `bg-accent` white.
+/// The branch label only exists at 1000px+ (`hidden min-[1000px]:inline`).
+/// No checkout panel in this build — a click repolls and flashes the
+/// summary the original's tooltip carried.
+fn git_button(
+    chip: &GitChip,
+    window_width: f32,
+    cx: &mut Context<crate::canvas_view::CanvasView>,
+) -> Div {
+    // The branch icon: `text-accent` (white) while dirty, `text-text-dim`
+    // on a clean repo, `text-text-faint` off one.
+    let glyph_color = theme::hex(if chip.repo {
+        if chip.dirty > 0 {
+            theme::text::NORMAL
+        } else {
+            theme::text::DIM
+        }
+    } else {
+        theme::text::FAINT
+    });
+    let mut el = div()
+        .h(px(BUTTON_H))
+        .flex_none()
+        .px(px(9.0))
+        .flex()
+        .items_center()
+        .gap(px(6.0))
+        .text_color(rgb(theme::hex(theme::text::DIM)))
+        .cursor_pointer()
+        .hover(|el| {
+            el.bg(rgb(theme::hex(theme::hairline::FAINT)))
+                .text_color(rgb(theme::hex(theme::text::NORMAL)))
+        })
+        .child(
+            div()
+                .flex_none()
+                .text_color(rgb(glyph_color))
+                .child(crate::assets::icon("git-branch", 14.0, glyph_color)),
+        );
+    // `hidden min-[1000px]:inline max-w-[110px] truncate`.
+    if window_width >= 1000.0 {
+        el = el.child(
+            div()
+                .flex_none()
+                .max_w(px(110.0))
+                .truncate()
+                .font_family("Departure Mono")
+                .text_size(px(11.0))
+                .font_weight(FontWeight::MEDIUM)
+                .child(git_chip_label(chip)),
+        );
+    }
+    if chip.dirty > 0 {
+        // `bg-accent` — the white accent dot.
+        el = el.child(
+            div()
+                .w(px(6.0))
+                .h(px(6.0))
+                .flex_none()
+                .rounded_full()
+                .bg(rgb(theme::hex(theme::text::NORMAL))),
+        );
+    }
+    el.on_mouse_down(
+        MouseButton::Left,
+        cx.listener(move |this, _event, window, cx| {
+            cx.stop_propagation();
+            this.titlebar_command("git", json!({}), window, cx);
+        }),
+    )
+}
+
 /// `jr` — a window-control cell: `h-10 w-[46px]`, glyph centred, the
 /// faint-on-raised hover; `danger` paints the shell's red close hover.
 #[cfg(not(target_os = "macos"))]
 fn window_button(
-    glyph: &'static str,
+    icon_name: &'static str,
+    icon_size: f32,
     action: &'static str,
     danger: bool,
     cx: &mut Context<crate::canvas_view::CanvasView>,
@@ -142,8 +556,12 @@ fn window_button(
         .flex()
         .items_center()
         .justify_center()
-        .text_size(px(13.0))
-        .text_color(rgb(theme::hex(theme::text::FAINT)))
+        .text_color(rgb(theme::hex(if danger {
+            // `jr` close: text-text-dim, the others text-text-faint.
+            theme::text::DIM
+        } else {
+            theme::text::FAINT
+        })))
         .cursor_pointer()
         .hover(move |el| {
             if danger {
@@ -153,7 +571,15 @@ fn window_button(
                     .text_color(rgb(theme::hex(theme::text::NORMAL)))
             }
         })
-        .child(glyph)
+        .child(crate::assets::icon(
+            icon_name,
+            icon_size,
+            theme::hex(if danger {
+                theme::text::DIM
+            } else {
+                theme::text::FAINT
+            }),
+        ))
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, _event, window, cx| {
@@ -163,28 +589,11 @@ fn window_button(
         )
 }
 
-/// The bar. `workspace_dir` is `workspace::current()` — its basename is
-/// the centre title, the full path only standing in when the basename is
-/// empty (e.g. `/`). `presence_count` is the live terminal/agent count
-/// the caller knows cheaply; `0` hides the badge entirely.
+/// The bar. Everything the shell drew is covered in the module doc.
 pub fn titlebar_pane(
-    workspace_dir: &std::path::Path,
-    presence_count: usize,
+    state: &TitlebarState,
     cx: &mut Context<crate::canvas_view::CanvasView>,
 ) -> impl IntoElement {
-    let workspace_name = workspace_dir
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .filter(|n| !n.is_empty())
-        .unwrap_or_else(|| {
-            let full = workspace_dir.to_string_lossy().into_owned();
-            if full.is_empty() {
-                "Slate".to_owned()
-            } else {
-                full
-            }
-        });
-
     // `title-bar-shell`: grid 1fr|auto|1fr → flex with equal flex-1
     // sides, which centres the middle column the same way. `pl-2`, macOS
     // grows it to 78px for the traffic lights (the bundle's `vt` branch).
@@ -207,9 +616,11 @@ pub fn titlebar_pane(
             }),
         );
 
-    // Left: the shell's `en` pill wrap (h-30, base bg, raised ring, 3px
-    // pad). It held the history switch; here it holds the sidebar toggle —
-    // the only left-side chrome the command surface supports.
+    // Left: `title-bar-history-switch` (Undo/Redo), then the drag
+    // spacer — the shell's flash text only sits here while a notice is
+    // live, and that slot renders through `notice` instead. The
+    // `overflow-hidden` is the shell's `min-w-0` contract: a narrow
+    // window clips this column before it touches the centred tabs.
     let left = div()
         .flex_1()
         .min_w_0()
@@ -217,49 +628,34 @@ pub fn titlebar_pane(
         .flex()
         .flex_row()
         .items_center()
-        .gap_2()
+        .gap_3()
+        .overflow_hidden()
         .child(
-            div()
-                .h(px(PILL_H))
-                .flex()
-                .flex_row()
-                .items_center()
-                .rounded_full()
-                .border_1()
-                .border_color(rgb(theme::hex(theme::monochrome::RAISED)))
-                .bg(rgb(theme::hex(theme::monochrome::BASE)))
-                .px(px(3.0))
-                .child(action_button("◧", "sidebar", cx)),
+            pill_wrap()
+                .child(history_button("arrow-left", "undo", state.can_undo, cx))
+                .child(history_button("arrow-right", "redo", state.can_redo, cx)),
         )
         .child(drag_space(cx));
 
-    // Centre: the `role="status"` slot — the workspace name instead of the
-    // original's transient flash text and view tabs. 13px medium, title
-    // colour, and it drags like a native title bar.
+    // Centre: the Workspace View `tablist` — the active view wears the
+    // raised pill, all three switch for real.
     let center = div()
         .flex_none()
         .min_w_0()
-        .max_w(px(400.0))
         .flex()
         .items_center()
-        .overflow_hidden()
         .child(
-            div()
-                .text_size(px(13.0))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(rgb(theme::hex(theme::text::NORMAL)))
-                .truncate()
-                .child(workspace_name),
-        )
-        .on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|_this, _event, window, cx| {
-                cx.stop_propagation();
-                window.start_window_move();
-            }),
+            pill_wrap()
+                .child(view_tab("CANVAS", "canvas", state.active_view == "canvas", true, cx))
+                .child(view_tab("CODE", "code", state.active_view == "code", true, cx))
+                .child(view_tab("OVERVIEW", "overview", state.active_view == "overview", true, cx)),
         );
 
-    // Right: drag space, live count, settings, divider, window controls.
+    // Right: drag space, the flip toggle, the Arrange menu, the git
+    // pill, divider, window controls — the shell's island order. The
+    // column clips its own overflow (`min-w-0` + justify-end), so on a
+    // narrow window the island's left edge eats itself before it can
+    // cover the centred tabs.
     let mut right = div()
         .flex_1()
         .min_w_0()
@@ -268,35 +664,32 @@ pub fn titlebar_pane(
         .flex_row()
         .items_center()
         .justify_end()
+        .overflow_hidden()
         .child(drag_space(cx));
 
-    if presence_count > 0 {
-        right = right.child(
-            div()
-                .flex_none()
-                .h(px(BUTTON_H))
-                .px_2()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_1()
-                .child(
-                    div()
-                        .w(px(6.0))
-                        .h(px(6.0))
-                        .rounded_full()
-                        .bg(rgb(theme::hex(theme::status::OK))),
-                )
-                .child(
-                    div()
-                        .text_size(px(11.0))
-                        .text_color(rgb(theme::hex(theme::text::FAINT)))
-                        .child(format!("{presence_count} live")),
-                ),
-        );
+    // `activeView !== 'overview'` gates both controls in the shell — flip
+    // only means anything on Canvas, and the arrange menu's items switch
+    // between widget modes and terminal layouts per view.
+    if state.active_view != "overview" {
+        right = right
+            .child(
+                div()
+                    .flex_none()
+                    .mr(px(4.0))
+                    .child(pill_wrap().child(flip_button(state.terminals_flipped, cx))),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .mr(px(4.0))
+                    .child(pill_wrap().child(action_button("layout-grid", 14.0, "arrange", cx))),
+            );
     }
-
-    right = right.child(action_button("⚙", "settings", cx));
+    right = right.child(
+        div()
+            .flex_none()
+            .child(pill_wrap().child(git_button(state.git, state.window_width, cx))),
+    );
 
     // `!vt` — window controls exist only off macOS, flush to the right
     // edge (`pr-0`). Separator: `mx-0.5 h-4 w-px bg-line-soft/80`.
@@ -311,9 +704,21 @@ pub fn titlebar_pane(
                     .flex_none()
                     .bg(rgba((theme::hex(theme::hairline::SOFT) << 8) | 0xCC)),
             )
-            .child(window_button("–", "minimize", false, cx))
-            .child(window_button("□", "maximize", false, cx))
-            .child(window_button("×", "close", true, cx));
+            .child(window_button("minus", 14.0, "minimize", false, cx))
+            .child(window_button(
+                if state.window_maximized {
+                    // The shell's maximized glyph — Lucide `copy` (two
+                    // overlapping squares) where the port has it vendored.
+                    "copy"
+                } else {
+                    "square"
+                },
+                13.0,
+                "maximize",
+                false,
+                cx,
+            ))
+            .child(window_button("x", 14.0, "close", true, cx));
     }
 
     bar.child(left).child(center).child(right)

@@ -48,7 +48,7 @@ impl CodeLayout {
             Self::Grid => "Equal cards in a square grid",
             Self::Columns => "One column per terminal",
             Self::Rows => "One row per terminal",
-            Self::Focus => "Active terminal large, the rest beside it",
+            Self::Focus => "Last used terminal large, rest beside it",
         }
     }
 }

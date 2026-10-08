@@ -63,29 +63,23 @@ fn day_key(y: i64, m: i64, d: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
-/// Today's `(year, month, day)` — UTC, matching `planner::today_utc` which
-/// resolves "today" in the planner store the same way.
+/// Today's `(year, month, day)` — local, matching `planner::today_local`
+/// which resolves "today" in the planner store against the machine's local
+/// calendar day (`localDayKey` in the Electron shell). Near midnight UTC and
+/// local disagree, and only the local reading matches what the user sees.
 fn today_parts() -> (i64, i64, i64) {
-    let days = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs() / 86_400) as i64;
-    civil_from_days(days)
-}
-
-/// `snapshotSeq` from the raw file — `PlannerDocument` keeps the field
-/// private, and replaying already-folded entries is NOT a no-op (a folded
-/// `plan.create` would regenerate the item from payload-only fields and
-/// lose state like a later `done`). The gate mirrors `apply`'s.
-fn planner_snapshot_seq(path: &std::path::Path) -> u64 {
-    std::fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-        .and_then(|document| {
-            document
-                .get("snapshotSeq")
-                .and_then(serde_json::Value::as_u64)
-        })
-        .unwrap_or(0)
+    let key = slate_app::planner::today_local().0;
+    let parts: Vec<i64> = key.split('-').filter_map(|p| p.parse().ok()).collect();
+    if parts.len() == 3 {
+        (parts[0], parts[1], parts[2])
+    } else {
+        // Unreachable — today_local always formats YYYY-MM-DD — but never
+        // let a malformed key panic the grid; fall back to the epoch day.
+        let days = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs() / 86_400) as i64;
+        civil_from_days(days)
+    }
 }
 
 /// Planner items keyed by their `day`, then trimmed to display order.
@@ -98,23 +92,15 @@ pub fn items_by_day() -> (HashMap<String, Vec<String>>, Option<String>) {
         Ok(log) => log,
         Err(error) => return (HashMap::new(), Some(error)),
     };
-    let today = slate_app::planner::today_utc();
     let planner_path = dir.join("workspace-planner.json");
-    let snapshot_seq = planner_snapshot_seq(&planner_path);
     let document = match slate_app::planner_document::PlannerDocument::open(&planner_path) {
         Ok(document) => document,
         Err(error) => return (HashMap::new(), Some(error)),
     };
-    let mut items = document.items.clone();
-    for entry in log.entries() {
-        if entry.phase != "commit" || entry.seq <= snapshot_seq {
-            continue;
-        }
-        match slate_app::planner::reduce(&items, entry, &today) {
-            Ok(next) => items = next,
-            Err(error) => return (HashMap::new(), Some(error.0)),
-        }
-    }
+    let items = match document.folded_items(&log, &slate_app::planner::today_local()) {
+        Ok(items) => items,
+        Err(error) => return (HashMap::new(), Some(error)),
+    };
     let mut map: HashMap<String, Vec<String>> = HashMap::new();
     for (_, item) in items.iter() {
         if let Some(day) = &item.day {
@@ -153,7 +139,6 @@ fn nav_button(
     let widget_id = widget_id.to_owned();
     div()
         .px_1()
-        .rounded_md()
         .cursor_pointer()
         .text_xs()
         .text_color(rgb(theme::hex(theme::text::DIM)))
@@ -185,7 +170,6 @@ fn day_cell(
         .flex()
         .items_center()
         .justify_center()
-        .rounded_full()
         .when(is_today, |el| el.bg(rgb(theme::hex(theme::text::NORMAL))))
         .child(
             div()
@@ -207,7 +191,6 @@ fn day_cell(
         .flex_col()
         .gap(px(1.0))
         .p(px(2.0))
-        .rounded_md()
         .cursor_pointer()
         .when(!in_month, |el| el.opacity(0.4))
         .when(is_selected, |el| {
@@ -280,8 +263,12 @@ pub fn calendar_pane(
     let today_key = day_key(today_y, today_m, today_d);
     let wid = widget.id.clone();
 
-    let (prev_y, prev_m) = if m == 1 { (y - 1, 12) } else { (y, m - 1) };
-    let (next_y, next_m) = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
+    // A corrupted journaled month must not panic the render — rem_euclid
+    // folds any i64 into 1..=12 for both the label and the ‹ › targets so
+    // one bad `state.month` can't crash the widget on every launch.
+    let m1 = m.rem_euclid(12); // 0-based for indexing
+    let (prev_y, prev_m) = if m1 == 0 { (y - 1, 12) } else { (y, m1) };
+    let (next_y, next_m) = if m1 == 11 { (y + 1, 1) } else { (y, m1 + 2) };
 
     let mut root = div().flex().flex_col().size_full();
     // Header: ‹ › browse the journaled month cursor, "Today" jumps back to
@@ -314,7 +301,7 @@ pub fn calendar_pane(
                             .text_sm()
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(rgb(theme::hex(theme::text::NORMAL)))
-                            .child(format!("{} {y}", MONTHS[(m - 1) as usize])),
+                            .child(format!("{} {y}", MONTHS[m1 as usize])),
                     )
                     .child(nav_button(
                         &wid,

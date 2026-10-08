@@ -173,6 +173,7 @@ fn a_malformed_day_in_an_update_aborts_the_fold() {
             day: None,
             time: None,
             done: false,
+            status: None,
             created_by: "user".to_owned(),
             order: 0.0,
             created_at: 1.0,

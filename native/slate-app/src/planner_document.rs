@@ -63,8 +63,17 @@ impl PlannerDocument {
             .ok_or("Invalid planner items")?;
         let mut items = PlannerState::new();
         for entry in entries {
-            let item: planner::PlanItem = serde_json::from_value(entry.clone())
+            let mut item: planner::PlanItem = serde_json::from_value(entry.clone())
                 .map_err(|e| format!("Invalid planner item: {e}"))?;
+            // revive() in the Electron store filled a missing/invalid status
+            // from `done`, so every loaded item carried one.
+            if item.status.is_none() {
+                item.status = Some(if item.done {
+                    planner::PlanStatus::Done
+                } else {
+                    planner::PlanStatus::Todo
+                });
+            }
             if item.id.is_empty() || item.title.trim().is_empty() || items.contains_key(&item.id) {
                 return Err(
                     "Invalid or duplicate planner item; original file left unchanged".into(),
@@ -78,6 +87,30 @@ impl PlannerDocument {
             document,
             items,
         })
+    }
+
+    /// The journal sequence the on-disk items were folded through — entries
+    /// at or below it are already reflected in `items`.
+    pub fn snapshot_seq(&self) -> u64 {
+        self.document["snapshotSeq"].as_u64().unwrap_or(0)
+    }
+
+    /// The read-only fold the panes use: snapshot items plus the journal tail,
+    /// never written back — `recover` is the consolidating variant.
+    pub fn folded_items(
+        &self,
+        log: &crate::journal_log::JournalLog,
+        today: &Today,
+    ) -> Result<PlannerState, String> {
+        let snapshot_seq = self.snapshot_seq();
+        let mut items = self.items.clone();
+        for entry in log.entries() {
+            if entry.phase != "commit" || entry.seq <= snapshot_seq {
+                continue;
+            }
+            items = planner::reduce(&items, entry, today).map_err(|e| e.0)?;
+        }
+        Ok(items)
     }
 
     pub fn apply(&mut self, event: &JournalEntry, today: &Today) -> Result<(), String> {
@@ -101,7 +134,7 @@ impl PlannerDocument {
                     .cloned()
                     .unwrap_or_else(|| json!({}));
                 let object = value.as_object_mut().expect("validated planner item");
-                for key in ["project", "day", "time", "attachments"] {
+                for key in ["project", "day", "time", "attachments", "status"] {
                     object.remove(key);
                 }
                 object.extend(

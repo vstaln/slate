@@ -71,13 +71,12 @@ fn checkbox(checked: bool) -> Div {
         .h(px(13.0))
         .border_1()
         .border_color(rgb(theme::hex(theme::hairline::FAINT)))
-        .rounded_sm()
         .flex()
         .items_center()
         .justify_center()
         .text_size(px(9.0))
         .when(checked, |el| {
-            el.bg(rgb(theme::hex(theme::status::INFO)))
+            el.bg(rgb(theme::hex(theme::accent::SAND)))
                 .text_color(rgb(theme::hex(theme::monochrome::BASE)))
         })
         .when(!checked, |el| {
@@ -106,7 +105,6 @@ fn toggle_row(
         .flex_row()
         .items_center()
         .gap_3()
-        .rounded_md()
         .cursor_pointer()
         .text_xs()
         .text_color(rgb(theme::hex(theme::text::DIM)))
@@ -172,7 +170,6 @@ fn button(
         .flex_none()
         .border_1()
         .border_color(rgb(theme::hex(theme::hairline::FAINT)))
-        .rounded_md()
         .cursor_pointer()
         .text_xs()
         .text_color(rgb(theme::hex(theme::text::DIM)))
@@ -221,7 +218,6 @@ fn value_row(label: &'static str, value: String, note: &'static str) -> impl Int
                         .py(px(3.0))
                         .border_1()
                         .border_color(rgb(theme::hex(theme::hairline::FAINT)))
-                        .rounded_md()
                         .bg(rgb(theme::hex(theme::monochrome::ELEVATED)))
                         .text_xs()
                         .text_color(rgb(theme::hex(theme::text::NORMAL)))
@@ -246,10 +242,11 @@ fn stepper_row(
     label: &'static str,
     key: &'static str,
     value: u64,
+    max: u64,
     cx: &mut Context<crate::canvas_view::CanvasView>,
 ) -> impl IntoElement {
     let down = value.saturating_sub(5);
-    let up = (value + 5).min(100);
+    let up = (value + 5).min(max);
     div()
         .flex()
         .flex_row()
@@ -389,7 +386,6 @@ pub fn settings_modal(
                     } else {
                         theme::hairline::FAINT
                     })))
-                    .rounded_md()
                     .cursor_pointer()
                     .text_xs()
                     .text_color(rgb(theme::hex(if selected {
@@ -532,7 +528,6 @@ pub fn settings_modal(
                                 .py(px(6.0))
                                 .border_1()
                                 .border_color(rgb(theme::hex(theme::hairline::FAINT)))
-                                .rounded_md()
                                 .text_xs()
                                 .text_color(rgb(theme::hex(if background.is_some() {
                                     theme::text::DIM
@@ -569,13 +564,16 @@ pub fn settings_modal(
                 "Dim",
                 "background_dim",
                 settings.background_dim().min(100),
+                100,
                 cx,
             ))
             .child(stepper_row(
                 "slate-settings-blur",
                 "Blur",
                 "background_blur",
-                settings.background_blur().min(100),
+                // `setBlur` clamps 0–90 in the shell's theme context.
+                settings.background_blur().min(90),
+                90,
                 cx,
             )),
     );
@@ -613,7 +611,6 @@ pub fn settings_modal(
                 .bg(rgb(theme::hex(theme::monochrome::SURFACE)))
                 .border_1()
                 .border_color(rgb(theme::hex(theme::hairline::FAINT)))
-                .rounded_md()
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|_this, _event, _window, cx| {
@@ -636,7 +633,6 @@ pub fn settings_modal(
                             div()
                                 .id("slate-settings-x")
                                 .px_1()
-                                .rounded_md()
                                 .cursor_pointer()
                                 .text_xs()
                                 .text_color(rgb(theme::hex(theme::text::FAINT)))
@@ -671,7 +667,6 @@ pub fn settings_modal(
                                 .cursor_pointer()
                                 .border_1()
                                 .border_color(rgb(theme::hex(theme::hairline::FAINT)))
-                                .rounded_md()
                                 .text_xs()
                                 .text_color(rgb(theme::hex(theme::text::DIM)))
                                 .hover(|el| {

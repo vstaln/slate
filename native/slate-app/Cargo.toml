@@ -43,6 +43,9 @@ uuid = { version = "1", features = ["v4"] }
 # OSC 52 clipboard payloads arrive base64-encoded; the GUI decodes them into
 # the gpui clipboard.
 base64 = "0.22"
+# Pinned to the version already in Cargo.lock through gpui: used to CPU-blur
+# the canvas wallpaper (gpui has no image blur filter).
+image = "=0.25.10"
 log = "0.4"
 env_logger = "0.11"
 
@@ -54,6 +57,15 @@ default = []
 # adds no new crate.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Linux only: the browser widget's embedded webview. `wry` builds the
+# WebKitGTK child view (`build_as_child` on X11) and `gtk` owns the event
+# loop it needs on a dedicated thread — the same pairing the vendored
+# element used at 2cf4566. Kept target-gated so other platforms neither
+# build it nor see it; the element falls back to empty bounds there.
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
+wry = "0.57"
+gtk = "0.18"
 
 # Windows only: listing a shell's children is what lets a terminal that has
 # stopped reading its input be interrupted without killing the shell along

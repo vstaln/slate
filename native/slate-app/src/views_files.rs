@@ -223,10 +223,9 @@ fn header_button(
     div()
         .text_xs()
         .cursor_pointer()
-        .rounded_md()
         .px_1()
         .text_color(rgb(theme::hex(if active {
-            theme::status::INFO
+            theme::accent::SAND
         } else {
             theme::text::FAINT
         })))
@@ -256,7 +255,6 @@ fn row_button(
     div()
         .text_xs()
         .cursor_pointer()
-        .rounded_md()
         .px_0p5()
         .text_color(rgb(theme::hex(if danger {
             theme::status::DANGER
@@ -407,7 +405,6 @@ pub fn files_pane(
             div()
                 .text_xs()
                 .cursor_pointer()
-                .rounded_md()
                 .px_1()
                 .text_color(rgb(theme::hex(theme::text::FAINT)))
                 .hover(|el| {
@@ -441,7 +438,6 @@ pub fn files_pane(
             div()
                 .text_xs()
                 .cursor_pointer()
-                .rounded_md()
                 .px_1()
                 .text_color(rgb(theme::hex(theme::text::DIM)))
                 .hover(|el| el.bg(rgb(theme::hex(theme::monochrome::RAISED))))
@@ -503,7 +499,6 @@ pub fn files_pane(
                     div()
                         .text_sm()
                         .cursor_pointer()
-                        .rounded_md()
                         .px_1()
                         .text_color(rgb(theme::hex(theme::text::FAINT)))
                         .hover(|el| el.bg(rgb(theme::hex(theme::monochrome::RAISED))))
@@ -547,7 +542,6 @@ pub fn files_pane(
                     .items_center()
                     .gap_2()
                     .px_1()
-                    .rounded_md()
                     .cursor_pointer()
                     .group(group.clone())
                     .text_sm()
@@ -569,7 +563,7 @@ pub fn files_pane(
                                 div()
                                     .flex_none()
                                     .text_color(rgb(theme::hex(if entry.is_dir {
-                                        theme::status::INFO
+                                        theme::accent::SAND
                                     } else {
                                         theme::text::FAINT
                                     })))
@@ -681,7 +675,6 @@ pub fn files_pane(
                     div()
                         .text_xs()
                         .cursor_pointer()
-                        .rounded_md()
                         .px_1()
                         .text_color(rgb(theme::hex(theme::text::FAINT)))
                         .hover(|el| {
