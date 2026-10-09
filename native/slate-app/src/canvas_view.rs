@@ -360,6 +360,10 @@ pub struct CanvasView {
     /// canvas — `on_drag_move::<ExternalPaths>` keeps it fresh so `on_drop`
     /// knows where the files landed (the shell's `M(clientX, clientY)`).
     drop_point: Option<Pos2>,
+    /// The shell's `cascadeRef` — counts socket-adopted widgets so each
+    /// lands at `screenToWorld(90 + col*60, 90 + row*60)`, six per row,
+    /// reset when the canvas hydrates (workspace switch included).
+    cascade_count: usize,
     /// The shell's `notice` state — a transient top-center toast for cap
     /// hits, control-route failures and save errors. Rendered while
     /// `Instant` is unexpired.
@@ -974,6 +978,7 @@ impl CanvasView {
             select_mode: true,
             snap_guides: None,
             drop_point: None,
+            cascade_count: 0,
             notice: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
@@ -1279,17 +1284,22 @@ impl CanvasView {
                             })
                             .collect();
                         for id in orphans {
-                            let n = view.canvas.widgets.len() as f32;
                             let title = view
                                 .manager
                                 .name(&id)
                                 .unwrap_or_else(|| "Terminal".to_owned());
-                            view.create_widget_at(
-                                &id,
-                                "terminal",
-                                &title,
-                                Pos2::new(80.0 + n * 40.0, 80.0 + n * 40.0),
-                            );
+                            // The shell's `cascadeRef` grid: screen point
+                            // (90 + col*60, 90 + row*60), six per row, run
+                            // through `screenToWorld` — so adopted terminals
+                            // fan out under the camera rather than stack.
+                            let n = view.cascade_count;
+                            view.cascade_count += 1;
+                            let col = (n % 6) as f32;
+                            let row = (n / 6) as f32;
+                            let at = view
+                                .view()
+                                .to_world(Pos2::new(90.0 + col * 60.0, 90.0 + row * 60.0));
+                            view.create_widget_at(&id, "terminal", &title, at);
                         }
                         // A terminal disposed over the socket leaves the
                         // snapshot list entirely; its widget goes with it.
@@ -2594,6 +2604,9 @@ impl CanvasView {
                 &log,
             )
             .0;
+            // The shell reset `cascadeRef` on hydrate — a fresh canvas
+            // starts the adoption grid over.
+            self.cascade_count = 0;
         }
     }
 
