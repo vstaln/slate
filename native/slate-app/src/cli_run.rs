@@ -44,7 +44,7 @@ THE APP & CANVAS
   {prog} journal tail [--lines n] [--since seq] | journal types
   {prog} reset --tasks|--messages|--all --yes     {prog} screenshot [worker] [--out <file>]
   {prog} api <METHOD> <path> [json-body]          raw request escape hatch
-  {prog} browser list — no webview in the native build; lists browser widgets
+  {prog} browser open [url] | list | navigate | snapshot | click | fill | select | press | scroll
 
 Destructive commands (reset, run-close, canvas close, terminal close,
 plan delete) require --yes to confirm.
@@ -144,7 +144,7 @@ fn command_help(name: &str) -> Option<&'static str> {
         "canvas" => {
             "slate canvas list | place <kind> | image <path> | move | rename | focus | close — canvas widgets & viewport."
         }
-        "browser" => "slate browser <list|open|navigate|snapshot|click|fill|select|press|scroll> — drive browser widgets",
+        "browser" => "slate browser open [url] | list | navigate <id> <url> | snapshot <id> | click <id> <ref> | fill <id> <ref> --value \"...\" | select <id> <ref> --value \"...\" | press <id> <key> [--ref N] | scroll <id> [--pixels N]. Detected checkout and purchase flows are blocked, along with password and payment fields.",
         "plan" => {
             "slate plan list | create | update | done | toggle | delete [<id>] — planner day tasks."
         }
