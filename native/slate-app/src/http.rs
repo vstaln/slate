@@ -232,9 +232,12 @@ pub trait RouteEnv: Send {
         target: &str,
         caller: Option<&str>,
     ) -> Result<String, CommandError>;
-    /// Open a fresh shell terminal — the dispatch path's `terminals.reserve`.
+    /// The next free `term-*` id — `terminal.create` journals the id before
+    /// the PTY exists, so the route has to mint it ahead of the spawn.
+    fn fresh_terminal_id(&mut self) -> String;
+    /// Open a fresh shell under `id` — the dispatch path's `terminals.reserve`.
     /// The canvas's orphan-adoption turns it into a widget on the next tick.
-    fn spawn_terminal(&mut self, title: &str, cwd: &str) -> Result<String, String>;
+    fn spawn_terminal(&mut self, id: &str, title: &str, cwd: &str) -> Result<(), String>;
     /// A line of text into the PTY with confirmed delivery; `press_enter`
     /// submits it. `Err` means the terminal is not reading input.
     fn write_terminal(&mut self, id: &str, text: &str, press_enter: bool) -> Result<(), String>;
@@ -658,18 +661,21 @@ fn orchestration_route(
                         "POST /orchestration/dispatches",
                         "dispatches open terminals",
                     ) {
-                        Ok(env) => match env.spawn_terminal(&title, &cwd) {
-                            Ok(id) => {
-                                opened = true;
-                                id
+                        Ok(env) => {
+                            let id = env.fresh_terminal_id();
+                            match env.spawn_terminal(&id, &title, &cwd) {
+                                Ok(()) => {
+                                    opened = true;
+                                    id
+                                }
+                                Err(error) => {
+                                    return Some(Response::from_error(&CommandError::new(
+                                        ErrorCode::Failed,
+                                        error,
+                                    )))
+                                }
                             }
-                            Err(error) => {
-                                return Some(Response::from_error(&CommandError::new(
-                                    ErrorCode::Failed,
-                                    error,
-                                )))
-                            }
-                        },
+                        }
                         Err(response) => return Some(response),
                     }
                 }
@@ -1982,6 +1988,63 @@ fn widgets_route(request: &Request, segments: &[String], deps: &mut RouteDeps<'_
                 }
                 Err(response) => response,
             }
+        }
+        // controlServer.ts routes `POST /widgets/terminal` to the same
+        // `terminal.create` submit as `POST /terminal` — title trimmed to
+        // 200 chars, cwd to 1024, both optional. The journal entry lands
+        // before the spawn so a failed PTY still records the attempt.
+        ("POST", Some("terminal")) => {
+            let title = request
+                .text("title")
+                .map(|text| text.trim().chars().take(200).collect::<String>())
+                .filter(|text| !text.is_empty());
+            let cwd = request
+                .text("cwd")
+                .map(|text| text.chars().take(1024).collect::<String>())
+                .filter(|text| !text.is_empty())
+                .or_else(|| deps.workspace_dir.map(str::to_owned))
+                .unwrap_or_default();
+            let env = match environment(
+                deps,
+                "POST /widgets/terminal",
+                "spawning a terminal needs the running app",
+            ) {
+                Ok(env) => env,
+                Err(response) => return response,
+            };
+            let id = env.fresh_terminal_id();
+            let entry = match journal_commit(
+                deps,
+                request,
+                "terminal.create",
+                "terminal:new",
+                json!({
+                    "id": id,
+                    "title": title,
+                    "cwd": cwd,
+                    "agentOwned": true,
+                }),
+                "POST /widgets/terminal",
+            ) {
+                Ok(entry) => entry,
+                Err(response) => return response,
+            };
+            let env = match environment(
+                deps,
+                "POST /widgets/terminal",
+                "spawning a terminal needs the running app",
+            ) {
+                Ok(env) => env,
+                Err(response) => return response,
+            };
+            if let Err(error) = env.spawn_terminal(&id, title.as_deref().unwrap_or(&id), &cwd) {
+                return Response::from_error(&CommandError::new(ErrorCode::Failed, error));
+            }
+            accepted(
+                &entry,
+                200,
+                json!({ "id": id, "title": title.unwrap_or_else(|| id.clone()), "cwd": cwd, "ready": true }),
+            )
         }
         // `widget.update` — the title-trimming and terminal-setTitle the
         // original's apply() ran.

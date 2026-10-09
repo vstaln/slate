@@ -353,9 +353,9 @@ pub fn plan(command: &str, args: &Args) -> CommandResult<Plan> {
             match action {
                 "list" | "ls" => Ok(Plan::get("/orchestration/workers")),
                 "new" | "spawn" | "open" => Ok(Plan::post(
-                    // orc spelled it /widgets/terminal but the control server
-                    // aliases both to the same create — /terminal is our route.
-                    "/terminal",
+                    // orc spelled it /widgets/terminal — the control server
+                    // aliases both spellings to the same create.
+                    "/widgets/terminal",
                     object(vec![
                         // orc sent {title}; our route also keys on `name`.
                         ("title", text(args.pick(&["title", "name"]))),

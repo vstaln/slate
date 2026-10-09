@@ -3655,10 +3655,13 @@ impl slate_app::http::RouteEnv for EngineEnv<'_> {
             .map_err(|_| CommandError::new(ErrorCode::NotFound, format!("no terminal \"{id}\"")))
     }
 
-    fn spawn_terminal(&mut self, title: &str, cwd: &str) -> Result<String, String> {
-        let id = self.manager.fresh_terminal_id();
+    fn fresh_terminal_id(&mut self) -> String {
+        self.manager.fresh_terminal_id()
+    }
+
+    fn spawn_terminal(&mut self, id: &str, title: &str, cwd: &str) -> Result<(), String> {
         self.manager.spawn_with_options(
-            id.clone(),
+            id.to_owned(),
             120,
             32,
             if cwd.is_empty() {
@@ -3669,8 +3672,8 @@ impl slate_app::http::RouteEnv for EngineEnv<'_> {
             shell_command(),
             std::collections::HashMap::new(),
         )?;
-        self.manager.set_name(&id, title);
-        Ok(id)
+        self.manager.set_name(id, title);
+        Ok(())
     }
 
     fn write_terminal(&mut self, id: &str, text: &str, press_enter: bool) -> Result<(), String> {

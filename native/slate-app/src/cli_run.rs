@@ -1747,6 +1747,7 @@ fn run_context(url: &str, token: &str, parsed: &slate_app::cli::Args) -> Result<
             .and_then(Value::as_str)
     });
     let code_workspace = code.as_ref().and_then(|c| {
+        let c = data_of(c);
         let active = c.get("activeId").and_then(Value::as_str);
         c.get("workspaces")
             .and_then(Value::as_array)
@@ -1758,7 +1759,7 @@ fn run_context(url: &str, token: &str, parsed: &slate_app::cli::Args) -> Result<
     });
     let folder = presence
         .as_ref()
-        .and_then(|p| p.get("workspaceDir"))
+        .and_then(|p| data_of(p).get("workspaceDir"))
         .and_then(Value::as_str);
 
     if parsed.flag("json") {
