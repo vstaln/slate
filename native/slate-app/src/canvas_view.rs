@@ -528,6 +528,14 @@ pub struct CanvasView {
     // form's text and staged photos.
     pub(crate) planner_editing: Option<crate::views_planner::PlannerEdit>,
     pub(crate) planner_draft: crate::views_planner::PlannerDraft,
+    // fix-orchestration: the orchestration pane's keyboard owner — the reply
+    // or permission-note field armed by its own click — and the typed text
+    // per message id, which survives focus moving between cards.
+    orc_editing: Option<crate::views_orchestration::OrcEdit>,
+    orc_drafts: HashMap<String, String>,
+    // fix-orchestration: the last rejected control write, shown as the
+    // pane's red banner until dismissed or the next write succeeds.
+    orc_error: Option<String>,
 }
 
 /// A `/term <command>` line waiting to be typed into a fresh PTY.
@@ -1043,6 +1051,10 @@ impl CanvasView {
             // fix-planner:
             planner_editing: None,
             planner_draft: Default::default(),
+            // fix-orchestration:
+            orc_editing: None,
+            orc_drafts: HashMap::new(),
+            orc_error: None,
         };
         view.snapshots = view.manager.snapshots();
         for pending in relaunch {
@@ -3299,15 +3311,6 @@ impl CanvasView {
         self.notice = Some((text.into(), Instant::now() + Duration::from_secs(4)));
     }
 
-    /// A pane's mutation against the control server — the same routes the
-    /// `slate` CLI calls. The engine stays the single writer; a direct file
-    /// write from here would be clobbered by the next routed persist.
-    fn control_post(&mut self, method: &str, path: &str, body: Option<Value>) {
-        if let Err(error) = slate_app::ipc::control_request(method, path, body.as_ref()) {
-            self.notice(error);
-        }
-    }
-
     /// `PlannerStore.nextOrder` against the folded planner state — snapshot
     /// items plus the journal tail, read-only. `None` when the store can't
     /// be read; the fold then falls back to the payload's own `order`.
@@ -3459,29 +3462,7 @@ impl CanvasView {
                     action.get("id").and_then(Value::as_str),
                     action.get("body").and_then(Value::as_str),
                 ) {
-                    let to = slate_app::ipc::control_request(
-                        "GET",
-                        &format!("/orchestration/messages/{ask_id}"),
-                        None,
-                    )
-                    .ok()
-                    .and_then(|value| {
-                        value
-                            .get("message")?
-                            .get("from")?
-                            .as_str()
-                            .map(str::to_owned)
-                    });
-                    let mut payload = json!({
-                        "type": "reply",
-                        "replyTo": ask_id,
-                        "body": body,
-                        "subject": "reply",
-                    });
-                    if let Some(to) = to {
-                        payload["to"] = json!(to);
-                    }
-                    self.control_post("POST", "/orchestration/messages", Some(payload));
+                    self.orc_send_ask(ask_id, body);
                 }
             }
             Some("orc_allow") | Some("orc_deny") => {
@@ -3501,29 +3482,7 @@ impl CanvasView {
                         Some(note) => format!("{verb}: {note}"),
                         None => verb.to_owned(),
                     };
-                    let to = slate_app::ipc::control_request(
-                        "GET",
-                        &format!("/orchestration/messages/{ask_id}"),
-                        None,
-                    )
-                    .ok()
-                    .and_then(|value| {
-                        value
-                            .get("message")?
-                            .get("from")?
-                            .as_str()
-                            .map(str::to_owned)
-                    });
-                    let mut payload = json!({
-                        "type": "reply",
-                        "replyTo": ask_id,
-                        "body": body,
-                        "subject": subject,
-                    });
-                    if let Some(to) = to {
-                        payload["to"] = json!(to);
-                    }
-                    self.control_post("POST", "/orchestration/messages", Some(payload));
+                    self.orc_reply(ask_id, body, subject);
                 }
             }
             Some("orc_gate") => {
@@ -3531,7 +3490,7 @@ impl CanvasView {
                     action.get("id").and_then(Value::as_str),
                     action.get("resolution").and_then(Value::as_str),
                 ) {
-                    self.control_post(
+                    self.orc_post(
                         "POST",
                         &format!("/orchestration/gates/{gate}/resolve"),
                         Some(json!({ "resolution": resolution })),
@@ -3540,7 +3499,7 @@ impl CanvasView {
             }
             Some("orc_ack") => {
                 if let Some(message) = action.get("id").and_then(Value::as_str) {
-                    self.control_post(
+                    self.orc_post(
                         "POST",
                         &format!("/orchestration/messages/{message}/ack"),
                         Some(json!({})),
@@ -3555,12 +3514,26 @@ impl CanvasView {
                     } else {
                         "released"
                     };
-                    self.control_post(
+                    self.orc_post(
                         "POST",
                         &format!("/orchestration/dispatches/{dispatch}/account"),
                         Some(json!({ "state": state })),
                     );
                 }
+            }
+            // fix-orchestration: a field click arms its keyboard owner; the
+            // draft is created on first keystroke, so a click alone stores
+            // nothing.
+            Some("orc_edit") => {
+                if let Some(id) = action.get("id").and_then(Value::as_str) {
+                    self.orc_editing = Some(match action.get("kind").and_then(Value::as_str) {
+                        Some("note") => crate::views_orchestration::OrcEdit::Note(id.to_owned()),
+                        _ => crate::views_orchestration::OrcEdit::Reply(id.to_owned()),
+                    });
+                }
+            }
+            Some("orc_dismiss_error") => {
+                self.orc_error = None;
             }
             // Files pane ops — pure filesystem work the pane itself can't
             // own; confirmed twice on the pane side before this runs. Every
@@ -4861,6 +4834,9 @@ fn widget_body(
     // like the files slice.
     planner_editing: Option<&crate::views_planner::PlannerEdit>,
     planner_draft: &crate::views_planner::PlannerDraft,
+    // fix-orchestration: the pane's field/draft/error slice, carried in for
+    // the same no-read-mid-render reason.
+    orc: crate::views_orchestration::OrcState<'_>,
     cx: &mut Context<CanvasView>,
 ) -> AnyElement {
     let font = px(12.0 * zoom);
@@ -5023,6 +4999,7 @@ fn widget_body(
             .child(crate::views_orchestration::orchestration_pane(
                 &load_orchestration_store(),
                 widget,
+                orc,
                 cx,
             ))
             .into_any_element(),
@@ -6483,6 +6460,12 @@ impl Render for CanvasView {
                         // fix-planner:
                         self.planner_editing.as_ref(),
                         &self.planner_draft,
+                        // fix-orchestration:
+                        crate::views_orchestration::OrcState {
+                            editing: self.orc_editing.as_ref().map(|e| e.message_id()),
+                            drafts: &self.orc_drafts,
+                            error: self.orc_error.as_deref(),
+                        },
                         cx,
                     );
                     // Non-terminal panes scroll their content natively —
@@ -8265,6 +8248,14 @@ impl CanvasView {
             return;
         }
 
+        // fix-orchestration: an armed reply/note field claims the keyboard
+        // the same way the files fields below do.
+        if self.orc_edit_key(keystroke, mods) {
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
+
         // fix-files: the files pane's fields own the keyboard with the same
         // shape as the omnibox. `Search` commits each keystroke to
         // `state.search` — the original's `setSearch` filtered live and
@@ -9268,5 +9259,133 @@ impl CanvasView {
         if let Some(edit) = self.planner_editing.as_mut() {
             edit.cursor = if end { edit.buffer.len() } else { 0 };
         }
+    }
+
+    // fix-orchestration: a control write that reports back. A rejected POST
+    // becomes the pane's banner (the widget's `actionError`) instead of a
+    // toast; a success clears it.
+    fn orc_post(&mut self, method: &str, path: &str, body: Option<Value>) -> bool {
+        match slate_app::ipc::control_request(method, path, body.as_ref()) {
+            Ok(_) => {
+                self.orc_error = None;
+                true
+            }
+            Err(error) => {
+                self.orc_error = Some(error);
+                false
+            }
+        }
+    }
+
+    // fix-orchestration: a sent reply or decision drops its draft and
+    // releases the field that typed it.
+    fn orc_forget(&mut self, id: &str) {
+        self.orc_drafts.remove(id);
+        if self.orc_editing.as_ref().map(|e| e.message_id()) == Some(id) {
+            self.orc_editing = None;
+        }
+    }
+
+    // fix-orchestration: the reply/decision message to an ask, addressed back
+    // to the asker — the lookup and payload `slate reply` / `slate allow`
+    // build.
+    fn orc_reply(&mut self, ask_id: &str, body: String, subject: &str) {
+        let to = slate_app::ipc::control_request(
+            "GET",
+            &format!("/orchestration/messages/{ask_id}"),
+            None,
+        )
+        .ok()
+        .and_then(|value| {
+            value
+                .get("message")?
+                .get("from")?
+                .as_str()
+                .map(str::to_owned)
+        });
+        let mut payload = json!({
+            "type": "reply",
+            "replyTo": ask_id,
+            "body": body,
+            "subject": subject,
+        });
+        if let Some(to) = to {
+            payload["to"] = json!(to);
+        }
+        if self.orc_post("POST", "/orchestration/messages", Some(payload)) {
+            self.orc_forget(ask_id);
+        }
+    }
+
+    // fix-orchestration: `orc_ask_reply` — empty text is refused, the way the
+    // widget's Send button is disabled until there is something to send.
+    fn orc_send_ask(&mut self, ask_id: &str, body: &str) {
+        if !body.trim().is_empty() {
+            self.orc_reply(ask_id, body.to_owned(), "reply");
+        }
+    }
+
+    // fix-orchestration: keystrokes while a reply/note field is armed. Typing
+    // appends, Backspace trims, Enter sends a reply (a note waits for its
+    // Allow/Deny button), Escape releases. An armed field whose message is no
+    // longer pending drops itself so it never holds keys for a card that's
+    // gone. Returns false when no field owns the keyboard.
+    fn orc_edit_key(&mut self, keystroke: &Keystroke, mods: &Modifiers) -> bool {
+        let Some(edit) = self.orc_editing.clone() else {
+            return false;
+        };
+        let id = edit.message_id().to_owned();
+        if !self.orc_field_live(&id) {
+            self.orc_editing = None;
+            return false;
+        }
+        match keystroke.key.as_str() {
+            "escape" => self.orc_editing = None,
+            "enter" => {
+                self.orc_editing = None;
+                if let crate::views_orchestration::OrcEdit::Reply(_) = edit {
+                    let body = self.orc_drafts.get(&id).cloned().unwrap_or_default();
+                    self.orc_send_ask(&id, &body);
+                }
+            }
+            "backspace" => {
+                if let Some(draft) = self.orc_drafts.get_mut(&id) {
+                    draft.pop();
+                }
+            }
+            _ => {
+                if !mods.control && !mods.alt && !mods.platform {
+                    let text = keystroke.key_char.clone().or_else(|| {
+                        match keystroke.key.as_str() {
+                            "space" => Some(" ".to_owned()),
+                            k if k.chars().count() == 1 => Some(k.to_owned()),
+                            _ => None,
+                        }
+                    });
+                    if let Some(text) = text {
+                        self.orc_drafts.entry(id).or_default().push_str(&text);
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    // fix-orchestration: an orchestration pane is still open and the message
+    // is still on the store and unanswered — the same test the pane's cards
+    // use to list it.
+    fn orc_field_live(&self, id: &str) -> bool {
+        if !self
+            .canvas
+            .widgets
+            .values()
+            .any(|w| w.kind.as_deref() == Some("orchestration"))
+        {
+            return false;
+        }
+        let store = load_orchestration_store();
+        store
+            .message_by_id(id)
+            .is_some_and(|m| crate::views_orchestration::pending(m, &store))
     }
 }

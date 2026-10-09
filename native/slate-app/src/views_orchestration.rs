@@ -14,6 +14,8 @@
 //! below it; clicking the selected run again clears the scope back to
 //! "all runs".
 
+use std::collections::HashMap;
+
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use serde_json::{json, Value};
@@ -29,6 +31,35 @@ const MAX_TASKS: usize = 40;
 const MAX_DISPATCHES: usize = 12;
 const MAX_INBOX: usize = 12;
 const MAX_MAIL: usize = 8;
+
+// fix-orchestration: the pane's slice of CanvasView state. Passed in as data
+// because `entity().read()` mid-render would re-borrow the view (see
+// `widget_body`), the same reason the files and browser fields ride along.
+pub struct OrcState<'a> {
+    /// Message id whose text field owns the keyboard (`orc_editing`).
+    pub editing: Option<&'a str>,
+    /// Typed-but-unsent text per message id (`orc_drafts`) — the original's
+    /// `draft` record, keyed the same way.
+    pub drafts: &'a HashMap<String, String>,
+    /// The last rejected control write (`orc_error`) — the red banner.
+    pub error: Option<&'a str>,
+}
+
+/// Which text field holds the keyboard. Enter on a reply sends it; Enter on a
+/// permission note only releases the field (the buttons send).
+#[derive(Clone)]
+pub enum OrcEdit {
+    Reply(String),
+    Note(String),
+}
+
+impl OrcEdit {
+    pub fn message_id(&self) -> &str {
+        match self {
+            OrcEdit::Reply(id) | OrcEdit::Note(id) => id,
+        }
+    }
+}
 
 /// First line of `text`, shortened to `max` chars — what a run row and the
 /// header show of an objective.
@@ -127,12 +158,59 @@ fn question_text(m: &Message) -> String {
 
 /// Unanswered and nobody has acked it yet — once a reply exists the widget
 /// dropped the row even unacked, and a `slate check` ack settles it too.
-fn pending(m: &Message, store: &OrchestrationStore) -> bool {
+pub(crate) fn pending(m: &Message, store: &OrchestrationStore) -> bool {
     m.acked_by.is_empty() && store.reply_to(&m.id).is_none()
+}
+
+/// A one-line text field — the original's `<input>`. Canvas has no DOM input,
+/// so the buffer is `CanvasView::orc_drafts` and keystrokes route through
+/// `orc_edit_key` while the field is armed (`active`). Clicking it arms it.
+fn field(
+    id: &str,
+    kind: &str,
+    draft: &str,
+    placeholder: &str,
+    active: bool,
+    wid: &str,
+    cx: &mut Context<crate::canvas_view::CanvasView>,
+) -> impl IntoElement {
+    let wid = wid.to_owned();
+    let action = json!({ "op": "orc_edit", "id": id, "kind": kind });
+    let text = if draft.is_empty() && !active {
+        div()
+            .text_color(rgb(theme::hex(theme::text::FAINT)))
+            .child(placeholder.to_owned())
+    } else {
+        div()
+            .text_color(rgb(theme::hex(theme::text::NORMAL)))
+            .child(format!("{draft}{}", if active { "▏" } else { "" }))
+    };
+    div()
+        .flex_1()
+        .min_w_0()
+        .px_2()
+        .py(px(1.0))
+        .border_1()
+        .border_color(rgb(theme::hex(if active {
+            theme::accent::SAND
+        } else {
+            theme::hairline::SOFT
+        })))
+        .cursor_text()
+        .text_xs()
+        .child(text)
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _event, _window, cx| {
+                this.widget_command(&wid, action.clone(), cx);
+            }),
+        )
 }
 
 fn ask_card(
     m: &Message,
+    draft: &str,
+    active: bool,
     wid: &str,
     cx: &mut Context<crate::canvas_view::CanvasView>,
 ) -> impl IntoElement {
@@ -149,16 +227,7 @@ fn ask_card(
                 .text_color(rgb(theme::hex(theme::text::NORMAL)))
                 .child(question_text(m)),
         );
-    if m.options.is_empty() {
-        // There is no canvas text input — free answers go through the CLI,
-        // same as the original's "Answer…" field submitted `reply(id, body)`.
-        el = el.child(
-            div()
-                .text_xs()
-                .text_color(rgb(theme::hex(theme::text::FAINT)))
-                .child(format!("slate reply {} \"…\"", m.id)),
-        );
-    } else {
+    if !m.options.is_empty() {
         let mut row = div().flex().flex_row().flex_wrap().gap_1();
         for option in &m.options {
             row = row.child(orc_button(
@@ -170,11 +239,27 @@ fn ask_card(
         }
         el = el.child(row);
     }
-    el
+    // The original's "Answer…" input and its send button, both here.
+    el.child(
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1()
+            .child(field(&m.id, "reply", draft, "Answer…", active, wid, cx))
+            .child(orc_button(
+                "Send",
+                wid,
+                json!({ "op": "orc_ask_reply", "id": m.id, "body": draft }),
+                cx,
+            )),
+    )
 }
 
 fn permission_card(
     m: &Message,
+    draft: &str,
+    active: bool,
     wid: &str,
     cx: &mut Context<crate::canvas_view::CanvasView>,
 ) -> impl IntoElement {
@@ -191,6 +276,15 @@ fn permission_card(
                 .text_color(rgb(theme::hex(theme::text::NORMAL)))
                 .child(question_text(m)),
         )
+        .child(field(
+            &m.id,
+            "note",
+            draft,
+            "Optional note…",
+            active,
+            wid,
+            cx,
+        ))
         .child(
             div()
                 .flex()
@@ -199,25 +293,14 @@ fn permission_card(
                 .child(orc_button(
                     "Allow",
                     wid,
-                    json!({ "op": "orc_allow", "id": m.id }),
+                    json!({ "op": "orc_allow", "id": m.id, "note": draft }),
                     cx,
                 ))
                 .child(orc_button(
                     "Deny",
                     wid,
-                    json!({ "op": "orc_deny", "id": m.id }),
+                    json!({ "op": "orc_deny", "id": m.id, "note": draft }),
                     cx,
-                )),
-        )
-        // The original carried an optional reason through its note input;
-        // canvas has no text field, so the reason line is the CLI hint.
-        .child(
-            div()
-                .text_xs()
-                .text_color(rgb(theme::hex(theme::text::FAINT)))
-                .child(format!(
-                    "slate allow {0} --note \"…\" · slate deny {0} --reason \"…\"",
-                    m.id
                 )),
         )
 }
@@ -515,12 +598,26 @@ fn dispatch_row(
                         .child(format!("{} · {}", d.agent, d.id)),
                 ),
         )
-        .child(orc_button(
-            "Release",
-            wid,
-            json!({ "op": "orc_release", "id": d.id }),
-            cx,
-        ))
+        // The original's Keep (`retained`) and Release (`released`) pair.
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .flex_none()
+                .gap_1()
+                .child(orc_button(
+                    "Keep",
+                    wid,
+                    json!({ "op": "orc_retain", "id": d.id }),
+                    cx,
+                ))
+                .child(orc_button(
+                    "Release",
+                    wid,
+                    json!({ "op": "orc_release", "id": d.id }),
+                    cx,
+                )),
+        )
 }
 
 fn mail_row(m: &Message) -> impl IntoElement {
@@ -550,6 +647,7 @@ fn mail_row(m: &Message) -> impl IntoElement {
 pub fn orchestration_pane(
     store: &OrchestrationStore,
     widget: &slate_app::projection::Widget,
+    orc: OrcState<'_>,
     cx: &mut Context<crate::canvas_view::CanvasView>,
 ) -> impl IntoElement {
     let wid = widget.id.clone();
@@ -573,9 +671,9 @@ pub fn orchestration_pane(
     let messages = store.list_messages(scope);
 
     let running: Vec<&Dispatch> = dispatches.iter().filter(|d| d.state == "running").collect();
-    let settled: Vec<&Dispatch> = dispatches.iter().filter(|d| d.state == "settled").collect();
     // A settled dispatch the coordinator has not accounted for yet is the
     // only finished kind worth a row — retained and released are done.
+    let settled: Vec<&Dispatch> = dispatches.iter().filter(|d| d.state == "settled").collect();
     let ready_n = tasks.iter().filter(|t| t.status == "ready").count();
 
     let permissions: Vec<&Message> = messages
@@ -665,6 +763,37 @@ pub fn orchestration_pane(
         );
     }
 
+    // The control-write banner — the original's `actionError` strip. A
+    // rejected POST lands here until dismissed or the next write succeeds.
+    if let Some(error) = orc.error {
+        col = col.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .px_1()
+                .py(px(2.0))
+                .border_1()
+                .border_color(rgb(theme::hex(theme::status::DANGER)))
+                .child(
+                    div()
+                        .text_xs()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(rgb(theme::hex(theme::status::DANGER)))
+                        .child(error.to_owned()),
+                )
+                .child(orc_button(
+                    "Dismiss",
+                    &wid,
+                    json!({ "op": "orc_dismiss_error" }),
+                    cx,
+                )),
+        );
+    }
+
     // Everything below the header scrolls as one region; the header stays
     // pinned at the top of the pane.
     let mut list = div()
@@ -675,6 +804,62 @@ pub fn orchestration_pane(
         .flex_1()
         .min_h_0()
         .overflow_y_scroll();
+
+    // Actionable first, like the original: permission → waiting on you →
+    // decision gates → ackable reports. Each card's text field reads its
+    // draft and says whether it holds the keyboard.
+    {
+        let mut section = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(section_header("INBOX"));
+        if permissions.is_empty() && asks.is_empty() && gates.is_empty() && notices.is_empty() {
+            section = section.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(theme::hex(theme::text::FAINT)))
+                    .child("Nothing waiting on you"),
+            );
+        }
+        for m in permissions.iter().take(MAX_INBOX) {
+            let draft = orc.drafts.get(&m.id).map(String::as_str).unwrap_or("");
+            let active = orc.editing == Some(m.id.as_str());
+            section = section.child(permission_card(m, draft, active, &wid, cx));
+        }
+        for m in asks.iter().take(MAX_INBOX) {
+            let draft = orc.drafts.get(&m.id).map(String::as_str).unwrap_or("");
+            let active = orc.editing == Some(m.id.as_str());
+            section = section.child(ask_card(m, draft, active, &wid, cx));
+        }
+        for gate in &gates {
+            section = section.child(gate_card(gate, &wid, cx));
+        }
+        for m in notices.iter().take(MAX_INBOX) {
+            section = section.child(ack_row(m, &wid, cx));
+        }
+        list = list.child(section);
+    }
+
+    // Finished — the original's "keep or release" rows. Only settled and
+    // unaccounted dispatches; hidden entirely when there are none.
+    if !settled.is_empty() {
+        let mut section = div()
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .child(section_header(format!(
+                "FINISHED — KEEP OR RELEASE ({})",
+                settled.len()
+            )));
+        for d in settled.iter().take(MAX_DISPATCHES) {
+            section = section.child(dispatch_row(d, &wid, cx));
+        }
+        if let Some(tail) = capped_tail(settled.len(), MAX_DISPATCHES) {
+            section = section.child(tail);
+        }
+        list = list.child(section);
+    }
 
     // Runs — click scopes the whole pane (journaled `selectedRun`), click the
     // selected one again to go back to all runs.
@@ -718,58 +903,23 @@ pub fn orchestration_pane(
         list = list.child(section);
     }
 
-    // Dispatches — live workers first, then settled ones still waiting on
-    // the keep-or-release accounting.
+    // Running dispatches — the live workers.
     {
         let mut section = div()
             .flex()
             .flex_col()
             .gap(px(2.0))
-            .child(section_header("DISPATCHES"));
-        if running.is_empty() && settled.is_empty() {
+            .child(section_header(format!("RUNNING ({})", running.len())));
+        if running.is_empty() {
             section = section.child(
                 div()
                     .text_xs()
                     .text_color(rgb(theme::hex(theme::text::FAINT)))
-                    .child("No dispatches yet"),
+                    .child("No dispatches running"),
             );
         }
         for d in running.iter().take(MAX_DISPATCHES) {
             section = section.child(dispatch_row(d, &wid, cx));
-        }
-        for d in settled.iter().take(MAX_DISPATCHES) {
-            section = section.child(dispatch_row(d, &wid, cx));
-        }
-        list = list.child(section);
-    }
-
-    // Inbox — the original's "Permission required", "Waiting on you" and
-    // "Decision gates" sections plus ackable reports, in its priority order.
-    {
-        let mut section = div()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .child(section_header("INBOX"));
-        if permissions.is_empty() && asks.is_empty() && gates.is_empty() && notices.is_empty() {
-            section = section.child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(theme::hex(theme::text::FAINT)))
-                    .child("Nothing waiting on you"),
-            );
-        }
-        for m in permissions.iter().take(MAX_INBOX) {
-            section = section.child(permission_card(m, &wid, cx));
-        }
-        for m in asks.iter().take(MAX_INBOX) {
-            section = section.child(ask_card(m, &wid, cx));
-        }
-        for gate in &gates {
-            section = section.child(gate_card(gate, &wid, cx));
-        }
-        for m in notices.iter().take(MAX_INBOX) {
-            section = section.child(ack_row(m, &wid, cx));
         }
         list = list.child(section);
     }
