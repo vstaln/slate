@@ -522,6 +522,12 @@ pub struct CanvasView {
     // fix-browser: App.tsx's canvas-wide `window.open` budget — at most 3
     // popups per sliding 5s, on top of webview.rs's per-webview gate.
     popup_opens: std::collections::VecDeque<Instant>,
+    // fix-planner: the planner pane's open text field (create form or a row's
+    // inline title/note/date) — it owns the keyboard while `Some`, the same
+    // single-owner shape as `browser_editing`. `planner_draft` holds the create
+    // form's text and staged photos.
+    pub(crate) planner_editing: Option<crate::views_planner::PlannerEdit>,
+    pub(crate) planner_draft: crate::views_planner::PlannerDraft,
 }
 
 /// A `/term <command>` line waiting to be typed into a fresh PTY.
@@ -1034,6 +1040,9 @@ impl CanvasView {
             browser_cursor: 0,
             browser_sel: None,
             popup_opens: std::collections::VecDeque::new(),
+            // fix-planner:
+            planner_editing: None,
+            planner_draft: Default::default(),
         };
         view.snapshots = view.manager.snapshots();
         for pending in relaunch {
@@ -4848,6 +4857,10 @@ fn widget_body(
     // in for the same no-read-mid-render reason as the browser fields.
     files_editing: Option<&crate::views_files::FilesEditing>,
     files_preview: Option<&crate::views_files::FilesPreview>,
+    // fix-planner: the planner pane's open field and create draft, carried in
+    // like the files slice.
+    planner_editing: Option<&crate::views_planner::PlannerEdit>,
+    planner_draft: &crate::views_planner::PlannerDraft,
     cx: &mut Context<CanvasView>,
 ) -> AnyElement {
     let font = px(12.0 * zoom);
@@ -4986,7 +4999,12 @@ fn widget_body(
         Some("planner") => div()
             .size_full()
             .text_size(font)
-            .child(crate::views_planner::planner_pane(widget, cx))
+            .child(crate::views_planner::planner_pane(
+                widget,
+                planner_editing,
+                planner_draft,
+                cx,
+            ))
             .into_any_element(),
         Some("files") => div()
             .size_full()
@@ -6462,6 +6480,9 @@ impl Render for CanvasView {
                         // fix-files:
                         self.files_editing.as_ref(),
                         self.files_preview.as_ref(),
+                        // fix-planner:
+                        self.planner_editing.as_ref(),
+                        &self.planner_draft,
                         cx,
                     );
                     // Non-terminal panes scroll their content natively —
@@ -8142,6 +8163,42 @@ impl CanvasView {
             return;
         }
 
+        // fix-planner: the planner pane's open field owns the keyboard — the
+        // omnibox's editing keys without a selection. Enter commits (a create
+        // field adds the task), Escape reverts, arrows/Home/End move the caret,
+        // ⌘/Ctrl+V pastes text or a clipboard photo.
+        if self.planner_editing.is_some() {
+            let paste = (mods.control || mods.platform) && keystroke.key == "v";
+            match keystroke.key.as_str() {
+                "escape" => self.planner_editing = None,
+                "enter" => self.planner_submit(cx),
+                "backspace" => self.planner_edit_backspace(),
+                "delete" => self.planner_edit_delete(),
+                "left" => self.planner_edit_step(false),
+                "right" => self.planner_edit_step(true),
+                "home" => self.planner_edit_edge(false),
+                "end" => self.planner_edit_edge(true),
+                _ if paste => self.planner_paste(cx),
+                _ => {
+                    if !mods.control && !mods.alt && !mods.platform {
+                        let text = keystroke.key_char.clone().or_else(|| {
+                            match keystroke.key.as_str() {
+                                "space" => Some(" ".to_owned()),
+                                k if k.chars().count() == 1 => Some(k.to_owned()),
+                                _ => None,
+                            }
+                        });
+                        if let Some(text) = text {
+                            self.planner_edit_insert(&text);
+                        }
+                    }
+                }
+            }
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
+
         // The browser omnibox owns the keyboard while it is editing — the
         // same shape as rename plus the DOM input's editing keys: Enter
         // navigates, Escape reverts, arrows/Home/End move the caret (⇧
@@ -8896,5 +8953,320 @@ impl CanvasView {
             self.browser_cursor = at;
         }
         self.browser_sel = None;
+    }
+
+    /// fix-planner: focus a field (the original's input focus). The field that
+    /// was open flushes first (`planner_flush`), then `field` opens with `seed`
+    /// as its buffer and the caret at the end.
+    pub(crate) fn planner_begin(
+        &mut self,
+        wid: String,
+        field: crate::views_planner::PlannerField,
+        seed: String,
+        cx: &mut Context<Self>,
+    ) {
+        // A click inside the field that already owns the caret keeps the caret.
+        if self.planner_editing.as_ref().is_some_and(|edit| edit.field == field) {
+            return;
+        }
+        self.planner_flush(cx);
+        self.planner_editing = Some(crate::views_planner::PlannerEdit {
+            wid,
+            field,
+            cursor: seed.len(),
+            buffer: seed.clone(),
+            seed,
+        });
+        cx.notify();
+    }
+
+    /// Closes the open field. A create field stores its buffer in the draft;
+    /// a row field commits as the existing `plan_update` op with a `patch`
+    /// (blur and Enter both land here). An unchanged field commits nothing, and
+    /// a malformed date is refused with a notice — the fold would abort on it.
+    fn planner_flush(&mut self, cx: &mut Context<Self>) {
+        use crate::views_planner::PlannerField;
+        let Some(edit) = self.planner_editing.take() else {
+            return;
+        };
+        let text = edit.buffer;
+        match &edit.field {
+            PlannerField::Title(id) | PlannerField::Note(id) | PlannerField::Day(id) => {
+                if text == edit.seed {
+                    return;
+                }
+                let patch = match &edit.field {
+                    PlannerField::Title(_) => {
+                        let title = text.trim();
+                        if title.is_empty() {
+                            return;
+                        }
+                        json!({ "title": title })
+                    }
+                    PlannerField::Note(_) => json!({ "note": text }),
+                    _ => {
+                        let today = slate_app::planner::today_local();
+                        match slate_app::planner::normalize_day(
+                            Some(&json!(text.trim())),
+                            &today,
+                        ) {
+                            Ok(day) => json!({ "day": day }),
+                            Err(error) => {
+                                self.notice(error.0);
+                                return;
+                            }
+                        }
+                    }
+                };
+                let action = json!({ "op": "plan_update", "id": id, "patch": patch });
+                self.widget_command(&edit.wid, action, cx);
+            }
+            field => {
+                if let Some(slot) = self.planner_draft.slot(field) {
+                    *slot = text;
+                }
+            }
+        }
+    }
+
+    /// Enter in the open field: a create field adds the task and reopens
+    /// itself empty (the original keeps focus in the input); a row field
+    /// commits and closes.
+    fn planner_submit(&mut self, cx: &mut Context<Self>) {
+        let Some(edit) = self.planner_editing.clone() else {
+            return;
+        };
+        if !edit.field.is_create() {
+            self.planner_flush(cx);
+            return;
+        }
+        self.planner_add(&edit.wid, cx);
+        let seed = self.planner_draft.value(&edit.field);
+        self.planner_begin(edit.wid, edit.field, seed, cx);
+    }
+
+    /// The create form's Add (Enter in a create field too): flush the open
+    /// field into the draft, then dispatch the scope-aware `plan_create`. A
+    /// blank title is a no-op; a bad date is a notice and keeps the draft.
+    pub(crate) fn planner_add(&mut self, wid: &str, cx: &mut Context<Self>) {
+        self.planner_flush(cx);
+        let state = self.canvas.widgets.get(wid).and_then(|w| w.state.clone());
+        match crate::views_planner::create_action(state.as_ref(), &self.planner_draft) {
+            Ok(Some(action)) => {
+                self.widget_command(wid, action, cx);
+                self.planner_draft.title.clear();
+                self.planner_draft.attachments.clear();
+            }
+            Ok(None) => {}
+            Err(error) => self.notice(error),
+        }
+        cx.notify();
+    }
+
+    /// The × on a thumb. The draft drops the photo locally; an item journals
+    /// its remaining list as `plan_update` — an empty list clears the field.
+    pub(crate) fn planner_remove_attachment(
+        &mut self,
+        target: crate::views_planner::PlannerAttachTarget,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::views_planner::PlannerAttachTarget;
+        match target {
+            PlannerAttachTarget::Draft => {
+                if index < self.planner_draft.attachments.len() {
+                    self.planner_draft.attachments.remove(index);
+                }
+            }
+            PlannerAttachTarget::Item(id) => {
+                let mut kept = crate::views_planner::planner_items()
+                    .0
+                    .into_iter()
+                    .find(|row| row.id == id)
+                    .map(|row| row.attachments)
+                    .unwrap_or_default();
+                if index >= kept.len() {
+                    return;
+                }
+                kept.remove(index);
+                self.commit(
+                    "plan.update",
+                    &format!("plan:{id}"),
+                    json!({ "attachments": kept }),
+                );
+            }
+        }
+        cx.notify();
+    }
+
+    /// Saved photo paths land on their target: staged on the draft, or
+    /// appended to the item's list. `merge_attachments` caps both at 12.
+    fn planner_attach(
+        &mut self,
+        target: crate::views_planner::PlannerAttachTarget,
+        paths: Vec<std::path::PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::views_planner::{merge_attachments, PlannerAttachTarget};
+        if paths.is_empty() {
+            return;
+        }
+        let added: Vec<String> = paths
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+        match target {
+            PlannerAttachTarget::Draft => {
+                self.planner_draft.attachments =
+                    merge_attachments(&self.planner_draft.attachments, &added);
+            }
+            PlannerAttachTarget::Item(id) => {
+                let current = crate::views_planner::planner_items()
+                    .0
+                    .into_iter()
+                    .find(|row| row.id == id)
+                    .map(|row| row.attachments)
+                    .unwrap_or_default();
+                let next = merge_attachments(&current, &added);
+                self.commit(
+                    "plan.update",
+                    &format!("plan:{id}"),
+                    json!({ "attachments": next }),
+                );
+            }
+        }
+        cx.notify();
+    }
+
+    /// The paperclip: the native file prompt, then each picked image is
+    /// imported into the media store off the UI thread and attached.
+    pub(crate) fn planner_pick_photos(
+        &mut self,
+        target: crate::views_planner::PlannerAttachTarget,
+        cx: &mut Context<Self>,
+    ) {
+        let picked = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Attach photo".into()),
+        });
+        let media = Self::planner_media_dir();
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = picked.await else {
+                return;
+            };
+            let saved = cx
+                .background_executor()
+                .spawn(async move {
+                    paths
+                        .iter()
+                        .filter(|path| {
+                            slate_app::attachments::classify_media(path)
+                                == slate_app::attachments::MediaKind::Image
+                        })
+                        .filter_map(|path| {
+                            slate_app::attachments::import_media(path, &media).ok()
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| this.planner_attach(target, saved, cx));
+        })
+        .detach();
+    }
+
+    /// ⌘/Ctrl+V into the open field: a clipboard photo attaches to the field's
+    /// target (the draft, or the row it belongs to); text inserts at the caret.
+    fn planner_paste(&mut self, cx: &mut Context<Self>) {
+        let Some(item) = cx.read_from_clipboard() else {
+            return;
+        };
+        let images: Vec<(Vec<u8>, String)> = item
+            .entries()
+            .iter()
+            .filter_map(|entry| match entry {
+                gpui::ClipboardEntry::Image(image) => Some((
+                    image.bytes().to_vec(),
+                    format!("{:?}", image.format()).to_lowercase(),
+                )),
+                _ => None,
+            })
+            .collect();
+        if !images.is_empty() {
+            let Some(target) = self
+                .planner_editing
+                .as_ref()
+                .map(|edit| edit.field.attach_target())
+            else {
+                return;
+            };
+            let dir = Self::planner_media_dir();
+            let saved: Vec<std::path::PathBuf> = images
+                .iter()
+                .filter_map(|(bytes, ext)| {
+                    slate_app::attachments::save_bytes(bytes, ext, &dir).ok()
+                })
+                .collect();
+            self.planner_attach(target, saved, cx);
+        } else if let Some(text) = item.text() {
+            self.planner_edit_insert(&text);
+        }
+        cx.notify();
+    }
+
+    /// The media store (`{user data}/media`) that attachments are saved into.
+    fn planner_media_dir() -> std::path::PathBuf {
+        slate_app::ipc::user_data_dir().join("media")
+    }
+
+    // Caret edits on the open field. `cursor` is always a char boundary: every
+    // step walks by `char`, so the byte slicing below cannot split one.
+
+    fn planner_edit_insert(&mut self, text: &str) {
+        if let Some(edit) = self.planner_editing.as_mut() {
+            edit.buffer.insert_str(edit.cursor, text);
+            edit.cursor += text.len();
+        }
+    }
+
+    fn planner_edit_backspace(&mut self) {
+        if let Some(edit) = self.planner_editing.as_mut() {
+            if let Some((prev, _)) = edit.buffer[..edit.cursor].char_indices().next_back() {
+                edit.buffer.replace_range(prev..edit.cursor, "");
+                edit.cursor = prev;
+            }
+        }
+    }
+
+    fn planner_edit_delete(&mut self) {
+        if let Some(edit) = self.planner_editing.as_mut() {
+            if let Some(next) = edit.buffer[edit.cursor..].chars().next() {
+                let end = edit.cursor + next.len_utf8();
+                edit.buffer.replace_range(edit.cursor..end, "");
+            }
+        }
+    }
+
+    fn planner_edit_step(&mut self, forward: bool) {
+        if let Some(edit) = self.planner_editing.as_mut() {
+            edit.cursor = if forward {
+                edit.buffer[edit.cursor..]
+                    .chars()
+                    .next()
+                    .map_or(edit.cursor, |c| edit.cursor + c.len_utf8())
+            } else {
+                edit.buffer[..edit.cursor]
+                    .char_indices()
+                    .next_back()
+                    .map_or(edit.cursor, |(i, _)| i)
+            };
+        }
+    }
+
+    fn planner_edit_edge(&mut self, end: bool) {
+        if let Some(edit) = self.planner_editing.as_mut() {
+            edit.cursor = if end { edit.buffer.len() } else { 0 };
+        }
     }
 }

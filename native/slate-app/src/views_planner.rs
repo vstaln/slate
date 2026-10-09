@@ -34,9 +34,12 @@
 //! * `{"op": "set", "state": {"scope": ...}}` / `{"project": ...}` — the
 //!   tab and the project filter live in journaled widget state.
 //!
-//! There is no free-text input element in the canvas yet, so "+ New task"
-//! creates a placeholder row under the current scope — `slate plan update`
-//! (or a future `plan_update` title edit) refines it.
+//! fix-planner: the create form (title / project / date + staged photos) and
+//! the inline title / note / date edits are CanvasView state
+//! (`planner_editing`, `planner_draft`), the same single-owner shape as the
+//! browser omnibox. Field commits emit the existing `plan_update` op with a
+//! `patch`; the create emits `plan_create` (via `planner_add`). Photos are
+//! attached with the paperclip (file prompt) or by pasting a clipboard image.
 
 use gpui::prelude::FluentBuilder;
 use gpui::*;
@@ -53,6 +56,148 @@ pub struct PlannerRow {
     pub time: Option<String>,
     pub done: bool,
     pub order: f64,
+    /// fix-planner: the item's photo paths, folded from `attachments`.
+    pub attachments: Vec<String>,
+}
+
+/// fix-planner: the original's `pendingCreateAttachments` cap (`>= 12`).
+pub(crate) const MAX_ATTACHMENTS: usize = 12;
+
+/// fix-planner: the create form's draft — `title`, `project`, `day` as typed,
+/// plus the staged photo paths. `day` empty = the scope default (`add()`).
+#[derive(Default)]
+pub(crate) struct PlannerDraft {
+    pub title: String,
+    pub project: String,
+    pub day: String,
+    pub attachments: Vec<String>,
+}
+
+/// The one text field that owns the keyboard — the create form's inputs or a
+/// row's inline title / note / date.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) enum PlannerField {
+    CreateTitle,
+    CreateProject,
+    CreateDay,
+    Title(String),
+    Note(String),
+    Day(String),
+}
+
+/// Where a photo lands: the create draft, or an existing item's list.
+#[derive(Clone)]
+pub(crate) enum PlannerAttachTarget {
+    Draft,
+    Item(String),
+}
+
+/// An open field: `buffer` is what the user is typing, `cursor` a byte offset
+/// on a char boundary, `seed` the value when focus arrived (an unchanged row
+/// field commits nothing).
+#[derive(Clone)]
+pub(crate) struct PlannerEdit {
+    pub wid: String,
+    pub field: PlannerField,
+    pub buffer: String,
+    pub cursor: usize,
+    pub seed: String,
+}
+
+impl PlannerField {
+    pub(crate) fn is_create(&self) -> bool {
+        matches!(
+            self,
+            PlannerField::CreateTitle | PlannerField::CreateProject | PlannerField::CreateDay
+        )
+    }
+
+    pub(crate) fn attach_target(&self) -> PlannerAttachTarget {
+        match self {
+            PlannerField::Title(id) | PlannerField::Note(id) | PlannerField::Day(id) => {
+                PlannerAttachTarget::Item(id.clone())
+            }
+            _ => PlannerAttachTarget::Draft,
+        }
+    }
+}
+
+impl PlannerDraft {
+    /// The draft slot a create field edits; `None` for row fields.
+    pub(crate) fn slot(&mut self, field: &PlannerField) -> Option<&mut String> {
+        match field {
+            PlannerField::CreateTitle => Some(&mut self.title),
+            PlannerField::CreateProject => Some(&mut self.project),
+            PlannerField::CreateDay => Some(&mut self.day),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn value(&self, field: &PlannerField) -> String {
+        match field {
+            PlannerField::CreateTitle => self.title.clone(),
+            PlannerField::CreateProject => self.project.clone(),
+            PlannerField::CreateDay => self.day.clone(),
+            _ => String::new(),
+        }
+    }
+}
+
+/// `current` plus `added`, capped at `MAX_ATTACHMENTS` — the staged-photo rule.
+pub(crate) fn merge_attachments(current: &[String], added: &[String]) -> Vec<String> {
+    current
+        .iter()
+        .chain(added)
+        .take(MAX_ATTACHMENTS)
+        .cloned()
+        .collect()
+}
+
+/// The original's `add()`: validates the draft and builds the `plan_create`
+/// action. `Ok(None)` is a blank title (a no-op); `Err` is the notice text for
+/// a bad date. Project follows `projectFilter || project.trim()`; `day` is the
+/// scope default (today under Today/Week, else undated) unless typed.
+pub(crate) fn create_action(
+    state: Option<&Value>,
+    draft: &PlannerDraft,
+) -> Result<Option<Value>, String> {
+    let title = draft.title.trim();
+    if title.is_empty() {
+        return Ok(None);
+    }
+    let today = slate_app::planner::today_local();
+    let scope = Scope::parse(
+        state
+            .and_then(|s| s.get("scope"))
+            .and_then(Value::as_str)
+            .unwrap_or("today"),
+    );
+    let filter = state
+        .and_then(|s| s.get("project"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let typed = draft.day.trim();
+    let day = if typed.is_empty() {
+        matches!(scope, Scope::Today | Scope::Week).then(|| today.0.clone())
+    } else {
+        slate_app::planner::normalize_day(Some(&json!(typed)), &today)
+            .map_err(|e| e.0)?
+    };
+    let project = filter.or_else(|| {
+        let p = draft.project.trim();
+        (!p.is_empty()).then(|| p.to_owned())
+    });
+    let mut action = json!({ "op": "plan_create", "title": title });
+    if let Some(day) = day {
+        action["day"] = json!(day);
+    }
+    if let Some(project) = project {
+        action["project"] = json!(project);
+    }
+    if !draft.attachments.is_empty() {
+        action["attachments"] = json!(draft.attachments);
+    }
+    Ok(Some(action))
 }
 
 /// The original's `se` tab list, in order. `all` is a filter width, not a
@@ -231,9 +376,107 @@ pub fn planner_items() -> (Vec<PlannerRow>, Option<String>) {
             time: item.time.clone(),
             done: item.done,
             order: item.order,
+            attachments: item.attachments.clone().unwrap_or_default(),
         })
         .collect();
     (rows, error)
+}
+
+/// fix-planner: one inline field. At rest it shows `rest` (or `placeholder`
+/// when empty); click focuses it (`planner_begin`) with `seed` as the buffer.
+/// While it owns the keyboard the buffer shows with a caret at `cursor`.
+fn planner_text(
+    base: Div,
+    field: PlannerField,
+    rest: &str,
+    placeholder: &str,
+    seed: &str,
+    wid: &str,
+    editing: Option<&PlannerEdit>,
+    cx: &mut Context<crate::canvas_view::CanvasView>,
+) -> Div {
+    let faint = rgb(theme::hex(theme::text::FAINT));
+    let caret = rgb(theme::hex(theme::text::NORMAL));
+    let active = editing.filter(|e| e.field == field);
+    let body = match active {
+        Some(edit) => {
+            let at = edit.cursor.min(edit.buffer.len());
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .child(edit.buffer[..at].to_owned())
+                .child(div().flex_none().w(px(1.)).h(px(12.)).bg(caret))
+                .child(edit.buffer[at..].to_owned())
+        }
+        None if rest.is_empty() => div().text_color(faint).child(placeholder.to_owned()),
+        None => div().child(rest.to_owned()),
+    };
+    let wid = wid.to_owned();
+    let seed = seed.to_owned();
+    base.min_w_0()
+        .overflow_hidden()
+        .cursor_text()
+        .child(body)
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _event, window, cx| {
+                // Don't let the click fall through to the row's toggle.
+                cx.stop_propagation();
+                window.focus(&this.focus, cx);
+                this.planner_begin(wid.clone(), field.clone(), seed.clone(), cx);
+            }),
+        )
+}
+
+/// fix-planner: the photo strip — `att_thumb` in the original. Each thumb
+/// removes itself on its × (`planner_remove_attachment`).
+fn planner_thumbs(
+    paths: &[String],
+    target: PlannerAttachTarget,
+    cx: &mut Context<crate::canvas_view::CanvasView>,
+) -> Option<Div> {
+    if paths.is_empty() {
+        return None;
+    }
+    let mut strip = div().flex().flex_row().flex_wrap().gap_1().pl(px(18.));
+    for (index, path) in paths.iter().enumerate() {
+        let target = target.clone();
+        let group = format!("planner-thumb-{index}-{path}");
+        strip = strip.child(
+            div()
+                .group(group.clone())
+                .relative()
+                .w(px(80.))
+                .h(px(64.))
+                .overflow_hidden()
+                .border_1()
+                .border_color(rgb(theme::hex(theme::hairline::SOFT)))
+                .child(img(std::path::PathBuf::from(path)).size_full())
+                .child(
+                    div()
+                        .absolute()
+                        .top_1()
+                        .right_1()
+                        .px_1()
+                        .text_xs()
+                        .cursor_pointer()
+                        .invisible()
+                        .group_hover(group, |el| el.visible())
+                        .bg(rgb(theme::hex(theme::monochrome::RAISED)))
+                        .text_color(rgb(theme::hex(theme::status::DANGER)))
+                        .child("×")
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _event, _window, cx| {
+                                cx.stop_propagation();
+                                this.planner_remove_attachment(target.clone(), index, cx);
+                            }),
+                        ),
+                ),
+        );
+    }
+    Some(strip)
 }
 
 /// One hover-affordance button on a row (`→scope` move, `×` delete).
@@ -278,6 +521,7 @@ fn planner_row<'a>(
     today: &'a str,
     week_end: &'a str,
     wid: &'a str,
+    editing: Option<&'a PlannerEdit>,
     cx: &'a mut Context<crate::canvas_view::CanvasView>,
 ) -> impl IntoElement + 'a {
     let group: SharedString = format!("plan-row-{}", row.id).into();
@@ -328,20 +572,25 @@ fn planner_row<'a>(
                 .text_color(rgb(theme::hex(theme::text::FAINT)))
                 .child(index.to_string()),
         )
-        .child(
+        .child(planner_text(
             div()
                 .flex_1()
                 .min_w_0()
-                .truncate()
                 .text_sm()
                 .text_color(rgb(theme::hex(if row.done {
                     theme::text::FAINT
                 } else {
                     theme::text::NORMAL
                 })))
-                .when(row.done, |el| el.line_through())
-                .child(row.title.clone()),
-        )
+                .when(row.done, |el| el.line_through()),
+            PlannerField::Title(row.id.clone()),
+            &row.title,
+            "Untitled",
+            &row.title,
+            wid,
+            editing,
+            cx,
+        ))
         .child(row_button(
             match target {
                 Scope::Today => "→today",
@@ -354,52 +603,85 @@ fn planner_row<'a>(
             group.clone(),
             cx,
         ))
+        // fix-planner: the row's paperclip — the original's `Attach photo`.
+        .child(
+            div()
+                .text_xs()
+                .cursor_pointer()
+                .px_1()
+                .invisible()
+                .group_hover(group.clone(), |el| el.visible())
+                .text_color(rgb(theme::hex(theme::text::FAINT)))
+                .hover(|el| {
+                    el.bg(rgb(theme::hex(theme::monochrome::RAISED)))
+                        .text_color(rgb(theme::hex(theme::text::NORMAL)))
+                })
+                .child("+ photo")
+                .on_mouse_down(MouseButton::Left, {
+                    let id = row.id.clone();
+                    cx.listener(move |this, _event, _window, cx| {
+                        cx.stop_propagation();
+                        this.planner_pick_photos(PlannerAttachTarget::Item(id.clone()), cx);
+                    })
+                }),
+        )
         .child(row_button(
             "×",
             wid.to_owned(),
             delete_action,
             true,
-            group,
+            group.clone(),
             cx,
         ));
 
     // The original's sub-line: project · date chip · time · note. The chip
     // is a date picker there; here it's the readout the move cycle edits.
-    let mut meta: Option<Div> = None;
-    if row.project.is_some() || show_day || row.time.is_some() || !row.note.is_empty() {
-        let mut m = div()
-            .flex()
-            .flex_row()
-            .flex_wrap()
-            .gap_2()
-            .pl(px(18.))
-            .text_xs()
-            .text_color(rgb(theme::hex(theme::text::FAINT)));
-        if let Some(project) = &row.project {
-            m = m.child(
-                div()
-                    .text_color(rgb(theme::hex(theme::text::DIM)))
-                    .child(project.clone()),
-            );
-        }
-        if show_day {
-            m = m.child(
-                div().child(
-                    row.day
-                        .as_deref()
-                        .map(fmt_day)
-                        .unwrap_or_else(|| "no date".to_owned()),
-                ),
-            );
-        }
-        if let Some(time) = &row.time {
-            m = m.child(time.clone());
-        }
-        if !row.note.is_empty() {
-            m = m.child(div().truncate().child(row.note.clone()));
-        }
-        meta = Some(m);
+    // The original's sub-line: project · date chip · time · note. fix-planner:
+    // the date chip and the note are inline fields — the date takes any
+    // `YYYY-MM-DD` (or today/tomorrow/yesterday), an empty one clears it.
+    let mut m = div()
+        .flex()
+        .flex_row()
+        .flex_wrap()
+        .gap_2()
+        .pl(px(18.))
+        .text_xs()
+        .text_color(rgb(theme::hex(theme::text::FAINT)));
+    if let Some(project) = &row.project {
+        m = m.child(
+            div()
+                .text_color(rgb(theme::hex(theme::text::DIM)))
+                .child(project.clone()),
+        );
     }
+    if show_day {
+        m = m.child(planner_text(
+            div().text_xs(),
+            PlannerField::Day(row.id.clone()),
+            &row.day.as_deref().map(fmt_day).unwrap_or_default(),
+            "no date",
+            row.day.as_deref().unwrap_or(""),
+            wid,
+            editing,
+            cx,
+        ));
+    }
+    if let Some(time) = &row.time {
+        m = m.child(time.clone());
+    }
+    // An empty note is a hover-only "+ note" affordance.
+    m = m.child(planner_text(
+        div().truncate().text_xs().when(row.note.is_empty(), |el| {
+            el.invisible().group_hover(group.clone(), |el| el.visible())
+        }),
+        PlannerField::Note(row.id.clone()),
+        &row.note,
+        "+ note",
+        &row.note,
+        wid,
+        editing,
+        cx,
+    ));
 
     let mut el = div()
         .group(format!("plan-row-{}", row.id))
@@ -408,15 +690,116 @@ fn planner_row<'a>(
         .px_1()
         .py_1()
         .hover(|el| el.bg(rgb(theme::hex(theme::monochrome::RAISED))))
-        .child(line);
-    if let Some(meta) = meta {
-        el = el.child(meta);
+        .child(line)
+        .child(m);
+    if let Some(strip) = planner_thumbs(
+        &row.attachments,
+        PlannerAttachTarget::Item(row.id.clone()),
+        cx,
+    ) {
+        el = el.child(strip);
     }
     el
 }
 
-pub fn planner_pane(
+/// fix-planner: the original's add row — title (paste / paperclip for photos),
+/// project and date inputs, the Add button, then the staged photo strip.
+fn planner_create_form(
+    draft: &PlannerDraft,
+    editing: Option<&PlannerEdit>,
+    wid: &str,
+    show_project: bool,
+    cx: &mut Context<crate::canvas_view::CanvasView>,
+) -> impl IntoElement {
+    let input = |base: Div, field: PlannerField, placeholder: &str, cx: &mut Context<_>| {
+        let value = draft.value(&field);
+        planner_text(base, field, &value, placeholder, &value, wid, editing, cx)
+    };
+    let title = input(
+        div().flex_1().min_w_0().text_sm().text_color(rgb(theme::hex(theme::text::NORMAL))),
+        PlannerField::CreateTitle,
+        "Add a task…  (paste a photo)",
+        cx,
+    );
+    let project = show_project.then(|| {
+        input(
+            div().flex_1().min_w_0().text_xs().text_color(rgb(theme::hex(theme::text::DIM))),
+            PlannerField::CreateProject,
+            "Project (optional)",
+            cx,
+        )
+    });
+    let date = input(
+        div().flex_1().min_w_0().text_xs().text_color(rgb(theme::hex(theme::text::DIM))),
+        PlannerField::CreateDay,
+        "Date YYYY-MM-DD  (empty = scope)",
+        cx,
+    );
+    let button = |label: &'static str| {
+        div()
+            .flex_none()
+            .text_xs()
+            .cursor_pointer()
+            .px_2()
+            .py_1()
+            .text_color(rgb(theme::hex(theme::text::FAINT)))
+            .hover(|el| {
+                el.bg(rgb(theme::hex(theme::monochrome::RAISED)))
+                    .text_color(rgb(theme::hex(theme::text::NORMAL)))
+            })
+            .child(label)
+    };
+    let add = button("Add").on_mouse_down(MouseButton::Left, {
+        let wid = wid.to_owned();
+        cx.listener(move |this, _event, _window, cx| {
+            cx.stop_propagation();
+            this.planner_add(&wid, cx);
+        })
+    });
+    let clip = button("📎").on_mouse_down(
+        MouseButton::Left,
+        cx.listener(|this, _event, _window, cx| {
+            cx.stop_propagation();
+            this.planner_pick_photos(PlannerAttachTarget::Draft, cx);
+        }),
+    );
+    let mut form = div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .mx_1()
+        .px_2()
+        .py_1()
+        .bg(rgb(theme::hex(theme::monochrome::ELEVATED)))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .child(title)
+                .child(clip)
+                .child(add),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .children(project)
+                .child(date),
+        );
+    if let Some(strip) = planner_thumbs(&draft.attachments, PlannerAttachTarget::Draft, cx) {
+        form = form.child(strip);
+    }
+    form
+}
+
+pub(crate) fn planner_pane(
     widget: &slate_app::projection::Widget,
+    editing: Option<&PlannerEdit>,
+    draft: &PlannerDraft,
     cx: &mut Context<crate::canvas_view::CanvasView>,
 ) -> impl IntoElement {
     let (rows, error) = planner_items();
@@ -674,43 +1057,14 @@ pub fn planner_pane(
         root = root.child(chips);
     }
 
-    // ── "+ New task" — placeholder create under the current scope ────
-    // The original create form set `day` when scoped today/week (inbox and
-    // all created undated) and picked up the active project filter.
-    {
-        let mut create = serde_json::Map::new();
-        create.insert("op".into(), json!("plan_create"));
-        create.insert("title".into(), json!("New task"));
-        if matches!(scope, Scope::Today | Scope::Week) {
-            create.insert("day".into(), Value::String(today.clone()));
-        }
-        if let Some(p) = &project_filter {
-            create.insert("project".into(), json!(p));
-        }
-        let create_action = Value::Object(create);
-        let wid = wid.clone();
-        root = root.child(
-            div()
-                .text_sm()
-                .cursor_pointer()
-                .mx_1()
-                .px_2()
-                .py_1()
-                .bg(rgb(theme::hex(theme::monochrome::ELEVATED)))
-                .text_color(rgb(theme::hex(theme::text::FAINT)))
-                .hover(|el| {
-                    el.bg(rgb(theme::hex(theme::monochrome::RAISED)))
-                        .text_color(rgb(theme::hex(theme::text::DIM)))
-                })
-                .child("+ New task")
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _event, _window, cx| {
-                        this.widget_command(&wid, create_action.clone(), cx);
-                    }),
-                ),
-        );
-    }
+    // ── Create form — the original's add row (see planner_create_form) ──
+    root = root.child(planner_create_form(
+        draft,
+        editing,
+        &wid,
+        project_filter.is_none(),
+        cx,
+    ));
 
     if let Some(e) = &error {
         root = root.child(
@@ -755,6 +1109,7 @@ pub fn planner_pane(
             &today,
             &week_end,
             &wid,
+            editing,
             cx,
         ));
     }
