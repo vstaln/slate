@@ -305,7 +305,43 @@ fn journal_commit(
 
 /// Routes one request. `None` means no route matched — the caller answers 404,
 /// as the TypeScript does after falling through every branch.
+///
+/// Every mutation is attributed (`registerHttpAgent` on each POST/PATCH/DELETE
+/// in controlServer.ts) and every successful mutation answers in the
+/// `{ok, version, seq, data}` envelope `reply()` produces. Flat fields stay
+/// alongside `data` so `slate --json` callers keep reading what they read.
 pub fn route(request: &Request, deps: &mut RouteDeps<'_>) -> Option<Response> {
+    let method = request.method.as_str();
+    if method != "GET" && !request.segments().is_empty() {
+        if let Err(response) = register_http_agent(request) {
+            return Some(response);
+        }
+    }
+    let response = route_domains(request, deps)?;
+    Some(enveloped(method, response))
+}
+
+/// The `reply()` envelope for a flat mutation answer. Responses that already
+/// carry `ok` (the journal-backed ones) pass through untouched.
+fn enveloped(method: &str, response: Response) -> Response {
+    let Value::Object(flat) = &response.body else {
+        return response;
+    };
+    if method == "GET" || response.status >= 400 || flat.contains_key("ok") {
+        return response;
+    }
+    let mut body = Map::new();
+    body.insert("ok".into(), Value::Bool(true));
+    body.insert("version".into(), json!(0));
+    body.insert("seq".into(), json!(0));
+    body.insert("data".into(), response.body.clone());
+    for (key, value) in flat {
+        body.insert(key.clone(), value.clone());
+    }
+    Response::json(response.status, Value::Object(body))
+}
+
+fn route_domains(request: &Request, deps: &mut RouteDeps<'_>) -> Option<Response> {
     let segments = request.segments();
     let method = request.method.as_str();
     let head = segments.first().map(String::as_str);
@@ -822,13 +858,14 @@ fn orchestration_route(
                         // worker_done the CLI path does — a watcher polling mail
                         // must see either shape of completion.
                         let actor = request.agent_id.as_deref().unwrap_or("api");
+                        let to = request.text("to").unwrap_or("@coordinator");
                         let _ = deps.orchestration.send(
                             &dispatch.run_id,
                             "worker_done",
                             actor,
-                            "@coordinator",
-                            "",
-                            "",
+                            to,
+                            &format!("worker_done {}", task.id),
+                            &format!("dispatch {} settled as {outcome} via API", dispatch.id),
                             Some(&task.id),
                             Some(&dispatch.id),
                             None,
@@ -855,7 +892,9 @@ fn orchestration_route(
             )
         }
         ("POST", Some("dispatches"), Some(id), Some("account")) => {
-            let state = request.text("state").unwrap_or("released");
+            let Some(state) = request.text("state") else {
+                return Some(invalid("state is required"));
+            };
             Some(match store.set_dispatch_state(id, state) {
                 Ok(dispatch) => {
                     // `released && closeTerminal` also kills the worker's
@@ -891,7 +930,12 @@ fn orchestration_route(
                             }
                         }
                     }
-                    Response::accepted(200, dispatch.version, 0, dispatch_json(&dispatch))
+                    Response::accepted(
+                        200,
+                        dispatch.version,
+                        0,
+                        json!({ "id": dispatch.id, "state": dispatch.state }),
+                    )
                 }
                 Err(error) => Response::from_error(&error),
             })
@@ -1092,7 +1136,8 @@ fn orchestration_route(
             let messages = request.field("messages") == Some(&Value::Bool(true));
             let all = request.field("all") == Some(&Value::Bool(true));
             if !tasks && !messages && !all {
-                return Some(invalid("reset needs tasks, messages or all"));
+                // Nothing asked for, nothing wiped — the TypeScript answers ok.
+                return Some(Response::json(200, json!({ "ok": true })));
             }
             let mut doc = store.to_json();
             if let Some(doc) = doc.as_object_mut() {

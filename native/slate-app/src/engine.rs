@@ -50,7 +50,70 @@ const MAX_PENDING_EVENT_BYTES: usize = 8 * 1024 * 1024;
 /// handed over without waiting (see `enqueue_input`), so this is what keeps a
 /// shell that has stopped reading its input from growing the queue forever.
 const MAX_PENDING_INPUT_BYTES: usize = 1024 * 1024;
-const MAX_HTTP_BODY_BYTES: usize = 2 * 1024 * 1024;
+/// `readJson`'s cap in controlServer.ts — past it the request is a 413.
+const MAX_HTTP_BODY_BYTES: usize = 1024 * 1024;
+
+/// Transport rules applied to every request, before and after routing:
+/// preflights answer 204 ahead of the token check, every response carries
+/// `nosniff` and `no-store`, an unrouted method is a 404 (the TypeScript falls
+/// through to not-found, never 405), and every non-JSON rejection — axum's
+/// extractor errors, an oversized body — is re-shaped as `{error, code}`.
+async fn harden(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::http::{header, Method};
+    use axum::response::IntoResponse;
+
+    let preflight = request.method() == Method::OPTIONS;
+    let mut response = if preflight {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        next.run(request).await
+    };
+
+    let status = response.status();
+    let is_json = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("application/json"));
+    if !preflight && (status.is_client_error() || status.is_server_error()) && !is_json {
+        let (code, message, status) = match status {
+            StatusCode::METHOD_NOT_ALLOWED => ("not_found", "no such route".to_owned(), StatusCode::NOT_FOUND),
+            StatusCode::PAYLOAD_TOO_LARGE => (
+                "invalid",
+                format!("request body exceeds {} bytes", MAX_HTTP_BODY_BYTES),
+                status,
+            ),
+            _ => {
+                let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                    .await
+                    .unwrap_or_default();
+                let text = String::from_utf8_lossy(&bytes).trim().to_owned();
+                let message = if text.is_empty() {
+                    status.canonical_reason().unwrap_or("request failed").to_owned()
+                } else {
+                    text
+                };
+                ("invalid", message, status)
+            }
+        };
+        let body = serde_json::json!({ "error": message, "code": code });
+        response = (status, Json(body)).into_response();
+    }
+
+    let headers = response.headers_mut();
+    headers.insert(
+        axum::http::HeaderName::from_static("x-content-type-options"),
+        axum::http::HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response
+}
 const SUBMIT_GAP: Duration = Duration::from_millis(200);
 /// How long a single write into a PTY may stay in flight before the terminal
 /// is treated as no longer reading its input.
@@ -2033,6 +2096,9 @@ impl ControlServer {
                         // router deliberately does not see.
                         .fallback(handle_routed)
                         .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
+                        // Outermost, so it also sees the 413/415/405 answers
+                        // the layers and routing below produce.
+                        .layer(axum::middleware::from_fn(harden))
                         .with_state(state);
                     if let Err(error) = axum::serve(listener, app).await {
                         eprintln!("control server stopped: {error}");
@@ -2463,7 +2529,7 @@ async fn tell_worker(
     .map_err(bad_request)?;
     // `submit('terminal.write'|'terminal.attach', …)` — the audit entry the
     // TypeScript journaled for every tell.
-    let _ = commit_journal(
+    let journaled = commit_journal(
         agent.as_deref().unwrap_or("api"),
         if images.is_empty() {
             "terminal.write"
@@ -2487,7 +2553,35 @@ async fn tell_worker(
         response["images"] = serde_json::json!(images);
         response["mode"] = serde_json::json!("path");
     }
-    Ok(Json(response))
+    let (version, seq) = journal_position(&journaled);
+    Ok(Json(envelope(response, version, seq)))
+}
+
+/// `reply()`'s `{ok, version, seq, data}` around a flat answer. The flat fields
+/// stay at the top level beside `data`, so `slate --json` callers keep reading
+/// what they always read.
+fn envelope(flat: serde_json::Value, version: i64, seq: u64) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "ok": true,
+        "version": version,
+        "seq": seq,
+        "data": flat.clone(),
+    });
+    if let (Some(out), serde_json::Value::Object(fields)) = (body.as_object_mut(), flat) {
+        for (key, value) in fields {
+            out.insert(key, value);
+        }
+    }
+    body
+}
+
+/// The version and seq a journal append landed at — zero when the journal
+/// could not be written, which the caller already reports through the receipt.
+fn journal_position(entry: &Result<slate_app::journal::JournalEntry, String>) -> (i64, u64) {
+    entry
+        .as_ref()
+        .map(|entry| (entry.version.unwrap_or(0), entry.seq))
+        .unwrap_or((0, 0))
 }
 
 async fn write_terminal(
@@ -2496,7 +2590,7 @@ async fn write_terminal(
     uri: axum::http::Uri,
     Path(id): Path<String>,
     Json(request): Json<WriteRequest>,
-) -> Result<Json<WriteResponse>, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     authenticate(&headers, &state.token)?;
     let agent = agent_identity(&headers, &uri, request.agent_id.as_deref());
     check_rate_limit(&state, &headers, agent.as_deref())?;
@@ -2530,18 +2624,21 @@ async fn write_terminal(
     .map_err(bad_request)?;
     // `submit('terminal.write', …)` — the delivered write was journaled in
     // the TypeScript; the record is the audit trail, the PTY is the effect.
-    let _ = commit_journal(
+    let journaled = commit_journal(
         agent.as_deref().unwrap_or("api"),
         "terminal.write",
         &format!("terminal:{id}"),
         serde_json::json!({ "text": &text, "pressEnter": press_enter }),
     );
-    Ok(Json(WriteResponse {
+    let flat = serde_json::to_value(WriteResponse {
         ok: true,
         id,
         text,
         delivery: Some(receipt),
-    }))
+    })
+    .unwrap_or_default();
+    let (version, seq) = journal_position(&journaled);
+    Ok(Json(envelope(flat, version, seq)))
 }
 
 #[derive(Serialize)]
@@ -3327,7 +3424,8 @@ async fn handle_routed(
         query.insert(key.to_owned(), percent_decode_query(value));
     }
 
-    let parsed_body = if body.is_empty() {
+    // GET carries no body in the TypeScript — it is never read.
+    let parsed_body = if body.is_empty() || method == axum::http::Method::GET {
         serde_json::json!({})
     } else {
         match serde_json::from_slice::<serde_json::Value>(&body) {
