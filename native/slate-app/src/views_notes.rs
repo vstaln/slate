@@ -1,4 +1,4 @@
-//! Notes pane — the read half of the old Electron `NotesWidget`.
+//! Notes pane — the Rust port of the Electron notes widget.
 //!
 //! Data source: `workspace-notes.json` in the user data dir, the file the
 //! Electron `NotesStore` (src/main/notesStore.ts) debounce-persisted:
@@ -7,23 +7,26 @@
 //! order, createdAt, updatedAt, version}` and `color` is always resolved to
 //! `#rrggbb` (own color, else the category's, else the palette default).
 //!
-//! The native command plane has no `note.*` handlers yet, so the pane's
-//! add/delete affordances write `workspace-notes.json` directly — the same
-//! file the Electron `NotesStore` debounce-persisted. Notes written by the
-//! Electron build — or by anything else that speaks the file format — show
-//! up here on the next render, and vice versa.
+//! Every pane write goes through the same `note.*` journal ops the REST
+//! routes commit (`notes_route` in http.rs): `CanvasView::widget_command`
+//! posts to `/notes` over the control socket, so the journal entry and the
+//! file write happen in one place and the pane never touches the file.
 
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use serde_json::{json, Value};
 use slate_app::theme;
 
-/// The color a note with no category wears (`DEFAULT_NOTE_COLOR`,
-/// src/shared/noteColors.ts — first palette entry).
-const DEFAULT_COLOR: u32 = 0x7aa2f7;
+/// The category palette (`NOTE_CATEGORY_PALETTE`, src/shared/noteColors.ts).
+/// The first entry is `DEFAULT_NOTE_COLOR`, the color a note with no category
+/// and no color of its own wears.
+const PALETTE: [u32; 8] = [
+    0x7aa2f7, 0xe6c07b, 0x7fd99a, 0xc792ea, 0xf87171, 0x38bdf8, 0xf783ac, 0xffa94d,
+];
+const DEFAULT_COLOR: u32 = PALETTE[0];
 
-/// One display row. The store carries more (order, timestamps, version);
-/// the pane keeps the id so select/delete can address the note.
+/// One display row. The store carries more (timestamps, version); the pane
+/// keeps what it renders, edits, and sorts by (`order`).
 pub struct NoteRow {
     pub id: String,
     pub title: String,
@@ -32,92 +35,24 @@ pub struct NoteRow {
     pub color: u32,
     pub category: Option<String>,
     pub tags: Vec<String>,
+    pub order: f64,
 }
 
-/// Epoch milliseconds — `createdAt`/`updatedAt`/`id` parts in the store.
+/// Epoch milliseconds — the `id` part of a freshly created note.
 fn now_ms_f() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0.0, |elapsed| elapsed.as_millis() as f64)
 }
 
-fn notes_path() -> std::path::PathBuf {
-    slate_app::ipc::user_data_dir().join("workspace-notes.json")
-}
-
-/// The whole document, or the schema the store would have booted into.
-/// A corrupt file is quarantined and the `.bak` tried instead — falling
-/// back to defaults AND THEN SAVING would silently destroy the user's
-/// notes, which is exactly what the shell's readStoreJson was built
-/// against.
-fn read_document() -> Value {
-    let document = slate_app::ipc::read_store_recovered(&notes_path())
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
-    match document {
-        Some(document) if document.is_object() => document,
-        _ => json!({ "schemaVersion": 1, "items": [], "categoryColors": {} }),
-    }
-}
-
-/// `writeAtomic` — temp, fsync, .bak of the previous good copy, rename.
-fn write_document(document: &Value) -> Result<(), String> {
-    let path = notes_path();
-    let bytes = slate_app::jsjson::to_js_json_pretty(document, 2).into_bytes();
-    slate_app::ipc::write_file_atomic(&path, &bytes).map_err(|e| e.to_string())
-}
-
-/// Append a blank note (`revive()` in the Electron store required id +
-/// non-empty title) and return its generated id, or the failure text.
-fn add_note() -> Result<String, String> {
-    let mut document = read_document();
-    let now = now_ms_f();
-    let id = format!(
-        "note-{now}-{id}",
-        id = &uuid::Uuid::new_v4().simple().to_string()[..6]
-    );
-    let items = document
-        .get("items")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    // `NotesStore.nextOrder` — max+1 over surviving items, not `len`, which
-    // collides after a delete.
-    let order = items
-        .iter()
-        .filter_map(|item| item.get("order").and_then(Value::as_f64))
-        .fold(-1.0, f64::max)
-        + 1.0;
-    let mut items = items;
-    // `color` is always resolved in the store — no category here, so the
-    // palette default applies (DEFAULT_NOTE_COLOR).
-    items.push(json!({
-        "id": id,
-        "title": "New note",
-        "body": "",
-        "tags": [],
-        "color": format!("#{DEFAULT_COLOR:06x}"),
-        "createdBy": "slate",
-        "order": order,
-        "createdAt": now,
-        "updatedAt": now,
-        "version": 1,
-    }));
-    document["items"] = Value::Array(items);
-    write_document(&document)?;
-    Ok(id)
-}
-
-/// Remove one note by id; unknown ids are a no-op success.
-fn remove_note(id: &str) -> Result<(), String> {
-    let mut document = read_document();
-    let mut items = document
-        .get("items")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    items.retain(|entry| entry.get("id").and_then(Value::as_str) != Some(id));
-    document["items"] = Value::Array(items);
-    write_document(&document)
+/// A note id in the shape `POST /notes` mints when none is supplied. The pane
+/// mints it itself so it can expand the new card without a round-trip.
+pub fn new_note_id() -> String {
+    format!(
+        "note-{}-{}",
+        now_ms_f() as i64,
+        &uuid::Uuid::new_v4().simple().to_string()[..6]
+    )
 }
 
 fn note_color(value: Option<&serde_json::Value>) -> Option<u32> {
@@ -129,10 +64,10 @@ fn note_color(value: Option<&serde_json::Value>) -> Option<u32> {
     u32::from_str_radix(hex, 16).ok()
 }
 
-/// Notes as `(rows, error)` — items sorted by `updatedAt` descending, the
-/// order the Electron widget used once a category filter or none applied.
-/// A missing file is empty rather than an error; an unreadable or malformed
-/// one surfaces a one-line message the way the planner pane does.
+/// Notes sorted by `order` ascending — `NotesStore.list()`'s order, which the
+/// reorder controls rewrite. A missing file is empty rather than an error; an
+/// unreadable or malformed one surfaces a one-line message the way the planner
+/// pane does.
 pub fn note_rows() -> (Vec<NoteRow>, Option<String>) {
     let path = slate_app::ipc::user_data_dir().join("workspace-notes.json");
     let bytes = match std::fs::read(&path) {
@@ -157,7 +92,7 @@ pub fn note_rows() -> (Vec<NoteRow>, Option<String>) {
             .and_then(|value| note_color(Some(value)))
     };
 
-    let mut items: Vec<(f64, NoteRow)> = Vec::new();
+    let mut items: Vec<NoteRow> = Vec::new();
     for entry in document
         .get("items")
         .and_then(serde_json::Value::as_array)
@@ -201,35 +136,72 @@ pub fn note_rows() -> (Vec<NoteRow>, Option<String>) {
             .filter_map(serde_json::Value::as_str)
             .map(str::to_owned)
             .collect();
-        let updated_at = entry
-            .get("updatedAt")
-            .and_then(serde_json::Value::as_f64)
-            .unwrap_or(0.0);
-        items.push((
-            updated_at,
-            NoteRow {
-                id: id.to_owned(),
-                title: title.to_owned(),
-                preview,
-                body,
-                color,
-                category,
-                tags,
-            },
-        ));
+        items.push(NoteRow {
+            id: id.to_owned(),
+            title: title.to_owned(),
+            preview,
+            body,
+            color,
+            category,
+            tags,
+            order: entry
+                .get("order")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(0.0),
+        });
     }
-    items.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    (items.into_iter().map(|(_, row)| row).collect(), None)
+    items.sort_by(|a, b| a.order.partial_cmp(&b.order).unwrap_or(std::cmp::Ordering::Equal));
+    (items, None)
+}
+
+/// A clickable field in an expanded card. The `on_mouse_down` stops the bubble
+/// so the card's own select-toggle doesn't also fire.
+fn field_chip(
+    label: impl IntoElement,
+    widget_id: &str,
+    note_id: &str,
+    field: &str,
+    value: String,
+    cx: &mut Context<crate::canvas_view::CanvasView>,
+) -> Div {
+    let action = json!({
+        "op": "note_edit",
+        "id": note_id,
+        "field": field,
+        "value": value,
+    });
+    let wid = widget_id.to_owned();
+    div()
+        .px_1()
+        .cursor_pointer()
+        .text_xs()
+        .text_color(rgb(theme::hex(theme::text::DIM)))
+        .hover(|el| el.bg(rgb(theme::hex(theme::monochrome::RAISED))))
+        .child(label)
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _event, _window, cx| {
+                cx.stop_propagation();
+                this.widget_command(&wid, action.clone(), cx);
+            }),
+        )
 }
 
 /// A note card: 3px color rail on the left (the original's
 /// `borderLeft: 3px solid <color>`), title, squashed body preview — or the
 /// full body when `expanded` — then a category chip and `#tag` chips when
-/// the note has any. Clicking toggles the card into `widget.state.expanded`;
-/// an expanded card also shows a × that drops the note from the store file.
+/// the note has any. Clicking toggles the card into `widget.state.expanded`.
+///
+/// An expanded card is the editor: each field is click-to-edit (the buffer
+/// lives on `CanvasView::notes_editing`), ▲/▼ swap `order` with the neighbour,
+/// the swatch row recolors the note's category (or the note alone when it has
+/// none), and × drops the note through `note_delete`.
 fn note_card<'a>(
     row: &'a NoteRow,
     expanded: bool,
+    editing: Option<(&str, &str)>,
+    buffer: &str,
+    neighbours: (Option<(String, f64)>, Option<(String, f64)>),
     widget_id: &str,
     cx: &mut Context<crate::canvas_view::CanvasView>,
 ) -> impl IntoElement + 'a {
@@ -244,22 +216,28 @@ fn note_card<'a>(
             el.bg(rgb(theme::hex(theme::monochrome::RAISED))).px_1()
         });
     // The color rail: a fixed-width strip, rounded on both ends.
-    card = card.child(
-        div()
-            .w(px(3.0))
-            .flex_none()
-            .bg(rgb(row.color)),
-    );
+    card = card.child(div().w(px(3.0)).flex_none().bg(rgb(row.color)));
 
     // Click selects/deselects the note into the widget's journaled state.
     let expanded_value = if expanded { Value::Null } else { json!(row.id) };
     let toggle = json!({ "op": "set", "state": { "expanded": expanded_value } });
     let wid_toggle = widget_id.to_owned();
-    let wid_delete = widget_id.to_owned();
     let toggle_handler = cx.listener(move |this, _event, _window, cx| {
         this.widget_command(&wid_toggle, toggle.clone(), cx);
     });
+    let editing_here = |field: &str| editing == Some((row.id.as_str(), field));
 
+    // Title: the editor's buffer when this field is open, else the title.
+    let title_text: AnyElement = if editing_here("title") {
+        field_buffer(buffer).into_any_element()
+    } else if expanded {
+        field_chip(row.title.clone(), widget_id, &row.id, "title", row.title.clone(), cx)
+            .text_sm()
+            .text_color(rgb(theme::hex(theme::text::NORMAL)))
+            .into_any_element()
+    } else {
+        row.title.clone().into_any_element()
+    };
     let mut title_row = div().flex().flex_row().items_center().gap_1().child(
         div()
             .flex_1()
@@ -268,10 +246,49 @@ fn note_card<'a>(
             .font_weight(FontWeight::MEDIUM)
             .text_color(rgb(theme::hex(theme::text::NORMAL)))
             .truncate()
-            .child(row.title.clone()),
+            .child(title_text),
     );
     if expanded {
+        let (prev, next) = neighbours;
+        let swap = |other: Option<(String, f64)>, glyph: &'static str, cx: &mut Context<crate::canvas_view::CanvasView>| {
+            let wid = widget_id.to_owned();
+            let note_id = row.id.clone();
+            let order = row.order;
+            let mut chip = div()
+                .flex_none()
+                .px_1()
+                .text_xs()
+                .text_color(rgb(theme::hex(theme::text::FAINT)))
+                .child(glyph);
+            if let Some((other_id, other_order)) = other {
+                chip = chip
+                    .cursor_pointer()
+                    .hover(|el| el.bg(rgb(theme::hex(theme::monochrome::ELEVATED))))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _event, _window, cx| {
+                            cx.stop_propagation();
+                            this.widget_command(
+                                &wid,
+                                json!({
+                                    "op": "note_move",
+                                    "id": note_id,
+                                    "order": other_order,
+                                    "otherId": other_id,
+                                    "otherOrder": order,
+                                }),
+                                cx,
+                            );
+                        }),
+                    );
+            }
+            chip
+        };
+        title_row = title_row
+            .child(swap(prev, "▲", cx))
+            .child(swap(next, "▼", cx));
         let note_id = row.id.clone();
+        let wid_delete = widget_id.to_owned();
         title_row = title_row.child(
             div()
                 .flex_none()
@@ -289,25 +306,41 @@ fn note_card<'a>(
                         // The card below is clickable too — stop the bubble
                         // so delete doesn't also re-select the dead note.
                         cx.stop_propagation();
-                        if remove_note(&note_id).is_ok() {
-                            this.widget_command(
-                                &wid_delete,
-                                json!({ "op": "set", "state": { "expanded": Value::Null } }),
-                                cx,
-                            );
-                        }
-                        cx.notify();
+                        this.widget_command(
+                            &wid_delete,
+                            json!({ "op": "note_delete", "id": note_id }),
+                            cx,
+                        );
                     }),
                 ),
         );
     }
     let mut body = div().flex().flex_col().min_w_0().flex_1().child(title_row);
-    if expanded && !row.body.trim().is_empty() {
+    if editing_here("body") {
         body = body.child(
             div()
                 .text_xs()
                 .text_color(rgb(theme::hex(theme::text::DIM)))
-                .child(row.body.clone()),
+                .child(field_buffer(buffer)),
+        );
+    } else if expanded {
+        // Expanded: the whole body is the click target; empty bodies still
+        // offer a place to type.
+        let shown = if row.body.trim().is_empty() {
+            "add body…".to_owned()
+        } else {
+            row.body.clone()
+        };
+        let colour = if row.body.trim().is_empty() {
+            theme::hex(theme::text::FAINT)
+        } else {
+            theme::hex(theme::text::DIM)
+        };
+        body = body.child(
+            div()
+                .text_xs()
+                .text_color(rgb(colour))
+                .child(field_chip(shown, widget_id, &row.id, "body", row.body.clone(), cx)),
         );
     } else if !row.preview.is_empty() {
         body = body.child(
@@ -318,42 +351,125 @@ fn note_card<'a>(
                 .child(row.preview.clone()),
         );
     }
-    if row.category.is_some() || !row.tags.is_empty() {
-        let mut meta = div().flex().flex_row().flex_wrap().gap_1().pt(px(2.0));
-        if let Some(category) = &row.category {
-            meta = meta.child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_1()
-                    .bg(rgb(theme::hex(theme::monochrome::RAISED)))
-                    .px_2()
-                    .child(div().size(px(5.0)).rounded_full().bg(rgb(row.color)))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(theme::hex(theme::text::DIM)))
-                            .child(category.clone()),
-                    ),
-            );
+
+    let mut meta = div().flex().flex_row().flex_wrap().gap_1().pt(px(2.0));
+    let show_meta = expanded || row.category.is_some() || !row.tags.is_empty();
+    if show_meta {
+        if editing_here("category") {
+            meta = meta.child(field_buffer(buffer));
+        } else if let Some(category) = &row.category {
+            let chip = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .bg(rgb(theme::hex(theme::monochrome::RAISED)))
+                .px_2()
+                .child(div().size(px(5.0)).rounded_full().bg(rgb(row.color)))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(theme::hex(theme::text::DIM)))
+                        .child(category.clone()),
+                );
+            meta = meta.child(if expanded {
+                field_chip(chip, widget_id, &row.id, "category", category.clone(), cx)
+                    .into_any_element()
+            } else {
+                chip.into_any_element()
+            });
+        } else if expanded {
+            meta = meta.child(field_chip(
+                "+ category",
+                widget_id,
+                &row.id,
+                "category",
+                String::new(),
+                cx,
+            ));
         }
-        for tag in &row.tags {
-            meta = meta.child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(theme::hex(theme::text::FAINT)))
-                    .child(format!("#{tag}")),
-            );
+        if editing_here("tags") {
+            meta = meta.child(field_buffer(buffer));
+        } else {
+            for tag in &row.tags {
+                meta = meta.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(theme::hex(theme::text::FAINT)))
+                        .child(format!("#{tag}")),
+                );
+            }
+            if expanded {
+                meta = meta.child(field_chip(
+                    "+ tags",
+                    widget_id,
+                    &row.id,
+                    "tags",
+                    row.tags.join(", "),
+                    cx,
+                ));
+            }
         }
         body = body.child(meta);
     }
-    card.child(body)
-        .on_mouse_down(MouseButton::Left, toggle_handler)
+
+    // Swatches: the category's palette entry when the note has one, the
+    // note's own color otherwise. Clicking one journals the recolor.
+    if expanded {
+        let mut swatches = div().flex().flex_row().gap_1().pt(px(2.0));
+        for color in PALETTE {
+            let wid = widget_id.to_owned();
+            let note_id = row.id.clone();
+            let category = row.category.clone();
+            let swatch = div()
+                .size(px(10.0))
+                .rounded_full()
+                .bg(rgb(color))
+                .cursor_pointer()
+                .when(color == row.color, |el| {
+                    el.border_1().border_color(rgb(theme::hex(theme::text::NORMAL)))
+                })
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _event, _window, cx| {
+                        cx.stop_propagation();
+                        let action = match &category {
+                            Some(name) => json!({
+                                "op": "note_recolor",
+                                "category": name,
+                                "color": format!("#{color:06x}"),
+                            }),
+                            None => json!({
+                                "op": "note_update",
+                                "id": note_id,
+                                "patch": { "color": format!("#{color:06x}") },
+                            }),
+                        };
+                        this.widget_command(&wid, action, cx);
+                    }),
+                );
+            swatches = swatches.child(swatch);
+        }
+        body = body.child(swatches);
+    }
+
+    card.child(body).on_mouse_down(MouseButton::Left, toggle_handler)
+}
+
+/// The open editor's text with a caret — the DOM input stand-in.
+fn field_buffer(buffer: &str) -> impl IntoElement {
+    div()
+        .px_1()
+        .text_xs()
+        .bg(rgb(theme::hex(theme::monochrome::ELEVATED)))
+        .text_color(rgb(theme::hex(theme::text::NORMAL)))
+        .child(format!("{buffer}▏"))
 }
 
 pub fn notes_pane(
     widget: &slate_app::projection::Widget,
+    editing: Option<(&str, &str)>,
+    buffer: &str,
     cx: &mut Context<crate::canvas_view::CanvasView>,
 ) -> impl IntoElement {
     let (rows, error) = note_rows();
@@ -370,8 +486,8 @@ pub fn notes_pane(
         .gap_1()
         .size_full()
         .overflow_hidden();
-    // Header row: count on the left, + adds a blank note (writing the store
-    // file directly) and expands it for the follow-up edit.
+    // Header row: count on the left, + journals a blank note (`note_create`,
+    // i.e. POST /notes) and expands it for the follow-up edit.
     col = col.child(
         div()
             .flex()
@@ -397,15 +513,12 @@ pub fn notes_pane(
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _event, _window, cx| {
-                            if let Ok(id) = add_note() {
-                                this.widget_command(
-                                    &wid,
-                                    json!({ "op": "set", "state": { "expanded": id } }),
-                                    cx,
-                                );
-                            } else {
-                                cx.notify();
-                            }
+                            let id = new_note_id();
+                            this.widget_command(
+                                &wid,
+                                json!({ "op": "note_create", "id": id }),
+                                cx,
+                            );
                         }),
                     )
             }),
@@ -436,8 +549,20 @@ pub fn notes_pane(
                 .child("No notes yet — + creates one"),
         );
     }
-    for row in &rows {
-        list = list.child(note_card(row, expanded == Some(row.id.as_str()), &wid, cx));
+    for (index, row) in rows.iter().enumerate() {
+        let prev = index
+            .checked_sub(1)
+            .map(|i| (rows[i].id.clone(), rows[i].order));
+        let next = rows.get(index + 1).map(|n| (n.id.clone(), n.order));
+        list = list.child(note_card(
+            row,
+            expanded == Some(row.id.as_str()),
+            editing,
+            buffer,
+            (prev, next),
+            &wid,
+            cx,
+        ));
     }
     col.child(list)
 }
