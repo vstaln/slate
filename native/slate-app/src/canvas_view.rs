@@ -500,6 +500,15 @@ pub struct CanvasView {
     /// `layoutMode` — `code_layout::arrange`'s mode for the card grid.
     code_layout: slate_app::code_layout::CodeLayout,
     counter: u64,
+    // fix-files: the files pane's keyboard owner — its `Search files…`
+    // field or an in-row rename, keyed by widget id exactly like
+    // `browser_editing`/`browser_address`. Set from the pane's own clicks;
+    // `on_key` routes keystrokes while it is `Some`.
+    pub(crate) files_editing: Option<crate::views_files::FilesEditing>,
+    // fix-files: the files pane's `previewFile` — the loaded preview
+    // overlay. Lives here rather than in `widget.state` so file bytes
+    // never enter the journal.
+    pub(crate) files_preview: Option<crate::views_files::FilesPreview>,
 }
 
 /// A `/term <command>` line waiting to be typed into a fresh PTY.
@@ -1004,6 +1013,9 @@ impl CanvasView {
             code_launcher_open: false,
             code_layout,
             counter: 0,
+            // fix-files:
+            files_editing: None,
+            files_preview: None,
         };
         view.snapshots = view.manager.snapshots();
         for pending in relaunch {
@@ -3524,8 +3536,114 @@ impl CanvasView {
                                     .open(&candidate)
                                     .map(|_| ())
                             };
-                            if let Err(error) = result {
-                                self.notice(format!("create {}: {error}", candidate.display()));
+                            match result {
+                                Err(error) => {
+                                    self.notice(format!("create {}: {error}", candidate.display()))
+                                }
+                                Ok(()) => {
+                                    // fix-files: the create → rename flow —
+                                    // the fresh `untitled` row opens its
+                                    // inline rename immediately, seeded
+                                    // with the placeholder name.
+                                    self.files_editing =
+                                        Some(crate::views_files::FilesEditing::Rename {
+                                            id: id.to_owned(),
+                                            path: candidate.to_string_lossy().into_owned(),
+                                            buffer: candidate
+                                                .file_name()
+                                                .map(|n| n.to_string_lossy().into_owned())
+                                                .unwrap_or_default(),
+                                        });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // fix-files: `fs:rename` — the ✎ Save / Enter path. `name`
+            // follows the original's `joinChildPath` rules (a single
+            // component: no separators, never an embedded `..`), and the
+            // destination stays in the renamed entry's own directory —
+            // the shell joined it to `currentPath`, which is the same
+            // parent a listing row lives in.
+            Some("file_rename") => {
+                if let (Some(raw), Some(name)) = (
+                    action.get("path").and_then(Value::as_str),
+                    action.get("name").and_then(Value::as_str),
+                ) {
+                    let name = name.trim();
+                    if name.is_empty()
+                        || name == "."
+                        || name == ".."
+                        || name.contains(['/', '\\'])
+                        || name.contains("..")
+                    {
+                        self.notice("Name cannot contain path separators or \"..\"");
+                    } else {
+                        match self.file_jail(raw) {
+                            None => self.notice("rename refused — path escapes workspace"),
+                            Some(src) => {
+                                let target = src
+                                    .parent()
+                                    .map(|parent| parent.join(name))
+                                    .and_then(|t| self.file_jail(&t.to_string_lossy()));
+                                match target {
+                                    None => self
+                                        .notice("rename refused — path escapes workspace"),
+                                    Some(target) => match std::fs::rename(&src, &target) {
+                                        Err(error) => {
+                                            self.notice(format!("Failed to rename: {error}"))
+                                        }
+                                        Ok(()) => {
+                                            self.notice(format!("Renamed to \"{name}\""));
+                                            // The original re-viewed an
+                                            // open preview at the new
+                                            // path.
+                                            let previewed = matches!(
+                                                &self.files_preview,
+                                                Some(p) if p.id == id
+                                                    && p.path == src.to_string_lossy()
+                                            );
+                                            if previewed {
+                                                match crate::views_files::preview_load(&target)
+                                                {
+                                                    Ok((body, size)) => {
+                                                        self.files_preview = Some(
+                                                            crate::views_files::FilesPreview {
+                                                                id: id.to_owned(),
+                                                                path: target
+                                                                    .to_string_lossy()
+                                                                    .into_owned(),
+                                                                name: name.to_owned(),
+                                                                size,
+                                                                body,
+                                                            },
+                                                        );
+                                                    }
+                                                    Err(error) => {
+                                                        self.files_preview = None;
+                                                        self.notice(format!(
+                                                            "Cannot preview: {error}"
+                                                        ));
+                                                    }
+                                                }
+                                            }
+                                            // A commit lands here from
+                                            // the Save button too —
+                                            // release the field either
+                                            // way.
+                                            if matches!(
+                                                &self.files_editing,
+                                                Some(crate::views_files::FilesEditing::Rename {
+                                                    id: editing,
+                                                    ..
+                                                }) if editing == id
+                                            ) {
+                                                self.files_editing = None;
+                                            }
+                                        }
+                                    },
+                                }
                             }
                         }
                     }
@@ -3609,6 +3727,61 @@ impl CanvasView {
             Some("file_copy_path") => {
                 if let Some(path) = action.get("path").and_then(Value::as_str) {
                     cx.write_to_clipboard(gpui::ClipboardItem::new_string(path.to_owned()));
+                }
+            }
+            // fix-files: `viewFile` — the bounded `fs:read-file` behind the
+            // preview overlay. Errors surface as the pane's `actionNotice`
+            // ("Cannot preview: …"), a success replaces `files_preview` and
+            // takes the keyboard like the original's modal.
+            Some("file_preview") => {
+                if let Some(raw) = action.get("path").and_then(Value::as_str) {
+                    match self.file_jail(raw) {
+                        None => self.notice("preview refused — path escapes workspace"),
+                        Some(path) => match crate::views_files::preview_load(&path) {
+                            Err(error) => {
+                                self.notice(format!("Cannot preview: {error}"));
+                            }
+                            Ok((body, size)) => {
+                                // The dialog traps focus — an open field
+                                // edit releases first.
+                                self.files_editing = None;
+                                self.files_preview =
+                                    Some(crate::views_files::FilesPreview {
+                                        id: id.to_owned(),
+                                        name: path
+                                            .file_name()
+                                            .map(|n| n.to_string_lossy().into_owned())
+                                            .unwrap_or_default(),
+                                        path: path.to_string_lossy().into_owned(),
+                                        size,
+                                        body,
+                                    });
+                            }
+                        },
+                    }
+                }
+            }
+            // fix-files: `closePreview` — the overlay's ✕; Escape routes
+            // through `on_key` instead.
+            Some("file_preview_close") => {
+                if matches!(&self.files_preview, Some(p) if p.id == id) {
+                    self.files_preview = None;
+                }
+            }
+            // fix-files: the dialog's "Copy Text" — clipboard straight
+            // from the loaded preview, so megabytes never round-trip
+            // through the action JSON.
+            Some("file_copy_content") => {
+                if let Some(preview) = &self.files_preview {
+                    if preview.id == id {
+                        if let crate::views_files::FilesPreviewBody::Text(text) =
+                            &preview.body
+                        {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                text.clone(),
+                            ));
+                        }
+                    }
                 }
             }
             // Browser pane ops — the omnibox submit and the chrome buttons.
@@ -4536,6 +4709,10 @@ fn widget_body(
     // The files pane's jail root — `CanvasView::files_root`, resolved by the
     // caller since this function can't borrow the view.
     files_root: &std::path::Path,
+    // fix-files: the pane's keyboard/preview slice of CanvasView — carried
+    // in for the same no-read-mid-render reason as the browser fields.
+    files_editing: Option<&crate::views_files::FilesEditing>,
+    files_preview: Option<&crate::views_files::FilesPreview>,
     cx: &mut Context<CanvasView>,
 ) -> AnyElement {
     let font = px(12.0 * zoom);
@@ -4679,7 +4856,13 @@ fn widget_body(
         Some("files") => div()
             .size_full()
             .text_size(font)
-            .child(crate::views_files::files_pane(files_root, widget, cx))
+            .child(crate::views_files::files_pane(
+                files_root,
+                widget,
+                files_editing,
+                files_preview,
+                cx,
+            ))
             .into_any_element(),
         Some("orchestration") => div()
             .size_full()
@@ -6137,6 +6320,9 @@ impl Render for CanvasView {
                         &self.browser_address,
                         clip,
                         &self.files_root(),
+                        // fix-files:
+                        self.files_editing.as_ref(),
+                        self.files_preview.as_ref(),
                         cx,
                     );
                     // Non-terminal panes scroll their content natively —
@@ -7670,6 +7856,29 @@ impl CanvasView {
             return;
         }
 
+        // fix-files: the files pane's preview overlay is modal while it is
+        // up — the shell's portal dialog ran a window-capture keydown plus
+        // a focus trap, so Escape closes it and every other key is
+        // swallowed before the command bar or a field ever sees it.
+        if self.files_preview.is_some() {
+            // Self-heal: a preview whose widget is gone drops on the next
+            // keypress instead of holding the keyboard forever.
+            let alive = self
+                .files_preview
+                .as_ref()
+                .map(|p| self.canvas.widgets.contains_key(&p.id))
+                .unwrap_or(false);
+            if alive {
+                if keystroke.key.as_str() == "escape" {
+                    self.files_preview = None;
+                }
+                cx.notify();
+                cx.stop_propagation();
+                return;
+            }
+            self.files_preview = None;
+        }
+
         // The command bar owns the keyboard while it is open: Escape closes,
         // Enter runs, Backspace edits, and anything printable appends. This
         // sits before the terminal branch on purpose — a bar that is open
@@ -7828,6 +8037,125 @@ impl CanvasView {
                                 });
                         if let Some(text) = text {
                             self.browser_address.push_str(&text);
+                        }
+                    }
+                }
+            }
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
+
+        // fix-files: the files pane's fields own the keyboard with the same
+        // shape as the omnibox. `Search` commits each keystroke to
+        // `state.search` — the original's `setSearch` filtered live and
+        // reset `visibleCount` — so its Enter/Escape only release; `Rename`
+        // is the `renamingName` buffer: Enter dispatches `file_rename`,
+        // Escape is `renameCancelled`. An edit whose widget vanished drops
+        // itself rather than holding the keys forever.
+        if let Some(edit) = self.files_editing.take() {
+            if !self.canvas.widgets.contains_key(edit.widget_id()) {
+                cx.notify();
+                cx.stop_propagation();
+                return;
+            }
+            match edit {
+                crate::views_files::FilesEditing::Search { id } => {
+                    let keep = match keystroke.key.as_str() {
+                        "enter" | "escape" => false,
+                        _ => {
+                            let mut query = self
+                                .canvas
+                                .widgets
+                                .get(&id)
+                                .and_then(|w| w.state.as_ref())
+                                .and_then(|s| s.get("search"))
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_owned();
+                            let edited = if keystroke.key.as_str() == "backspace" {
+                                query.pop().is_some()
+                            } else if !mods.control && !mods.alt && !mods.platform {
+                                let text = keystroke.key_char.clone().or_else(|| {
+                                    match keystroke.key.as_str() {
+                                        "space" => Some(" ".to_owned()),
+                                        k if k.chars().count() == 1 => Some(k.to_owned()),
+                                        _ => None,
+                                    }
+                                });
+                                if let Some(text) = text {
+                                    query.push_str(&text);
+                                    // The shell's saved-search cap.
+                                    query = query.chars().take(500).collect();
+                                    true
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            };
+                            // `setSearch` — the live filter plus the
+                            // 200-row window reset; untouched keys
+                            // (arrows, Tab) journal nothing.
+                            if edited {
+                                self.widget_command(
+                                    &id,
+                                    json!({ "op": "set", "state": {
+                                        "search": query,
+                                        "limit": 200,
+                                    } }),
+                                    cx,
+                                );
+                            }
+                            true
+                        }
+                    };
+                    if keep {
+                        self.files_editing =
+                            Some(crate::views_files::FilesEditing::Search { id });
+                    }
+                }
+                crate::views_files::FilesEditing::Rename { id, path, mut buffer } => {
+                    match keystroke.key.as_str() {
+                        "escape" => {
+                            // `renameCancelled` — the edit drops with no
+                            // dispatch.
+                        }
+                        "enter" => {
+                            self.widget_command(
+                                &id,
+                                json!({ "op": "file_rename", "path": path, "name": buffer }),
+                                cx,
+                            );
+                        }
+                        "backspace" => {
+                            buffer.pop();
+                            self.files_editing =
+                                Some(crate::views_files::FilesEditing::Rename {
+                                    id,
+                                    path,
+                                    buffer,
+                                });
+                        }
+                        _ => {
+                            if !mods.control && !mods.alt && !mods.platform {
+                                let text = keystroke.key_char.clone().or_else(|| {
+                                    match keystroke.key.as_str() {
+                                        "space" => Some(" ".to_owned()),
+                                        k if k.chars().count() == 1 => Some(k.to_owned()),
+                                        _ => None,
+                                    }
+                                });
+                                if let Some(text) = text {
+                                    buffer.push_str(&text);
+                                }
+                            }
+                            self.files_editing =
+                                Some(crate::views_files::FilesEditing::Rename {
+                                    id,
+                                    path,
+                                    buffer,
+                                });
                         }
                     }
                 }
@@ -8272,5 +8600,15 @@ impl CanvasView {
             _ => return,
         }
         cx.notify();
+    }
+
+    // fix-files: release the files pane's keyboard owner — the original's
+    // real inputs unmounted on navigation (an armed rename's row scrolls
+    // away with the folder); our buffer has to be told, or an invisible
+    // field keeps capturing keys.
+    pub(crate) fn files_edit_release(&mut self, id: &str) {
+        if self.files_editing.as_ref().map(|e| e.widget_id()) == Some(id) {
+            self.files_editing = None;
+        }
     }
 }

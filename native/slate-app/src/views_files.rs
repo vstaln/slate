@@ -2,26 +2,47 @@
 //! rooted at the path the caller passes (the app cwd today). Navigation is
 //! per-widget and journaled: `widget.state.cwd` holds the path relative to
 //! the root, so a widget that drilled into `src/` reopens there. `..` climbs
-//! one level but never past the root; file rows open through `xdg-open`.
+//! one level but never past the root; file rows open the preview overlay —
+//! the original's `openItem` → `viewFile` — not `xdg-open`.
 //!
 //! The original's row actions are ported too, kept pure like every other
 //! pane — clicks emit `{"op": …}` actions on `CanvasView::widget_command`
 //! and the dispatcher does the filesystem work:
-//!   * `file_open`      — `xdg-open <path>` (left-click on a file row)
-//!   * `file_reveal`    — file manager at `path` (dirs open themselves,
+//!   * `file_preview`        — bounded `fs:read-file` port → the preview
+//!     overlay (left-click on a file row, or the row's eye button)
+//!   * `file_preview_close`  — the overlay's ✕ (its Escape lives in
+//!     `CanvasView::on_key`, which owns the modal's keys)
+//!   * `file_copy_content`   — the overlay's "Copy Text"
+//!   * `file_open`           — `xdg-open <path>` (the row's ↗ and the
+//!     overlay's "Open with OS App")
+//!   * `file_reveal`         — file manager at `path` (dirs open themselves,
 //!     files open their parent directory)
-//!   * `file_copy_path` — absolute path onto the clipboard
-//!   * `file_new`       — create `untitled`/`untitled-N` of `kind` in `dir`
-//!   * `file_delete`    — remove the file / dir tree at `path`; only sent
-//!     for the path `state.confirmDelete` already armed
-//!   * `refresh`        — unknown-op no-op; `widget_command` still notifies,
-//!     so it re-reads the directory for free
+//!   * `file_copy_path`      — absolute path onto the clipboard
+//!   * `file_new`            — create `untitled`/`untitled-N` of `kind` in
+//!     `dir`, then arm the inline rename like the original's create flow
+//!   * `file_rename`         — `fs.rename` inside the jail; the row's ✎
+//!     Save button and the rename field's Enter
+//!   * `file_delete`         — remove the file / dir tree at `path`; only
+//!     sent for the path `state.confirmDelete` already armed
+//!   * `refresh`             — unknown-op no-op; `widget_command` still
+//!     notifies, so it re-reads the directory for free
 //!
-//! Pane-local keys journaled on `widget.state`: `cwd`, `showHidden`,
-//! `sort` (`name`/`mtime`/`size`), `confirmDelete` (abs path armed for a
-//! second click — the port of the original's danger confirm dialog), and
-//! `limit` (visible rows — the original's 200-row "Show more" pagination).
+//! Pane-local keys journaled on `widget.state`: `cwd`, `search` (the
+//! original's `search` state — localStorage there, journaled here — the
+//! listing filters on it live), `showHidden`, `sort`
+//! (`name`/`mtime`/`size`), `confirmDelete` (abs path armed for a second
+//! click — the port of the original's danger confirm dialog), and `limit`
+//! (visible rows — the original's 200-row "Show more" pagination).
+//!
+//! Keyboard-owning UI — the search field, the row rename input, and the
+//! preview overlay — is CanvasView state (`files_editing`/`files_preview`),
+//! keyed by widget id like `browser_editing`/`browser_address`: the pane
+//! sets it from its own clicks, `CanvasView::on_key` routes keystrokes,
+//! and Enter/Escape/Save/Cancel settle it. Preview content deliberately
+//! lives there too and not in `widget.state` — file bytes never enter the
+//! journal.
 
+use gpui::prelude::FluentBuilder;
 use gpui::*;
 use serde_json::{json, Value};
 use slate_app::theme;
@@ -39,10 +60,16 @@ pub struct FileEntry {
     pub mtime: Option<u64>,
 }
 
-pub fn list_entries(path: &std::path::Path) -> Result<Vec<FileEntry>, String> {
+/// The listing plus the original's `FsListResult.truncated`: the backend
+/// capped one folder read at 2,000 entries and set the flag when more
+/// existed, and `FilesWidget` showed a "Showing the first 2,000 items"
+/// note — a folder that looked shorter than it is was the bug it fixed.
+pub fn list_entries(path: &std::path::Path) -> Result<(Vec<FileEntry>, bool), String> {
     let mut entries: Vec<FileEntry> = Vec::new();
+    let mut truncated = false;
     for entry in std::fs::read_dir(path).map_err(|e| e.to_string())? {
         if entries.len() >= 2000 {
+            truncated = true;
             break;
         }
         let entry = entry.map_err(|e| e.to_string())?;
@@ -73,7 +100,114 @@ pub fn list_entries(path: &std::path::Path) -> Result<Vec<FileEntry>, String> {
             .cmp(&a.is_dir)
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
-    Ok(entries)
+    Ok((entries, truncated))
+}
+
+/// Which files-pane field owns the keyboard — `CanvasView::files_editing`.
+/// The original kept these as component state (`search` lived in
+/// `widget.state` here since it also persisted); the port keys them by
+/// widget id like `browser_editing`/`browser_address` so several panes
+/// can't fight over the keys.
+pub enum FilesEditing {
+    /// The `Search files…` input. The query itself rides
+    /// `widget.state.search` so the listing filters live; the enum only
+    /// marks that this pane's field holds the keyboard.
+    Search { id: String },
+    /// `renamingPath` + `renamingName` — the row's absolute path and the
+    /// edit buffer. Armed by the row's ✎ or by `file_new` (the original's
+    /// create → rename flow); Enter/Save dispatch `file_rename`.
+    Rename {
+        id: String,
+        path: String,
+        buffer: String,
+    },
+}
+
+impl FilesEditing {
+    pub fn widget_id(&self) -> &str {
+        match self {
+            FilesEditing::Search { id } => id,
+            FilesEditing::Rename { id, .. } => id,
+        }
+    }
+}
+
+/// What the preview overlay draws — the `FileReadResult` cases:
+/// image (`isImage`/`dataUrl`), plain text (`content`), or the
+/// binary-file notice (`isBinary`).
+pub enum FilesPreviewBody {
+    /// Rendered straight from `preview.path` with `img()` — the native
+    /// port doesn't need the original's base64 `dataUrl` hop.
+    Image,
+    /// UTF-8 text (lossy like the shell's `buffer.toString('utf8')`).
+    Text(String),
+    /// A NUL byte in the read window — the original's `buffer.includes(0)`.
+    Binary,
+}
+
+/// `previewFile` — the loaded preview for one files pane. Kept on
+/// `CanvasView` (never journaled): up to 5 MB of file text has no business
+/// in `widget.state`.
+pub struct FilesPreview {
+    pub id: String,
+    pub path: String,
+    pub name: String,
+    pub size: u64,
+    pub body: FilesPreviewBody,
+}
+
+/// `media.hasImageExtension` — the `MIME_BY_EXT` keys the shell's
+/// `fs:read-file` routed to the image branch.
+fn has_image_extension(path: &Path) -> bool {
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    matches!(
+        ext.as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "avif" | "bmp" | "svg" | "ico" | "tif" | "tiff"
+            | "heic"
+    )
+}
+
+/// `fs:read-file`, minus the IPC: images get the shell's
+/// `MAX_DATA_URL_BYTES` ceiling (8 MB — though the native port renders the
+/// path rather than a data URL, the cap still gates the preview), every
+/// other file the `MAX_FS_READ_BYTES` one (5 MB). A NUL byte marks the
+/// file binary; anything else is shown as lossy UTF-8 text.
+pub fn preview_load(path: &Path) -> Result<(FilesPreviewBody, u64), String> {
+    const MAX_FS_READ_BYTES: u64 = 5 * 1024 * 1024;
+    const MAX_DATA_URL_BYTES: u64 = 8 * 1024 * 1024;
+    // `lstat` like the shell — the jail already resolved the path, so a
+    // symlink reaching here resolved inside the root.
+    let stat = std::fs::metadata(path).map_err(|_| "File does not exist".to_owned())?;
+    if !stat.is_file() {
+        return Err("Path is not a regular file".to_owned());
+    }
+    let size = stat.len();
+    if has_image_extension(path) {
+        if size > MAX_DATA_URL_BYTES {
+            return Err(format!(
+                "File is too large to preview ({:.1} MB).",
+                size as f64 / (1024.0 * 1024.0)
+            ));
+        }
+        return Ok((FilesPreviewBody::Image, size));
+    }
+    if size > MAX_FS_READ_BYTES {
+        return Err(format!(
+            "File is too large to preview ({:.1} MB). Limit is 5 MB.",
+            size as f64 / (1024.0 * 1024.0)
+        ));
+    }
+    let bytes = std::fs::read(path).map_err(|_| "Unable to read this file".to_owned())?;
+    if bytes.contains(&0) {
+        return Ok((FilesPreviewBody::Binary, size));
+    }
+    Ok((
+        FilesPreviewBody::Text(String::from_utf8_lossy(&bytes).into_owned()),
+        size,
+    ))
 }
 
 /// `widget.state.cwd` as a clean relative path — only `Normal` components
@@ -284,6 +418,11 @@ fn row_button(
 pub fn files_pane(
     root: &std::path::Path,
     widget: &slate_app::projection::Widget,
+    // The pane's slice of CanvasView keyboard/preview state — passed in
+    // because `entity().read()` mid-render would re-borrow the view and
+    // panic (same reason `browser_editing` rides a parameter).
+    editing: Option<&FilesEditing>,
+    preview: Option<&FilesPreview>,
     cx: &mut Context<crate::canvas_view::CanvasView>,
 ) -> impl IntoElement {
     let rel = relative_cwd(widget);
@@ -295,6 +434,15 @@ pub fn files_pane(
         .and_then(|s| s.get("showHidden"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    // `state.search` — journaled like the shell's localStorage copy; the
+    // saved 500-char cap applies on the way out too.
+    let search = state
+        .and_then(|s| s.get("search"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .chars()
+        .take(500)
+        .collect::<String>();
     let sort = state
         .and_then(|s| s.get("sort"))
         .and_then(Value::as_str)
@@ -306,6 +454,14 @@ pub fn files_pane(
         .and_then(|s| s.get("limit"))
         .and_then(Value::as_u64)
         .unwrap_or(200) as usize;
+    // Only this pane's edit matters — `files_editing` is keyed by widget id.
+    let search_editing = matches!(editing, Some(FilesEditing::Search { id }) if id == &wid);
+    let renaming = match editing {
+        Some(FilesEditing::Rename { id, path, buffer }) if id == &wid => {
+            Some((path.as_str(), buffer.as_str()))
+        }
+        _ => None,
+    };
     // Navigating anywhere resets pagination and disarms a pending delete —
     // the original reset its 200-row window on every path change.
     let nav_state = |cwd: String| {
@@ -347,17 +503,6 @@ pub fn files_pane(
                         .text_color(rgb(theme::hex(theme::text::NORMAL)))
                         .child(basename),
                 )
-                .child(header_button(
-                    if show_hidden {
-                        "hidden: on".to_owned()
-                    } else {
-                        "hidden: off".to_owned()
-                    },
-                    show_hidden,
-                    &wid,
-                    json!({ "op": "set", "state": { "showHidden": !show_hidden } }),
-                    cx,
-                ))
                 .child(header_button(
                     format!("sort: {sort}"),
                     sort != "name",
@@ -415,6 +560,7 @@ pub fn files_pane(
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _event, _window, cx| {
+                        this.files_edit_release(&wid);
                         this.widget_command(&wid, nav_state(String::new()), cx);
                     }),
                 ),
@@ -445,12 +591,128 @@ pub fn files_pane(
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _event, _window, cx| {
+                        this.files_edit_release(&wid);
                         this.widget_command(&wid, nav_state(target.clone()), cx);
                     }),
                 ),
         );
     }
     col = col.child(crumbs);
+
+    // The one directory read per render — hoisted so the truncated note
+    // can sit between the toolbar and the listing like the original's.
+    let listing = list_entries(&cur);
+    let truncated = listing.as_ref().map(|(_, t)| *t).unwrap_or(false);
+
+    // The original's search row: `Search files…` input + the Hidden
+    // toggle. The field is a click-to-edit like the browser omnibox —
+    // keystrokes reach it through `CanvasView::on_key` while
+    // `files_editing` marks this pane's field.
+    {
+        let wid_search = wid.clone();
+        col = col.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .px_1()
+                .child(
+                    div()
+                        .flex_none()
+                        .text_xs()
+                        .text_color(rgb(theme::hex(theme::text::FAINT)))
+                        .child("⌕"),
+                )
+                .child(
+                    div()
+                        .id(format!("slate-files-search-{}", wid_search))
+                        .flex_1()
+                        .min_w_0()
+                        .h(px(22.0))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .px_1()
+                        .bg(rgb(theme::hex(theme::monochrome::RAISED)))
+                        .cursor_text()
+                        .text_xs()
+                        .text_color(rgb(theme::hex(if search_editing {
+                            theme::text::NORMAL
+                        } else {
+                            theme::text::DIM
+                        })))
+                        .child(if search.is_empty() {
+                            "Search files…".to_owned()
+                        } else {
+                            search.clone()
+                        })
+                        .when(search_editing, |el| {
+                            el.child(
+                                div()
+                                    .text_color(rgb(theme::hex(theme::text::DIM)))
+                                    .child("▌".to_owned()),
+                            )
+                        })
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _event, window, cx| {
+                                cx.stop_propagation();
+                                window.focus(&this.focus, cx);
+                                // The field's focus-tracking — the query
+                                // itself is journaled `state.search`; this
+                                // only marks who owns the keyboard, like
+                                // the omnibox's `browser_editing`.
+                                this.files_editing = Some(FilesEditing::Search {
+                                    id: wid_search.clone(),
+                                });
+                                this.active = Some(wid_search.clone());
+                                cx.notify();
+                            }),
+                        ),
+                )
+                .when(!search.is_empty(), |el| {
+                    // The clear-✕ — the original's right-side button.
+                    el.child(header_button(
+                        "✕".to_owned(),
+                        false,
+                        &wid,
+                        json!({ "op": "set", "state": { "search": "", "limit": 200 } }),
+                        cx,
+                    ))
+                })
+                .child(header_button(
+                    if show_hidden {
+                        "hidden: on".to_owned()
+                    } else {
+                        "hidden: off".to_owned()
+                    },
+                    show_hidden,
+                    &wid,
+                    json!({ "op": "set", "state": { "showHidden": !show_hidden } }),
+                    cx,
+                )),
+        );
+    }
+
+    // The original's truncation note, verbatim — it only renders when the
+    // 2,000-item cap dropped entries, and names the search caveat while a
+    // query is active.
+    if truncated {
+        col = col.child(
+            div()
+                .px_1()
+                .text_xs()
+                .text_color(rgb(theme::hex(theme::text::FAINT)))
+                .child(if search.is_empty() {
+                    "Showing the first 2,000 items. Some files in this folder are not listed."
+                        .to_owned()
+                } else {
+                    "Showing the first 2,000 items — search only covers those. Some files in this folder are not listed."
+                        .to_owned()
+                }),
+        );
+    }
 
     // The listing scrolls; the toolbar and crumbs above stay put.
     let mut list = div()
@@ -462,12 +724,19 @@ pub fn files_pane(
         .min_h_0()
         .overflow_y_scroll();
 
-    match list_entries(&cur) {
-        Ok(mut entries) => {
+    match listing {
+        Ok((mut entries, _truncated)) => {
             // `state.showHidden` filters dotfiles — the `..` row below is
             // navigation, not an entry, so it never hides.
             if !show_hidden {
                 entries.retain(|e| !e.name.starts_with('.'));
+            }
+            // `filteredItems` — `item.name.toLowerCase().includes(q)` over
+            // the loaded slice, exactly what the truncation note warns
+            // about when the 2,000-cap dropped the rest.
+            let query = search.trim().to_lowercase();
+            if !query.is_empty() {
+                entries.retain(|e| e.name.to_lowercase().contains(&query));
             }
             match sort {
                 // Dirs keep floating first whichever key is picked; the key
@@ -506,6 +775,7 @@ pub fn files_pane(
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, _event, _window, cx| {
+                                this.files_edit_release(&wid);
                                 this.widget_command(&wid, nav_state(target.clone()), cx);
                             }),
                         ),
@@ -513,18 +783,26 @@ pub fn files_pane(
             }
 
             if entries.is_empty() {
+                // The original's two empty states — a live query that
+                // matched nothing reads differently from an empty folder.
                 list = list.child(
                     div()
                         .text_sm()
                         .px_1()
                         .text_color(rgb(theme::hex(theme::text::FAINT)))
-                        .child("(empty)"),
+                        .child(if query.is_empty() {
+                            "(empty)"
+                        } else {
+                            "No files match search filter"
+                        }),
                 );
             }
             for entry in entries.into_iter().take(limit) {
                 let path = cur.join(&entry.name);
                 let abs = path.to_string_lossy().into_owned();
                 let armed = confirm_delete == Some(abs.as_str());
+                // `isRenaming` — this row's name cell becomes the input.
+                let renaming_here = matches!(renaming, Some((p, _)) if p == abs.as_str());
                 // Per-row group name drives the action strip's hover reveal —
                 // the original's `opacity-0 group-hover` tailwind pair.
                 let group = format!("files-row-{abs}");
@@ -553,22 +831,91 @@ pub fn files_pane(
                     .hover(|el| el.bg(rgb(theme::hex(theme::monochrome::RAISED))))
                     .child(
                         div()
+                            .flex_none()
+                            .w(px(12.))
+                            .flex()
+                            .justify_center()
+                            .text_color(rgb(theme::hex(if entry.is_dir {
+                                theme::accent::SAND
+                            } else {
+                                theme::text::FAINT
+                            })))
+                            .child(icon),
+                    );
+
+                if renaming_here {
+                    // The original's renaming cell: icon, the input,
+                    // Save/Cancel. The buffer lives on `files_editing`
+                    // (the `renamingName` state) — every keystroke
+                    // re-renders, so Save reads the live text.
+                    let buffer = renaming
+                        .and_then(|(p, b)| (p == abs.as_str()).then(|| b.to_owned()))
+                        .unwrap_or_default();
+                    let wid_cancel = wid.clone();
+                    row = row
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .flex_1()
+                                .min_w_0()
+                                .text_color(rgb(theme::hex(theme::text::NORMAL)))
+                                .child(div().min_w_0().child(buffer.clone()))
+                                .child(
+                                    div()
+                                        .text_color(rgb(theme::hex(theme::text::DIM)))
+                                        .child("▌".to_owned()),
+                                ),
+                        )
+                        .child(row_button(
+                            "save".to_owned(),
+                            false,
+                            &wid,
+                            vec![json!({ "op": "file_rename", "path": abs, "name": buffer })],
+                            cx,
+                        ))
+                        .child(
+                            // Cancel — `renameCancelled`: drop the edit
+                            // without dispatching. Direct field access like
+                            // the search field's own click.
+                            div()
+                                .text_xs()
+                                .cursor_pointer()
+                                .px_0p5()
+                                .text_color(rgb(theme::hex(theme::text::FAINT)))
+                                .hover(|el| {
+                                    el.bg(rgb(theme::hex(theme::monochrome::RAISED)))
+                                        .text_color(rgb(theme::hex(theme::text::NORMAL)))
+                                })
+                                .child("cancel")
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _event, _window, cx| {
+                                        cx.stop_propagation();
+                                        if matches!(
+                                            &this.files_editing,
+                                            Some(FilesEditing::Rename { id, .. }) if id == &wid_cancel
+                                        ) {
+                                            this.files_editing = None;
+                                        }
+                                        cx.notify();
+                                    }),
+                                ),
+                        );
+                    list = list.child(row);
+                    continue;
+                }
+
+                row = row
+                    .child(
+                        div()
                             .flex()
                             .flex_row()
                             .items_center()
                             .gap_1()
                             .flex_1()
                             .min_w_0()
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .text_color(rgb(theme::hex(if entry.is_dir {
-                                        theme::accent::SAND
-                                    } else {
-                                        theme::text::FAINT
-                                    })))
-                                    .child(icon),
-                            )
                             .child(div().min_w_0().truncate().child(entry.name.clone())),
                     )
                     .child(
@@ -600,12 +947,13 @@ pub fn files_pane(
                     row = row.on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _event, _window, cx| {
+                            this.files_edit_release(&wid);
                             this.widget_command(&wid, nav_state(target.clone()), cx);
                         }),
                     );
                 } else {
-                    // Files hand their absolute path to the desktop through
-                    // the dispatcher — the pane itself never spawns.
+                    // `openItem` → `viewFile`: a file click previews — the
+                    // overlay is the dispatcher's job, the pane stays pure.
                     let wid = wid.clone();
                     let abs = abs.clone();
                     row = row.on_mouse_down(
@@ -613,16 +961,18 @@ pub fn files_pane(
                         cx.listener(move |this, _event, _window, cx| {
                             this.widget_command(
                                 &wid,
-                                json!({ "op": "file_open", "path": abs }),
+                                json!({ "op": "file_preview", "path": abs }),
                                 cx,
                             );
                         }),
                     );
                 }
 
-                // Row action strip: reveal in fm, copy path, delete — hidden
-                // until the row is hovered, except while its delete is armed
-                // so the second click has somewhere visible to land.
+                // Row action strip — the original's hover-revealed five:
+                // preview (files only), open in the default app, copy path,
+                // rename, delete. Hidden until the row is hovered, except
+                // while its delete is armed so the second click has
+                // somewhere visible to land.
                 let delete_label = if armed { "✕?" } else { "✕" };
                 let delete_actions = if armed {
                     vec![
@@ -632,37 +982,77 @@ pub fn files_pane(
                 } else {
                     vec![json!({ "op": "set", "state": { "confirmDelete": abs } })]
                 };
-                row = row.child(
-                    div()
-                        .flex_none()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_0p5()
-                        .opacity(if armed { 1.0 } else { 0.0 })
-                        .group_hover(group, |s| s.opacity(1.0))
-                        .child(row_button(
-                            "↗".to_owned(),
-                            false,
-                            &wid,
-                            vec![json!({ "op": "file_reveal", "path": abs })],
-                            cx,
-                        ))
-                        .child(row_button(
-                            "⧉".to_owned(),
-                            false,
-                            &wid,
-                            vec![json!({ "op": "file_copy_path", "path": abs })],
-                            cx,
-                        ))
-                        .child(row_button(
-                            delete_label.to_owned(),
-                            armed,
-                            &wid,
-                            delete_actions,
-                            cx,
-                        )),
-                );
+                let rename_abs = abs.clone();
+                let rename_name = entry.name.clone();
+                let wid_rename = wid.clone();
+                let mut strip = div()
+                    .flex_none()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_0p5()
+                    .opacity(if armed { 1.0 } else { 0.0 })
+                    .group_hover(group, |s| s.opacity(1.0));
+                if !entry.is_dir {
+                    strip = strip.child(row_button(
+                        "◉".to_owned(),
+                        false,
+                        &wid,
+                        vec![json!({ "op": "file_preview", "path": abs })],
+                        cx,
+                    ));
+                }
+                strip = strip
+                    .child(row_button(
+                        "↗".to_owned(),
+                        false,
+                        &wid,
+                        vec![json!({ "op": "file_open", "path": abs })],
+                        cx,
+                    ))
+                    .child(row_button(
+                        "⧉".to_owned(),
+                        false,
+                        &wid,
+                        vec![json!({ "op": "file_copy_path", "path": abs })],
+                        cx,
+                    ))
+                    .child(
+                        // ✎ `startRename` — arms the inline edit; the buffer
+                        // seeds with the row's current name.
+                        div()
+                            .text_xs()
+                            .cursor_pointer()
+                            .px_0p5()
+                            .text_color(rgb(theme::hex(theme::text::FAINT)))
+                            .hover(|el| {
+                                el.bg(rgb(theme::hex(theme::monochrome::RAISED)))
+                                    .text_color(rgb(theme::hex(theme::text::NORMAL)))
+                            })
+                            .child("✎")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _event, window, cx| {
+                                    cx.stop_propagation();
+                                    window.focus(&this.focus, cx);
+                                    this.files_editing = Some(FilesEditing::Rename {
+                                        id: wid_rename.clone(),
+                                        path: rename_abs.clone(),
+                                        buffer: rename_name.clone(),
+                                    });
+                                    this.active = Some(wid_rename.clone());
+                                    cx.notify();
+                                }),
+                            ),
+                    )
+                    .child(row_button(
+                        delete_label.to_owned(),
+                        armed,
+                        &wid,
+                        delete_actions,
+                        cx,
+                    ));
+                row = row.child(strip);
                 list = list.child(row);
             }
 
@@ -704,5 +1094,159 @@ pub fn files_pane(
             );
         }
     }
-    col.child(list)
+
+    let mut pane = col.child(list).relative();
+    // The original's `createPortal` preview dialog — app-covering there,
+    // pane-covering here; its Escape lives in `CanvasView::on_key`.
+    if let Some(preview) = preview.filter(|p| p.id == wid) {
+        pane = pane.child(preview_overlay(preview, &wid, cx));
+    }
+    pane
+}
+
+/// The preview overlay — `FilesWidget`'s portal dialog scoped to the pane.
+/// Header: file glyph, name, `size · path`, then "Open with OS App",
+/// "Copy Text" (text previews only — the original's `content !==
+/// undefined` gate), and the ✕ close. Body: `img()` contain for images
+/// (the path renders directly — no base64 `dataUrl` hop needed natively),
+/// scrolling mono text, or the binary-file notice. The root eats presses
+/// so a click can't fall through to the listing, like the settings
+/// modal's panel.
+fn preview_overlay(
+    preview: &FilesPreview,
+    wid: &str,
+    cx: &mut Context<crate::canvas_view::CanvasView>,
+) -> impl IntoElement {
+    let path = preview.path.clone();
+    let mut actions = div().flex_none().flex().flex_row().items_center().gap_1();
+    actions = actions.child(row_button(
+        "↗ open".to_owned(),
+        false,
+        wid,
+        vec![json!({ "op": "file_open", "path": path.clone() })],
+        cx,
+    ));
+    if matches!(preview.body, FilesPreviewBody::Text(_)) {
+        actions = actions.child(row_button(
+            "⧉ copy".to_owned(),
+            false,
+            wid,
+            vec![json!({ "op": "file_copy_content" })],
+            cx,
+        ));
+    }
+    actions = actions.child(row_button(
+        "✕".to_owned(),
+        false,
+        wid,
+        vec![json!({ "op": "file_preview_close" })],
+        cx,
+    ));
+
+    let header = div()
+        .flex_none()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .child(
+            div()
+                .flex_none()
+                .text_sm()
+                .text_color(rgb(theme::hex(theme::accent::SAND)))
+                .child("<>"),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .child(
+                    div()
+                        .truncate()
+                        .text_sm()
+                        .text_color(rgb(theme::hex(theme::text::NORMAL)))
+                        .child(preview.name.clone()),
+                )
+                .child(
+                    div()
+                        .truncate()
+                        .text_xs()
+                        .text_color(rgb(theme::hex(theme::text::FAINT)))
+                        .child(format!("{} · {}", human_size(preview.size), preview.path)),
+                ),
+        )
+        .child(actions);
+
+    let body: AnyElement = match &preview.body {
+        FilesPreviewBody::Image => div()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                img(PathBuf::from(&preview.path))
+                    .size_full()
+                    .object_fit(ObjectFit::Contain)
+                    .with_fallback(|| {
+                        div()
+                            .text_xs()
+                            .text_color(rgb(theme::hex(theme::text::FAINT)))
+                            .child("Image could not be loaded")
+                            .into_any_element()
+                    }),
+            )
+            .into_any_element(),
+        FilesPreviewBody::Text(text) => div()
+            .id(format!("slate-files-preview-text-{wid}"))
+            .size_full()
+            .overflow_y_scroll()
+            .child(
+                div()
+                    .font_family("Departure Mono")
+                    .text_xs()
+                    .text_color(rgb(theme::hex(theme::text::DIM)))
+                    .child(text.clone()),
+            )
+            .into_any_element(),
+        FilesPreviewBody::Binary => div()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(theme::hex(theme::text::FAINT)))
+                    .child("Binary file preview not available. Open with external application."),
+            )
+            .into_any_element(),
+    };
+
+    div()
+        .id(format!("slate-files-preview-{wid}"))
+        .absolute()
+        .top(px(0.0))
+        .left(px(0.0))
+        .right(px(0.0))
+        .bottom(px(0.0))
+        .flex()
+        .flex_col()
+        .gap_1()
+        .p_2()
+        .bg(rgb(theme::hex(theme::monochrome::BASE)))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|_this, _event, _window, cx| {
+                cx.stop_propagation();
+            }),
+        )
+        .child(header)
+        .child(
+            div()
+                .flex_1()
+                .min_h_0()
+                .border_1()
+                .border_color(rgb(theme::hex(theme::hairline::SOFT)))
+                .child(body),
+        )
 }
