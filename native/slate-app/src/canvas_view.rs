@@ -536,6 +536,10 @@ pub struct CanvasView {
     // fix-orchestration: the last rejected control write, shown as the
     // pane's red banner until dismissed or the next write succeeds.
     orc_error: Option<String>,
+    // fix-panes: the notes pane's open field — (note id, field name) — and
+    // its edit buffer. Keystrokes route here while it is `Some`.
+    pub(crate) notes_editing: Option<(String, String)>,
+    pub(crate) notes_buffer: String,
 }
 
 /// A `/term <command>` line waiting to be typed into a fresh PTY.
@@ -1055,6 +1059,9 @@ impl CanvasView {
             orc_editing: None,
             orc_drafts: HashMap::new(),
             orc_error: None,
+            // fix-panes:
+            notes_editing: None,
+            notes_buffer: String::new(),
         };
         view.snapshots = view.manager.snapshots();
         for pending in relaunch {
@@ -3948,6 +3955,89 @@ impl CanvasView {
                     self.browser_sel = None;
                 }
             }
+            // fix-panes: the notes pane's writes. Each is a REST call to `/notes`,
+            // which journals the matching `note.*` entry and then writes the
+            // store — so the pane, the CLI and REST all fold the same way.
+            Some("note_create") => {
+                if let Some(note) = action.get("id").and_then(Value::as_str) {
+                    self.control_post(
+                        "POST",
+                        "/notes",
+                        Some(json!({ "id": note, "title": "New note" })),
+                    );
+                    self.widget_command(
+                        id,
+                        json!({ "op": "set", "state": { "expanded": note } }),
+                        cx,
+                    );
+                }
+            }
+            Some("note_edit") => {
+                if let (Some(note), Some(field)) = (
+                    action.get("id").and_then(Value::as_str),
+                    action.get("field").and_then(Value::as_str),
+                ) {
+                    self.notes_editing = Some((note.to_owned(), field.to_owned()));
+                    self.notes_buffer = action
+                        .get("value")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned();
+                }
+            }
+            Some("note_update") => {
+                if let Some(note) = action.get("id").and_then(Value::as_str) {
+                    let patch = action.get("patch").cloned().unwrap_or_else(|| json!({}));
+                    self.control_post("PATCH", &format!("/notes/{note}"), Some(patch));
+                }
+            }
+            // Reorder swaps `order` with the neighbour: the mover takes the
+            // neighbour's slot and the neighbour takes the mover's.
+            Some("note_move") => {
+                if let (Some(note), Some(order), Some(other), Some(other_order)) = (
+                    action.get("id").and_then(Value::as_str),
+                    action.get("order").and_then(Value::as_f64),
+                    action.get("otherId").and_then(Value::as_str),
+                    action.get("otherOrder").and_then(Value::as_f64),
+                ) {
+                    self.control_post(
+                        "PATCH",
+                        &format!("/notes/{note}"),
+                        Some(json!({ "order": order })),
+                    );
+                    self.control_post(
+                        "PATCH",
+                        &format!("/notes/{other}"),
+                        Some(json!({ "order": other_order })),
+                    );
+                }
+            }
+            Some("note_recolor") => {
+                if let (Some(category), Some(color)) = (
+                    action.get("category").and_then(Value::as_str),
+                    action.get("color").and_then(Value::as_str),
+                ) {
+                    self.control_post(
+                        "POST",
+                        "/notes/recolor",
+                        Some(json!({ "category": category, "color": color })),
+                    );
+                }
+            }
+            Some("note_delete") => {
+                if let Some(note) = action.get("id").and_then(Value::as_str) {
+                    if matches!(&self.notes_editing, Some((editing, _)) if editing == note) {
+                        self.notes_editing = None;
+                        self.notes_buffer.clear();
+                    }
+                    self.control_post("DELETE", &format!("/notes/{note}"), None);
+                    self.widget_command(
+                        id,
+                        json!({ "op": "set", "state": { "expanded": null } }),
+                        cx,
+                    );
+                }
+            }
             _ => {}
         }
         cx.notify();
@@ -4837,6 +4927,9 @@ fn widget_body(
     // fix-orchestration: the pane's field/draft/error slice, carried in for
     // the same no-read-mid-render reason.
     orc: crate::views_orchestration::OrcState<'_>,
+    // fix-panes: the notes pane's open field and its buffer.
+    notes_editing: Option<(&str, &str)>,
+    notes_buffer: &str,
     cx: &mut Context<CanvasView>,
 ) -> AnyElement {
     let font = px(12.0 * zoom);
@@ -5020,7 +5113,7 @@ fn widget_body(
         Some("notes") => div()
             .size_full()
             .text_size(font)
-            .child(crate::views_notes::notes_pane(widget, cx))
+            .child(crate::views_notes::notes_pane(widget, notes_editing, notes_buffer, cx))
             .into_any_element(),
         Some("timer") => div()
             .size_full()
@@ -6466,6 +6559,11 @@ impl Render for CanvasView {
                             drafts: &self.orc_drafts,
                             error: self.orc_error.as_deref(),
                         },
+                        // fix-panes:
+                        self.notes_editing
+                            .as_ref()
+                            .map(|(note, field)| (note.as_str(), field.as_str())),
+                        &self.notes_buffer,
                         cx,
                     );
                     // Non-terminal panes scroll their content natively —
@@ -8182,6 +8280,41 @@ impl CanvasView {
             return;
         }
 
+        // fix-panes: the notes editor owns the keyboard while a field is open.
+        // Enter commits it as a note.update, Escape drops it, printable keys
+        // and Backspace edit the buffer (no caret — the notes field is short).
+        if self.notes_editing.is_some() {
+            match keystroke.key.as_str() {
+                "escape" => {
+                    self.notes_editing = None;
+                    self.notes_buffer.clear();
+                }
+                "enter" => self.notes_commit_edit(),
+                "backspace" => {
+                    self.notes_buffer.pop();
+                }
+                _ => {
+                    if !mods.control && !mods.alt && !mods.platform {
+                        let text =
+                            keystroke
+                                .key_char
+                                .clone()
+                                .or_else(|| match keystroke.key.as_str() {
+                                    "space" => Some(" ".to_owned()),
+                                    k if k.chars().count() == 1 => Some(k.to_owned()),
+                                    _ => None,
+                                });
+                        if let Some(text) = text {
+                            self.notes_buffer.push_str(&text);
+                        }
+                    }
+                }
+            }
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
+
         // The browser omnibox owns the keyboard while it is editing — the
         // same shape as rename plus the DOM input's editing keys: Enter
         // navigates, Escape reverts, arrows/Home/End move the caret (⇧
@@ -9261,6 +9394,14 @@ impl CanvasView {
         }
     }
 
+    /// Fire-and-toast control write for panes without their own error
+    /// surface — the notes pane's PATCH/POSTs land here.
+    fn control_post(&mut self, method: &str, path: &str, body: Option<Value>) {
+        if let Err(error) = slate_app::ipc::control_request(method, path, body.as_ref()) {
+            self.notice(error);
+        }
+    }
+
     // fix-orchestration: a control write that reports back. A rejected POST
     // becomes the pane's banner (the widget's `actionError`) instead of a
     // toast; a success clears it.
@@ -9387,5 +9528,29 @@ impl CanvasView {
         store
             .message_by_id(id)
             .is_some_and(|m| crate::views_orchestration::pending(m, &store))
+    }
+
+    /// fix-panes: Enter in the notes editor. The field goes out as a PATCH to
+    /// `/notes/{id}` — the `note.update` the REST route journals. An empty
+    /// category sends JSON null, which the route reads as "clear it".
+    fn notes_commit_edit(&mut self) {
+        let Some((note, field)) = self.notes_editing.take() else {
+            return;
+        };
+        let value = std::mem::take(&mut self.notes_buffer);
+        let patch = match field.as_str() {
+            "title" => json!({ "title": value }),
+            "body" => json!({ "body": value }),
+            "tags" => json!({
+                "tags": value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|tag| !tag.is_empty())
+                    .collect::<Vec<_>>(),
+            }),
+            "category" => json!({ "category": Some(value.trim()).filter(|name| !name.is_empty()) }),
+            _ => return,
+        };
+        self.control_post("PATCH", &format!("/notes/{note}"), Some(patch));
     }
 }

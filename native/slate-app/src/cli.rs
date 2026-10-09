@@ -357,9 +357,9 @@ pub fn plan(command: &str, args: &Args) -> CommandResult<Plan> {
                     // aliases both spellings to the same create.
                     "/widgets/terminal",
                     object(vec![
-                        // orc sent {title}; our route also keys on `name`.
+                        // `title` only — `name` is a serde alias on the same
+                        // field, so sending both is a duplicate-field 400.
                         ("title", text(args.pick(&["title", "name"]))),
-                        ("name", text(args.pick(&["name", "title"]))),
                         ("cwd", text(args.pick(&["cwd", "dir", "directory"]))),
                         ("command", text(args.pick(&["command", "cmd"]))),
                         ("id", text(args.pick(&["id"]))),
