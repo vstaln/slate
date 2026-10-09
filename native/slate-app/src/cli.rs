@@ -324,19 +324,16 @@ pub fn plan(command: &str, args: &Args) -> CommandResult<Plan> {
             Ok(Plan::get(format!("/orchestration/runs/{}", encode(&id))))
         }
         "run-close" => {
-            // Destructive in slate.mjs too: closing a run retires its
-            // coordination inbox — and the gate fires before the id lookup.
+            // Destructive in slate.mjs too, but unlike canvas/terminal close
+            // the require1 fires BEFORE the confirm gate — a missing id is
+            // `invalid`, not `needs_confirm`.
+            let id = args.require(&["id", "run", "runId"], 1, "run-close needs <run-id>")?;
             if !args.flag("yes") {
-                let label = args
-                    .pick(&["id", "run", "runId"])
-                    .or_else(|| args.positionals().get(1).cloned())
-                    .unwrap_or_default();
                 return Err(CommandError::new(
                     ErrorCode::NeedsConfirm,
-                    format!(" destructive: run-close {label} — add --yes to confirm"),
+                    format!(" destructive: run-close {id} — add --yes to confirm"),
                 ));
             }
-            let id = args.require(&["id", "run", "runId"], 1, "run-close needs <run-id>")?;
             Ok(Plan::post(
                 format!("/orchestration/runs/{}/close", encode(&id)),
                 Value::Object(Map::new()),
@@ -356,12 +353,16 @@ pub fn plan(command: &str, args: &Args) -> CommandResult<Plan> {
             match action {
                 "list" | "ls" => Ok(Plan::get("/orchestration/workers")),
                 "new" | "spawn" | "open" => Ok(Plan::post(
+                    // orc spelled it /widgets/terminal but the control server
+                    // aliases both to the same create — /terminal is our route.
                     "/terminal",
                     object(vec![
-                        ("id", text(args.pick(&["id"]))),
+                        // orc sent {title}; our route also keys on `name`.
+                        ("title", text(args.pick(&["title", "name"]))),
                         ("name", text(args.pick(&["name", "title"]))),
                         ("cwd", text(args.pick(&["cwd", "dir", "directory"]))),
                         ("command", text(args.pick(&["command", "cmd"]))),
+                        ("id", text(args.pick(&["id"]))),
                     ]),
                 )),
                 "send" | "write" => {
@@ -446,7 +447,18 @@ pub fn plan(command: &str, args: &Args) -> CommandResult<Plan> {
                         2,
                         "terminal close needs <id-or-name>",
                     )?;
-                    Ok(Plan::delete(format!("/terminal/{}", encode(&id))))
+                    // orc deletes the WIDGET, which disposes the PTY along
+                    // with it — `DELETE /terminal/:id` would leave the canvas
+                    // widget orphaned.
+                    let mut plan = Plan::delete(format!("/widgets/{}", encode(&id)));
+                    plan.body = serde_json::json!({
+                        "agentId": std::env::var("SLATE_AGENT_ID")
+                            .ok()
+                            .or_else(|| std::env::var("SLATE_TERMINAL_ID").ok())
+                            .filter(|id| !id.is_empty())
+                            .unwrap_or_else(|| "cli".to_owned())
+                    });
+                    Ok(plan)
                 }
                 other => Err(CommandError::new(
                     ErrorCode::UnknownCommand,
@@ -557,10 +569,9 @@ pub fn plan(command: &str, args: &Args) -> CommandResult<Plan> {
                 format!("/orchestration/dispatches/{}/account", encode(&id)),
                 object(vec![
                     ("state", Some(Value::from(state))),
-                    (
-                        "closeTerminal",
-                        args.flag("close").then(|| Value::Bool(true)),
-                    ),
+                    // orc sends the key unconditionally — `flags.close ===
+                    // true` — so an absent --close lands as explicit false.
+                    ("closeTerminal", Some(Value::Bool(args.flag("close")))),
                 ]),
             ))
         }
@@ -699,7 +710,8 @@ pub fn plan(command: &str, args: &Args) -> CommandResult<Plan> {
                                 .unwrap_or_else(|| "reply".to_owned()),
                         )),
                     ),
-                    ("body", Some(Value::from(body))),
+                    // orc's empty reply omits the key rather than sending "".
+                    ("body", text(Some(body))),
                     ("taskId", text(args.pick(&["task", "taskId"]))),
                     ("dispatchId", text(args.pick(&["dispatch", "dispatchId"]))),
                     ("runId", text(args.pick(&["run", "runId"]))),
@@ -835,10 +847,12 @@ pub fn plan(command: &str, args: &Args) -> CommandResult<Plan> {
             }
             Ok(Plan::post(
                 "/orchestration/reset",
+                // orc posts all three keys — `flags.x === true` — so an
+                // unset scope is an explicit false, not an absent key.
                 object(vec![
-                    ("tasks", tasks.then_some(Value::Bool(true))),
-                    ("messages", messages.then_some(Value::Bool(true))),
-                    ("all", all.then_some(Value::Bool(true))),
+                    ("tasks", Some(Value::Bool(tasks))),
+                    ("messages", Some(Value::Bool(messages))),
+                    ("all", Some(Value::Bool(all))),
                 ]),
             ))
         }
@@ -873,6 +887,28 @@ pub fn plan(command: &str, args: &Args) -> CommandResult<Plan> {
                     CommandError::new(ErrorCode::Invalid, "api: body must be valid JSON")
                 })?,
                 None => Value::Null,
+            };
+            // orc stamps `{agentId: AGENT_ID, ...body}` on every non-GET.
+            let body = if method == "GET" || body.is_null() {
+                body
+            } else {
+                let mut merged = serde_json::Map::new();
+                merged.insert(
+                    "agentId".to_owned(),
+                    Value::from(
+                        std::env::var("SLATE_AGENT_ID")
+                            .ok()
+                            .or_else(|| std::env::var("SLATE_TERMINAL_ID").ok())
+                            .filter(|id| !id.is_empty())
+                            .unwrap_or_else(|| "cli".to_owned()),
+                    ),
+                );
+                if let Some(map) = body.as_object() {
+                    for (key, value) in map {
+                        merged.insert(key.clone(), value.clone());
+                    }
+                }
+                Value::Object(merged)
             };
             Ok(Plan {
                 method,
