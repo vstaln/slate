@@ -144,7 +144,7 @@ fn command_help(name: &str) -> Option<&'static str> {
         "canvas" => {
             "slate canvas list | place <kind> | image <path> | move | rename | focus | close — canvas widgets & viewport."
         }
-        "browser" => "slate browser list — the native build has no webview; `list` reports browser widgets, the other verbs are unsupported.",
+        "browser" => "slate browser <list|open|navigate|snapshot|click|fill|select|press|scroll> — drive browser widgets",
         "plan" => {
             "slate plan list | create | update | done | toggle | delete [<id>] — planner day tasks."
         }
@@ -184,7 +184,7 @@ pub fn run() -> Result<(), String> {
                     Ok(())
                 }
                 None => Err(format!(
-                    "no help for \"{topic}\"{} — run `{} --help`",
+                    "unknown_command: no help for \"{topic}\"{} — run `{} --help`",
                     slate_app::cli::suggest_command(topic)
                         .map(|hint| format!(" — did you mean \"{hint}\"?"))
                         .unwrap_or_default(),
@@ -235,7 +235,8 @@ pub fn run() -> Result<(), String> {
             println!(
                 "{}",
                 if parsed.flag("json") {
-                    response.to_string()
+                    serde_json::to_string_pretty(data_of(&response))
+                        .unwrap_or_else(|_| response.to_string())
                 } else {
                     format_workers(&response)
                 }
@@ -251,19 +252,23 @@ pub fn run() -> Result<(), String> {
                 "/orchestration/workers/tell",
                 Some(body.clone()),
             )?;
-            let delivery_id = response
+            let delivery_id = data_of(&response)
                 .get("delivery")
                 .and_then(|delivery| delivery.get("id"))
                 .and_then(Value::as_str)
                 .unwrap_or("confirmed");
             if parsed.flag("json") {
-                println!("{response}");
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(data_of(&response))
+                        .map_err(|e| e.to_string())?
+                );
             } else {
                 // The trailing hint is from slate.mjs: the answer to a tell
                 // lives in that terminal's scrollback, not the inbox.
-                match response.get("mode").and_then(Value::as_str) {
+                match data_of(&response).get("mode").and_then(Value::as_str) {
                     Some(mode) => {
-                        let count = response
+                        let count = data_of(&response)
                             .get("images")
                             .and_then(Value::as_array)
                             .map_or(1, |images| images.len().max(1));
@@ -321,8 +326,45 @@ pub fn run() -> Result<(), String> {
                 &token,
                 &plan.method,
                 &path,
-                (!plan.body.is_null()).then_some(plan.body),
-            )?;
+                (!plan.body.is_null()).then_some(plan.body.clone()),
+            );
+            // slate.mjs's two-step for the show verbs: a 404 on the single
+            // read falls back to the list and finds the record there; any
+            // other error rethrows.
+            let response = match response {
+                Err(error)
+                    if (error.starts_with("not_found:")
+                        || error.starts_with("http_404"))
+                        && matches!(other, "task-show" | "task" | "worker-show") =>
+                {
+                    let (list_path, key) = match other {
+                        "task-show" | "task" => ("/orchestration/tasks", "task"),
+                        _ => ("/orchestration/dispatches", "dispatch"),
+                    };
+                    let id = parsed
+                        .pick(&["id", "task", "taskId", "dispatch", "dispatchId"])
+                        .or_else(|| parsed.positionals().get(1).cloned())
+                        .unwrap_or_default();
+                    let list = request(&url, &token, "GET", list_path, None)?;
+                    let plural = format!("{key}s");
+                    let found = data_of(&list)
+                        .get(&plural)
+                        .and_then(Value::as_array)
+                        .and_then(|items| {
+                            items
+                                .iter()
+                                .find(|item| {
+                                    item.get("id").and_then(Value::as_str) == Some(id.as_str())
+                                })
+                                .cloned()
+                        })
+                        .ok_or_else(|| format!("not_found: no {key} \"{id}\""))?;
+                    let mut inner = serde_json::Map::new();
+                    inner.insert(key.to_owned(), found);
+                    json!({ "data": Value::Object(inner) })
+                }
+                other_result => other_result?,
+            };
             print_response(other, &parsed, &response)?;
         }
     }
@@ -378,7 +420,7 @@ fn check_image_path(path: &str) -> Result<(), String> {
     if slate_app::attachments::classify_media(std::path::Path::new(path))
         != slate_app::attachments::MediaKind::Image
     {
-        return Err(format!("{path} is not an image"));
+        return Err(format!("invalid: {path} is not an image"));
     }
     Ok(())
 }
@@ -775,7 +817,7 @@ fn run_plan(parsed: &slate_app::cli::Args) -> Result<(), String> {
                     let rest: Vec<String> = parsed.positionals().iter().skip(2).cloned().collect();
                     (!rest.is_empty()).then(|| rest.join(" "))
                 })
-                .ok_or("plan create needs a title")?;
+                .ok_or("invalid: plan create needs a title")?;
             // Only keys with values go in the payload — the fold treats an
             // absent key as "leave alone" and `null` as "clear".
             let mut payload = json!({ "title": title });
@@ -820,11 +862,11 @@ fn run_plan(parsed: &slate_app::cli::Args) -> Result<(), String> {
                 .filter(|id| id.as_str() == id_or_prefix || id.starts_with(&id_or_prefix))
                 .collect();
             let id = match matches.len() {
-                0 => return Err(format!("no plan item matches \"{id_or_prefix}\"")),
+                0 => return Err(format!("not_found: no plan item matches \"{id_or_prefix}\"")),
                 1 => matches[0].clone(),
                 _ => {
                     return Err(format!(
-                        "\"{id_or_prefix}\" matches {} items — be more specific",
+                        "invalid: \"{id_or_prefix}\" matches {} items — be more specific",
                         matches.len()
                     ))
                 }
@@ -882,7 +924,7 @@ fn run_plan(parsed: &slate_app::cli::Args) -> Result<(), String> {
             Ok(())
         }
         other => Err(format!(
-            "unknown plan subcommand \"{other}\" — try list|create|toggle|update|delete"
+            "unknown_command: unknown plan subcommand \"{other}\" — try list|create|toggle|update|delete"
         )),
     }
 }
@@ -966,15 +1008,18 @@ fn run_journal(parsed: &slate_app::cli::Args) -> Result<(), String> {
                 return Ok(());
             }
             for entry in &entries[entries.len().saturating_sub(lines)..] {
-                // orc printed `  {time}  {type}  [{agent}]  {detail}` where
-                // the optional segments read fields entries do not carry —
-                // on the real schema that collapses to `  {type}`.
-                println!("  {}", entry.entry_type);
+                // orc's line shape — `  {time}  {type}  [{agent}]  {detail}` —
+                // against the real schema: seq for time, actor for [agent],
+                // the commit target for detail.
+                println!(
+                    "  #{}  {}  [{}]  {}",
+                    entry.seq, entry.entry_type, entry.actor_id, entry.target
+                );
             }
             Ok(())
         }
         other => Err(format!(
-            "unknown journal subcommand \"{other}\" — try tail|types"
+            "unknown_command: unknown journal subcommand \"{other}\" — try tail|types"
         )),
     }
 }
@@ -1002,10 +1047,10 @@ fn resolve_widget<'a>(
         .filter(|widget| widget.id.starts_with(given))
         .collect();
     match matches.len() {
-        0 => Err(format!("no widget matches \"{given}\"")),
+        0 => Err(format!("not_found: no widget matches \"{given}\"")),
         1 => Ok(matches[0]),
         n => Err(format!(
-            "\"{given}\" matches {n} widgets — be more specific"
+            "invalid: \"{given}\" matches {n} widgets — be more specific"
         )),
     }
 }
@@ -1080,7 +1125,7 @@ fn run_canvas(parsed: &slate_app::cli::Args) -> Result<(), String> {
             let given = parsed
                 .pick(&["id", "widget"])
                 .or_else(|| parsed.positionals().get(2).cloned())
-                .ok_or("canvas move needs <id|name>")?;
+                .ok_or("invalid: canvas move needs <id|name>")?;
             let id = resolve_widget(&state, &given)?.id.clone();
             let mut patch = json!({});
             for flag in ["x", "y", "w", "h"] {
@@ -1088,9 +1133,8 @@ fn run_canvas(parsed: &slate_app::cli::Args) -> Result<(), String> {
                     patch[flag] = json!(value);
                 }
             }
-            if patch.as_object().is_none_or(|map| map.is_empty()) {
-                return Err("canvas move needs --x/--y (and optionally --w/--h)".into());
-            }
+            // orc PATCHed whatever flags arrived — an empty patch is a
+            // harmless no-op `widget.update` on the server, not a CLI error.
             journal
                 .commit("cli", "widget.update", &format!("widget:{id}"), patch)
                 .map_err(|e| e.to_string())?;
@@ -1101,12 +1145,12 @@ fn run_canvas(parsed: &slate_app::cli::Args) -> Result<(), String> {
             let given = parsed
                 .pick(&["id", "widget"])
                 .or_else(|| parsed.positionals().get(2).cloned())
-                .ok_or("canvas rename needs <id|name>")?;
+                .ok_or("invalid: canvas rename needs <id|name>")?;
             let name = parsed
                 .pick(&["name", "title", "as"])
                 .or_else(|| parsed.positionals().get(3).cloned())
                 .filter(|name| !name.trim().is_empty())
-                .ok_or("canvas rename needs <name> or --name <name>")?;
+                .ok_or("invalid: canvas rename needs <name> or --name <name>")?;
             let id = resolve_widget(&state, &given)?.id.clone();
             journal
                 .commit(
@@ -1160,48 +1204,28 @@ fn run_canvas(parsed: &slate_app::cli::Args) -> Result<(), String> {
             let kind = parsed
                 .pick(&["kind"])
                 .or_else(|| parsed.positionals().get(2).cloned())
-                .ok_or("canvas place needs <kind> or --kind <kind>")?;
+                .ok_or("invalid: canvas place needs <kind> or --kind <kind>")?;
             let image_path = parsed
                 .pick(&["path", "image", "file"])
                 .or_else(|| parsed.positionals().get(3).cloned());
-            if kind == "image" && image_path.is_none() {
-                return Err("canvas place image needs --path <file>".into());
-            }
-            let known = [
-                "terminal",
-                "files",
-                "planner",
-                "orchestration",
-                "notes",
-                "timer",
-                "sys-monitor",
-                "kanban",
-                "calendar",
-                "links",
-                "image",
-                "browser",
-            ];
-            if !known.contains(&kind.as_str()) {
-                return Err(format!(
-                    "unknown widget kind \"{kind}\" — one of: {}",
-                    known.join(", ")
-                ));
-            }
-            if kind == "image" {
+            // orc had no client-side kind whitelist — the kind rides to
+            // /widgets and the server is the gate. `image` without --path is
+            // likewise just POST /widgets {kind:"image"}.
+            if kind == "image" && image_path.is_some() {
                 // The route rejects non-images before importing; check the
                 // same gate before either path so both refuse alike.
                 check_image_path(image_path.as_deref().unwrap_or_default())?;
             }
-            // The Electron shell posted /canvas/image for an image kind —
-            // that route runs the media-store import — and /widgets for the
-            // rest. The `widget.create` journal commit below stays as the
-            // offline path.
+            // The Electron shell posted /canvas/image for an image kind with
+            // a file — that route runs the media-store import — and /widgets
+            // for everything else. The `widget.create` journal commit below
+            // stays as the offline path.
             if let Some((url, token)) = live_control() {
                 // orc sent exactly `{path, title?, x?, y?}` to /canvas/image
                 // and `{kind, title?, x?, y?}` to /widgets; unset fields are
                 // absent so the route's own defaults apply.
                 let mut body = json!({});
-                if kind == "image" {
+                if kind == "image" && image_path.is_some() {
                     body["path"] = json!(absolutize(image_path.as_deref().unwrap_or_default()));
                 } else {
                     body["kind"] = json!(kind);
@@ -1214,7 +1238,7 @@ fn run_canvas(parsed: &slate_app::cli::Args) -> Result<(), String> {
                         body[flag] = json!(value);
                     }
                 }
-                let route = if kind == "image" {
+                let route = if kind == "image" && image_path.is_some() {
                     "/canvas/image"
                 } else {
                     "/widgets"
@@ -1262,7 +1286,8 @@ fn run_canvas(parsed: &slate_app::cli::Args) -> Result<(), String> {
                 "kanban" => (560.0, 480.0),
                 "calendar" => (420.0, 400.0),
                 "image" => (480.0, 360.0),
-                _ => (680.0, 420.0),
+                // The original registry's fallback for unregistered kinds.
+                _ => (520.0, 360.0),
             };
             // No --x/--y lands the widget just inside the camera's view, so
             // a CLI place is visible without a camera move.
@@ -1292,7 +1317,7 @@ fn run_canvas(parsed: &slate_app::cli::Args) -> Result<(), String> {
             let given = parsed
                 .pick(&["path", "image", "file"])
                 .or_else(|| parsed.positionals().get(2).cloned())
-                .ok_or("canvas image needs <path> or --path <file>")?;
+                .ok_or("invalid: canvas image needs <path> or --path <file>")?;
             check_image_path(&given)?;
             let path = absolutize(&given);
             // With the app up, `POST /canvas/image` runs the media-store
@@ -1352,41 +1377,41 @@ fn run_canvas(parsed: &slate_app::cli::Args) -> Result<(), String> {
             Ok(())
         }
         "focus" => {
-            // Routed as POST /canvas/focus; the live camera move is the running
-            // app's business, so this is the one canvas verb on the socket.
+            // Two routes: with an id it's our widget-focus extension on
+            // /canvas/focus; without one it's orc's camera move verbatim —
+            // POST /canvas/camera {x?, y?, zoom ?? 1} — where even a bare
+            // `focus` posts {zoom:1} and snaps back to 100%.
             let mut body = json!({});
-            if let Some(given) = parsed
+            let given = parsed
                 .pick(&["id", "to", "widget"])
-                .or_else(|| parsed.positionals().get(2).cloned())
-            {
-                body["id"] = json!(resolve_widget(&state, &given)?.id);
+                .or_else(|| parsed.positionals().get(2).cloned());
+            if let Some(given) = &given {
+                body["id"] = json!(resolve_widget(&state, given)?.id);
             }
             for flag in ["x", "y", "zoom"] {
                 if let Some(value) = num_flag(parsed, flag) {
                     body[flag] = json!(value);
                 }
             }
-            // orc's camera post always carried a zoom (`?? 1`) — a bare
-            // `canvas focus` or an x/y move without --zoom snaps back to
-            // 100% rather than keeping the current magnification.
-            if body.get("id").is_none() && body.get("zoom").is_none() {
-                body["zoom"] = json!(1);
-            }
-            if body.as_object().is_none_or(|map| map.is_empty()) {
-                return Err("canvas focus needs <id|name> or --x/--y/--zoom".into());
-            }
             let (url, token) =
                 control().map_err(|e| format!("canvas focus needs the running app — {e}"))?;
+            let route = if given.is_some() {
+                "/canvas/focus"
+            } else {
+                body["zoom"] = json!(num_flag(parsed, "zoom").unwrap_or(1.0));
+                "/canvas/camera"
+            };
             let focused = body
                 .get("id")
                 .and_then(Value::as_str)
                 .unwrap_or("canvas")
                 .to_owned();
-            let response = request(&url, &token, "POST", "/canvas/focus", Some(body))?;
+            let response = request(&url, &token, "POST", route, Some(body))?;
             println!(
                 "{}",
                 if parsed.flag("json") {
-                    serde_json::to_string_pretty(&response).map_err(|e| e.to_string())?
+                    serde_json::to_string_pretty(data_of(&response))
+                        .map_err(|e| e.to_string())?
                 } else {
                     format!("focused {focused}")
                 }
@@ -1394,17 +1419,15 @@ fn run_canvas(parsed: &slate_app::cli::Args) -> Result<(), String> {
             Ok(())
         }
         other => Err(format!(
-            "unknown canvas subcommand \"{other}\" — try list|move|rename|focus|close"
+            "unknown_command: unknown canvas subcommand \"{other}\" — try list|move|rename|focus|close"
         )),
     }
 }
 
-/// `slate browser …` — the wry webview is gone with the gpui migration, so
-/// the verbs that drive one (open|navigate|snapshot|click|fill|select|
-/// press|scroll) keep the hard error. `list` is the exception: `GET /browser`
-/// answers an honest list — canvas widgets carrying `kind: "browser"` — the
-/// rows orc's `browser list` printed, so pass it through. When the app is
-/// closed the same read is a journal fold, so the answer does not change.
+/// `slate browser …` — orc's browser surface end to end: `list` reads
+/// `GET /browser` (a journal fold when the app is closed); the action verbs
+/// POST to `/browser/:id/{navigate,click,fill,select,press,scroll}` and `open`
+/// mints a canvas browser widget, all on the live control server.
 fn run_browser(parsed: &slate_app::cli::Args) -> Result<(), String> {
     let sub = parsed
         .positionals()
@@ -1413,9 +1436,7 @@ fn run_browser(parsed: &slate_app::cli::Args) -> Result<(), String> {
         .unwrap_or("list");
     match sub {
         "list" | "ls" | "status" => {}
-        _ => {
-            return Err("browser widgets are not supported in the native build".into());
-        }
+        _ => return run_browser_action(parsed, sub),
     }
     let browsers = match live_control() {
         Some((url, token)) => {
@@ -1481,6 +1502,113 @@ fn run_browser(parsed: &slate_app::cli::Args) -> Result<(), String> {
     Ok(())
 }
 
+/// `slate browser <action>` — everything but `list`: the request shape is
+/// orc's, `post('/browser/:id/<action>', {...})` with absent options omitted
+/// (JSON.stringify drops `undefined`, so no null fields go on the wire).
+fn run_browser_action(parsed: &slate_app::cli::Args, sub: &str) -> Result<(), String> {
+    let Some((url, token)) = live_control() else {
+        return Err("offline: browser actions need the running app".into());
+    };
+    let pos = parsed.positionals();
+    let id = |what: &str| -> Result<String, String> {
+        pos.get(2)
+            .cloned()
+            .ok_or_else(|| format!("invalid: {what}"))
+    };
+    let pick = |names: &[&str], at: usize| pos
+        .get(at)
+        .cloned()
+        .or_else(|| parsed.pick(names));
+    let mut body = serde_json::Map::new();
+    let (method, path) = match sub {
+        "open" => {
+            put(&mut body, "url", pick(&["url"], 2));
+            put(&mut body, "surface", parsed.pick(&["surface"]));
+            ("POST", "/browser/open".to_owned())
+        }
+        "navigate" | "goto" => {
+            let id = id("browser navigate needs <id> <url>")?;
+            let url = pick(&["url"], 3)
+                .ok_or("invalid: browser navigate needs <id> <url>")?;
+            put(&mut body, "url", Some(url));
+            ("POST", format!("/browser/{id}/navigate"))
+        }
+        "snapshot" => {
+            let id = id("browser snapshot needs <id>")?;
+            return browser_print(request(
+                &url,
+                &token,
+                "GET",
+                &format!("/browser/{id}/snapshot"),
+                None,
+            )?);
+        }
+        "click" => {
+            let id = id("browser click needs <id> <ref>")?;
+            put(&mut body, "ref", Some(pick(&["ref"], 3)
+                .ok_or("invalid: browser click needs <id> <ref>")?));
+            ("POST", format!("/browser/{id}/click"))
+        }
+        "fill" => {
+            let id = id("browser fill needs <id> <ref>")?;
+            put(&mut body, "ref", Some(pick(&["ref"], 3)
+                .ok_or("invalid: browser fill needs <id> <ref>")?));
+            put(&mut body, "value", Some(pick(&["value", "text"], 4)
+                .ok_or("invalid: browser fill needs --value \"...\"")?));
+            ("POST", format!("/browser/{id}/fill"))
+        }
+        "select" => {
+            let id = id("browser select needs <id> <ref>")?;
+            put(&mut body, "ref", Some(pick(&["ref"], 3)
+                .ok_or("invalid: browser select needs <id> <ref>")?));
+            put(&mut body, "value", Some(pick(&["value"], 4)
+                .ok_or("invalid: browser select needs --value \"...\"")?));
+            ("POST", format!("/browser/{id}/select"))
+        }
+        "press" => {
+            let id = id("browser press needs <id> <key>")?;
+            put(&mut body, "key", Some(pick(&["key"], 3)
+                .ok_or("invalid: browser press needs <id> <key>")?));
+            put(&mut body, "ref", parsed.pick(&["ref"]));
+            ("POST", format!("/browser/{id}/press"))
+        }
+        "scroll" => {
+            let id = id("browser scroll needs <id>")?;
+            if let Some(pixels) = pick(&["pixels"], 3) {
+                body.insert(
+                    "pixels".to_owned(),
+                    pixels.parse::<f64>().map(Value::from).unwrap_or(json!(pixels)),
+                );
+            }
+            ("POST", format!("/browser/{id}/scroll"))
+        }
+        other => {
+            return Err(format!(
+                "invalid: browser: unknown action \"{other}\" \
+                 (open|list|navigate|snapshot|click|fill|select|press|scroll)"
+            ))
+        }
+    };
+    browser_print(request(&url, &token, method, &path, Some(Value::Object(body)))?)
+}
+
+fn put(body: &mut serde_json::Map<String, Value>, key: &str, value: Option<String>) {
+    if let Some(value) = value {
+        body.insert(key.to_owned(), json!(value));
+    }
+}
+
+/// Actions emit their JSON payload like orc's `emit(result, browserLine)`,
+/// which falls back to a JSON dump whenever the shape isn't a browser list.
+fn browser_print(response: Value) -> Result<(), String> {
+    let data = data_of(&response);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(data).map_err(|e| e.to_string())?
+    );
+    Ok(())
+}
+
 /// `slate git …` — the original ran both verbs through the control server:
 /// the workspace checkout, `git add -A` before commit, `{hash, message}`
 /// back. Any subcommand that is not `commit` is a status read.
@@ -1497,7 +1625,7 @@ fn run_git(parsed: &slate_app::cli::Args) -> Result<(), String> {
                 .pick(&["message", "m", "msg"])
                 .or_else(|| parsed.positionals().get(2).cloned())
                 .filter(|message| !message.trim().is_empty())
-                .ok_or("git commit needs --message \"...\"")?;
+                .ok_or("invalid: git commit needs --message \"...\"")?;
             let response = request(
                 &url,
                 &token,
@@ -1574,7 +1702,7 @@ fn run_context(url: &str, token: &str, parsed: &slate_app::cli::Args) -> Result<
     let presence = request(url, token, "GET", "/presence", None).ok();
     let code = request(url, token, "GET", "/workspace/code", None).ok();
 
-    let worker_list = workers
+    let worker_list = data_of(&workers)
         .get("workers")
         .and_then(Value::as_array)
         .cloned()
@@ -1594,7 +1722,7 @@ fn run_context(url: &str, token: &str, parsed: &slate_app::cli::Args) -> Result<
         .and_then(|w| w.get("name"))
         .and_then(Value::as_str)
         .map(str::to_owned);
-    let active_dispatch = snapshot
+    let active_dispatch = data_of(&snapshot)
         .get("dispatches")
         .and_then(Value::as_array)
         .and_then(|list| {
@@ -1608,7 +1736,7 @@ fn run_context(url: &str, token: &str, parsed: &slate_app::cli::Args) -> Result<
         .and_then(|d| d.get("taskId"))
         .and_then(Value::as_str);
     let task_title = task_id.and_then(|id| {
-        snapshot
+        data_of(&snapshot)
             .get("tasks")
             .and_then(Value::as_array)
             .and_then(|list| {
@@ -1696,9 +1824,12 @@ fn run_doctor(url: &str, token: &str, parsed: &slate_app::cli::Args) -> Result<(
         .and_then(|h| h.get("version"))
         .and_then(Value::as_str);
     let drift = server_version.filter(|v| *v != version);
+    // orc's AGENT_ID = env || 'cli' — outside a terminal the identity is cli.
     let agent = env::var("SLATE_AGENT_ID")
         .ok()
-        .or_else(|| env::var("SLATE_TERMINAL_ID").ok());
+        .or_else(|| env::var("SLATE_TERMINAL_ID").ok())
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(|| "cli".to_owned());
     let workspace = presence
         .as_ref()
         .and_then(|p| p.get("workspaceDir"))
@@ -1711,7 +1842,7 @@ fn run_doctor(url: &str, token: &str, parsed: &slate_app::cli::Args) -> Result<(
                 .and_then(Value::as_str)
                 .map(str::to_owned)
         });
-    let open_runs = snapshot
+    let open_runs = data_of(&snapshot)
         .get("runs")
         .and_then(Value::as_array)
         .map(|runs| {
@@ -1720,7 +1851,7 @@ fn run_doctor(url: &str, token: &str, parsed: &slate_app::cli::Args) -> Result<(
                 .count()
         })
         .unwrap_or(0);
-    let worker_count = workers
+    let worker_count = data_of(&workers)
         .get("workers")
         .and_then(Value::as_array)
         .map_or(0, Vec::len);
@@ -1734,7 +1865,7 @@ fn run_doctor(url: &str, token: &str, parsed: &slate_app::cli::Args) -> Result<(
                 "version": version,
                 "serverVersion": server_version,
                 "drift": drift,
-                "agentId": agent,
+                "agentId": agent.as_str(),
                 "workspace": workspace,
                 "workers": worker_count,
                 "runs": open_runs,
@@ -1753,10 +1884,7 @@ fn run_doctor(url: &str, token: &str, parsed: &slate_app::cli::Args) -> Result<(
         (Some(v), _) => println!("Server: {v}"),
         (None, _) => println!("Server: ?"),
     }
-    println!(
-        "Agent: {}",
-        agent.as_deref().unwrap_or("(not inside a Slate terminal)")
-    );
+    println!("Agent: {agent}");
     println!("Workspace: {}", workspace.as_deref().unwrap_or("(none)"));
     println!("Mode: native slate CLI & orchestration");
     println!("Workers: {worker_count} | open runs: {open_runs}");
@@ -1789,16 +1917,25 @@ fn run_whoami(parsed: &slate_app::cli::Args) -> Result<(), String> {
     let terminal = env::var("SLATE_TERMINAL_ID")
         .ok()
         .unwrap_or_else(|| agent.clone());
-    let enrich = || -> Option<Value> {
-        let (url, token) = control().ok()?;
-        let workers = request(&url, &token, "GET", "/orchestration/workers", None).ok()?;
-        let snapshot = request(&url, &token, "GET", "/orchestration", None).ok()?;
-        let worker_list = workers.get("workers").and_then(Value::as_array)?;
+    // orc's whoami always hits the API — offline is an error, not a
+    // degraded answer.
+    let (url, token) = control()?;
+    let enrich = || -> Result<Value, String> {
+        let workers = request(&url, &token, "GET", "/orchestration/workers", None)?;
+        let snapshot = request(&url, &token, "GET", "/orchestration", None)?;
+        let workers_data = data_of(&workers).clone();
+        let snapshot_data = data_of(&snapshot).clone();
+        let worker_list = workers_data
+            .get("workers")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let worker_list = &worker_list;
         let self_worker = worker_list.iter().find(|w| {
             w.get("self") == Some(&Value::Bool(true))
                 || w.get("id").and_then(Value::as_str) == Some(terminal.as_str())
         });
-        let active_dispatch = snapshot
+        let active_dispatch = snapshot_data
             .get("dispatches")
             .and_then(Value::as_array)
             .and_then(|list| {
@@ -1812,7 +1949,7 @@ fn run_whoami(parsed: &slate_app::cli::Args) -> Result<(), String> {
             .and_then(|d| d.get("taskId"))
             .and_then(Value::as_str);
         let task_title = task_id.and_then(|id| {
-            snapshot
+            snapshot_data
                 .get("tasks")
                 .and_then(Value::as_array)
                 .and_then(|list| {
@@ -1822,16 +1959,16 @@ fn run_whoami(parsed: &slate_app::cli::Args) -> Result<(), String> {
                 .and_then(|t| t.get("title"))
                 .and_then(Value::as_str)
         });
-        Some(json!({
-            "agentId": agent,
+        Ok(json!({
+            "agentId": agent.as_str(),
             "name": self_worker
                 .and_then(|w| w.get("name"))
                 .and_then(Value::as_str)
-                .unwrap_or(&agent),
+                .unwrap_or(agent.as_str()),
             "terminalId": self_worker
                 .and_then(|w| w.get("id"))
                 .and_then(Value::as_str)
-                .unwrap_or(&terminal),
+                .unwrap_or(terminal.as_str()),
             "role": self_worker
                 .and_then(|w| w.get("agent"))
                 .and_then(Value::as_str)
@@ -1845,43 +1982,39 @@ fn run_whoami(parsed: &slate_app::cli::Args) -> Result<(), String> {
             "dispatchId": active_dispatch.and_then(|d| d.get("id")).and_then(Value::as_str),
         }))
     };
-    if let Some(me) = enrich() {
-        if parsed.flag("json") {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&me).map_err(|e| e.to_string())?
-            );
-        } else {
-            let name = as_str(&me, "name");
-            let terminal_id = as_str(&me, "terminalId");
-            println!(
-                "You are: {name}{}",
-                if name != terminal_id {
-                    format!(" ({terminal_id})")
-                } else {
-                    String::new()
+    let me = enrich()?;
+    if parsed.flag("json") {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&me).map_err(|e| e.to_string())?
+        );
+    } else {
+        let name = as_str(&me, "name");
+        let terminal_id = as_str(&me, "terminalId");
+        println!(
+            "You are: {name}{}",
+            if name != terminal_id {
+                format!(" ({terminal_id})")
+            } else {
+                String::new()
+            }
+        );
+        println!("Agent ID: {}", as_str(&me, "agentId"));
+        match as_str(&me, "taskId") {
+            task if !task.is_empty() => println!(
+                "Status: busy on task {task}{}",
+                match as_str(&me, "taskTitle") {
+                    "" => String::new(),
+                    title => format!(" (\"{title}\")"),
                 }
-            );
-            println!("Agent ID: {}", as_str(&me, "agentId"));
-            match as_str(&me, "taskId") {
-                task if !task.is_empty() => println!(
-                    "Status: busy on task {task}{}",
-                    match as_str(&me, "taskTitle") {
-                        "" => String::new(),
-                        title => format!(" (\"{title}\")"),
-                    }
-                ),
-                _ => println!("Status: idle"),
-            }
-            let dispatch = as_str(&me, "dispatchId");
-            if !dispatch.is_empty() {
-                println!("Dispatch ID: {dispatch}");
-            }
+            ),
+            _ => println!("Status: idle"),
         }
-        return Ok(());
+        let dispatch = as_str(&me, "dispatchId");
+        if !dispatch.is_empty() {
+            println!("Dispatch ID: {dispatch}");
+        }
     }
-    // The app is closed: identity is still ambient, as before.
-    println!("agent={agent} terminal={terminal}");
     Ok(())
 }
 
@@ -1891,27 +2024,27 @@ fn run_status(url: &str, token: &str, parsed: &slate_app::cli::Args) -> Result<(
     let snapshot = request(url, token, "GET", "/orchestration", None)?;
     let inbox = request(url, token, "GET", "/orchestration/inbox?limit=200", None)
         .unwrap_or_else(|_| json!({ "messages": [] }));
-    let runs = snapshot
+    let runs = data_of(&snapshot)
         .get("runs")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let tasks = snapshot
+    let tasks = data_of(&snapshot)
         .get("tasks")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let dispatches = snapshot
+    let dispatches = data_of(&snapshot)
         .get("dispatches")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let gates = snapshot
+    let gates = data_of(&snapshot)
         .get("gates")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let unread = inbox
+    let unread = data_of(&inbox)
         .get("messages")
         .and_then(Value::as_array)
         .map_or(0, Vec::len);
@@ -1988,26 +2121,36 @@ fn run_run_show(url: &str, token: &str, parsed: &slate_app::cli::Args) -> Result
     let id = parsed
         .pick(&["id", "run", "runId"])
         .or_else(|| parsed.positionals().get(1).cloned())
-        .ok_or("run-show needs <run-id>")?;
-    let run = request(
+        .ok_or("invalid: run-show needs <run-id>")?;
+    let single = request(
         url,
         token,
         "GET",
         &format!("/orchestration/runs/{}", encode(&id)),
         None,
-    )
-    .ok()
-    .and_then(|single| single.get("run").cloned())
-    .or_else(|| {
-        request(url, token, "GET", "/orchestration/runs", None)
-            .ok()?
-            .get("runs")?
-            .as_array()?
-            .iter()
-            .find(|r| r.get("id").and_then(Value::as_str) == Some(id.as_str()))
-            .cloned()
-    })
-    .ok_or_else(|| format!("no run \"{id}\""))?;
+    );
+    let run = match single {
+        // orc falls back to the list only when the single read 404s —
+        // every other failure (offline, timeout, 500) propagates.
+        Ok(response) => data_of(&response).get("run").cloned(),
+        Err(error) if error.starts_with("not_found:") || error.starts_with("http_404") => None,
+        Err(error) => return Err(error),
+    };
+    let run = match run {
+        Some(run) => run,
+        None => {
+            let response = request(url, token, "GET", "/orchestration/runs", None)?;
+            data_of(&response)
+                .get("runs")
+                .and_then(Value::as_array)
+                .and_then(|runs| {
+                    runs.iter()
+                        .find(|r| r.get("id").and_then(Value::as_str) == Some(id.as_str()))
+                        .cloned()
+                })
+                .ok_or_else(|| format!("not_found: no run \"{id}\""))?
+        }
+    };
     let tasks = request(
         url,
         token,
@@ -2015,7 +2158,7 @@ fn run_run_show(url: &str, token: &str, parsed: &slate_app::cli::Args) -> Result
         &format!("/orchestration/tasks?runId={}", encode(&id)),
         None,
     )?;
-    let task_list = tasks
+    let task_list = data_of(&tasks)
         .get("tasks")
         .and_then(Value::as_array)
         .cloned()
@@ -2058,47 +2201,57 @@ fn run_worker_read(url: &str, token: &str, parsed: &slate_app::cli::Args) -> Res
         .pick(&["to", "id", "dispatch", "dispatchId", "terminal"])
         .or_else(|| parsed.positionals().get(1).cloned())
         .or_else(|| env::var("SLATE_TERMINAL_ID").ok())
-        .ok_or("worker-read needs a terminal id")?;
+        .ok_or("invalid: worker-read needs a terminal id")?;
     let mut terminal_id = target.clone();
     if target.starts_with("disp-") {
-        let resolved = request(
+        let single = request(
             url,
             token,
             "GET",
             &format!("/orchestration/dispatches/{}", encode(&target)),
             None,
-        )
-        .ok()
-        .and_then(|single| {
-            single
-                .get("dispatch")?
-                .get("terminalId")?
-                .as_str()
-                .map(str::to_owned)
-        })
-        .or_else(|| {
-            request(url, token, "GET", "/orchestration/dispatches", None)
-                .ok()?
-                .get("dispatches")?
-                .as_array()?
-                .iter()
-                .find(|d| d.get("id").and_then(Value::as_str) == Some(target.as_str()))
+        );
+        let resolved = match single {
+            Ok(single) => data_of(&single)
+                .get("dispatch")
                 .and_then(|d| d.get("terminalId"))
                 .and_then(Value::as_str)
-                .map(str::to_owned)
-        });
+                .map(str::to_owned),
+            // orc rethrows anything that isn't a 404, then lists.
+            Err(error)
+                if error.starts_with("not_found:") || error.starts_with("http_404") =>
+            {
+                let list = request(url, token, "GET", "/orchestration/dispatches", None)?;
+                data_of(&list)
+                    .get("dispatches")
+                    .and_then(Value::as_array)
+                    .and_then(|dispatches| {
+                        dispatches
+                            .iter()
+                            .find(|d| {
+                                d.get("id").and_then(Value::as_str) == Some(target.as_str())
+                            })
+                            .and_then(|d| d.get("terminalId"))
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    })
+            }
+            Err(error) => return Err(error),
+        };
         match resolved {
             Some(id) => terminal_id = id,
             // An id-shaped target that resolves to nothing is still tried as
             // a terminal id, as slate.mjs does.
-            None if !is_id_like(&target) => return Err(format!("no dispatch \"{target}\"")),
+            None if !is_id_like(&target) => return Err(format!("not_found: no dispatch \"{target}\"")),
             None => {}
         }
     }
     let limit = parsed
         .pick(&["limit"])
         .or_else(|| parsed.positionals().get(2).cloned())
-        .and_then(|raw| raw.parse::<usize>().ok())
+        .and_then(|raw| raw.trim().parse::<f64>().ok())
+        .filter(|n| n.is_finite())
+        .map(|n| n.trunc().max(0.0) as usize)
         .unwrap_or(50);
     let output = request(
         url,
@@ -2107,7 +2260,7 @@ fn run_worker_read(url: &str, token: &str, parsed: &slate_app::cli::Args) -> Res
         &format!("/terminal/{}/output?full=1", encode(&terminal_id)),
         None,
     )?;
-    let text = as_str(&output, "output").to_owned();
+    let text = as_str(data_of(&output), "output").to_owned();
     let tail = if limit == 0 {
         String::new()
     } else {
@@ -2149,7 +2302,7 @@ fn lookup_sender(url: &str, token: &str, ask_id: &str) -> Option<String> {
         &format!("/orchestration/messages/{}", encode(ask_id)),
         None,
     ) {
-        if let Some(from) = single
+        if let Some(from) = data_of(&single)
             .get("message")
             .and_then(|m| m.get("from"))
             .and_then(Value::as_str)
@@ -2239,7 +2392,7 @@ fn run_check(url: &str, token: &str, parsed: &slate_app::cli::Args) -> Result<()
     let mut beat = Beat::new("inbox");
     let inbox = loop {
         let inbox = request_at(url, token, "GET", &query, None, read_timeout)?;
-        let empty = inbox
+        let empty = data_of(&inbox)
             .get("messages")
             .and_then(Value::as_array)
             .is_none_or(|messages| messages.is_empty());
@@ -2259,19 +2412,16 @@ fn run_check(url: &str, token: &str, parsed: &slate_app::cli::Args) -> Result<()
             None,
         );
     }
-    let messages = inbox
+    let messages = data_of(&inbox)
         .get("messages")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
     if parsed.flag("json") {
+        // orc emits the inbox payload verbatim under --json.
         println!(
             "{}",
-            serde_json::to_string_pretty(&json!({
-                "messages": messages,
-                "waited": wait && messages.is_empty(),
-            }))
-            .map_err(|e| e.to_string())?
+            serde_json::to_string_pretty(data_of(&inbox)).map_err(|e| e.to_string())?
         );
         return Ok(());
     }
@@ -2327,7 +2477,7 @@ fn run_ask(url: &str, token: &str, parsed: &slate_app::cli::Args) -> Result<(), 
         }
         if std::time::Instant::now() >= deadline {
             return Err(format!(
-                "no reply within {}s — the question is still pending as {ask_id}; \
+                "timeout: no reply within {}s — the question is still pending as {ask_id}; \
                  resume with: {} check --wait --types reply",
                 timeout_ms / 1_000,
                 prog_name()
@@ -2415,7 +2565,7 @@ fn tell_body(parsed: &slate_app::cli::Args) -> Result<Value, String> {
     let to = parsed
         .pick(&["to", "worker"])
         .or_else(|| positional.next().cloned())
-        .ok_or("tell needs <worker>")?;
+        .ok_or("invalid: tell needs <worker>")?;
     let text = parsed
         .pick(&["text", "message", "body"])
         .unwrap_or_else(|| positional.cloned().collect::<Vec<_>>().join(" "));
@@ -2434,9 +2584,14 @@ fn tell_body(parsed: &slate_app::cli::Args) -> Result<Value, String> {
         Vec::new()
     };
     if text.trim().is_empty() && images.is_empty() {
-        return Err("tell needs non-empty text".into());
+        return Err("invalid: tell needs non-empty text".into());
     }
-    Ok(json!({ "to": to, "text": text, "images": images }))
+    // orc's body is `{to, text, images?}` — an empty list omits the key.
+    Ok(object_body(vec![
+        ("to", Some(Value::from(to))),
+        ("text", Some(Value::from(text))),
+        ("images", (!images.is_empty()).then(|| Value::from(images))),
+    ]))
 }
 
 /// The roster line slate.mjs prints: `* ` marks your own terminal, then
@@ -2466,7 +2621,7 @@ fn format_workers(response: &Value) -> String {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as f64)
         .unwrap_or(0.0);
-    response
+    data_of(response)
         .get("workers")
         .and_then(Value::as_array)
         .map(|workers| {
@@ -2674,13 +2829,13 @@ fn encode(value: &str) -> String {
 fn parse_http_url(url: &str) -> Result<(String, u16), String> {
     let authority = url
         .strip_prefix("http://")
-        .ok_or_else(|| "SLATE_URL must use http://".to_owned())?
+        .ok_or_else(|| "invalid: SLATE_URL must use http://".to_owned())?
         .split('/')
         .next()
         .unwrap_or_default();
     let (host, port) = authority
         .rsplit_once(':')
-        .ok_or_else(|| "SLATE_URL must include a port".to_owned())?;
+        .ok_or_else(|| "invalid: SLATE_URL must include a port".to_owned())?;
     let port = port
         .parse::<u16>()
         .map_err(|error| format!("invalid control server port: {error}"))?;
