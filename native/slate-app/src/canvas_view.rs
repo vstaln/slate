@@ -509,6 +509,15 @@ pub struct CanvasView {
     // overlay. Lives here rather than in `widget.state` so file bytes
     // never enter the journal.
     pub(crate) files_preview: Option<crate::views_files::FilesPreview>,
+    // fix-browser: the omnibox's caret and selection — `browser_address`
+    // edits at `browser_cursor`; `browser_sel` is the selection's anchor
+    // (byte offsets on char boundaries, `None` = a collapsed caret). The DOM
+    // input's model: `anchor..cursor` is the highlighted range.
+    pub(crate) browser_cursor: usize,
+    pub(crate) browser_sel: Option<usize>,
+    // fix-browser: App.tsx's canvas-wide `window.open` budget — at most 3
+    // popups per sliding 5s, on top of webview.rs's per-webview gate.
+    popup_opens: std::collections::VecDeque<Instant>,
 }
 
 /// A `/term <command>` line waiting to be typed into a fresh PTY.
@@ -1016,6 +1025,10 @@ impl CanvasView {
             // fix-files:
             files_editing: None,
             files_preview: None,
+            // fix-browser:
+            browser_cursor: 0,
+            browser_sel: None,
+            popup_opens: std::collections::VecDeque::new(),
         };
         view.snapshots = view.manager.snapshots();
         for pending in relaunch {
@@ -1298,43 +1311,95 @@ impl CanvasView {
                         // this mailbox — page-initiated navigations journal
                         // the same `set` the omnibox writes, `window.open`
                         // spawns a fresh browser widget (browser:onOpenTab).
-                        for event in crate::webview::drain_events() {
+                        for event in slate_app::webview::drain_events() {
                             match event {
-                                crate::webview::WebViewEvent::Navigated { widget, url } => {
+                                slate_app::webview::WebViewEvent::Navigated { widget, url } => {
                                     view.widget_command(
                                         &widget,
                                         json!({ "op": "set", "state": { "url": url } }),
                                         cx,
                                     );
                                 }
-                                crate::webview::WebViewEvent::OpenTab { url, .. } => {
-                                    let id = view.fresh_id("browser");
-                                    let zoom = view.canvas.camera.zoom;
-                                    let center = Pos2::new(
-                                        ((view.viewport.x as f64 / 2.0 - view.canvas.camera.x)
-                                            / zoom) as f32,
-                                        ((view.viewport.y as f64 / 2.0 - view.canvas.camera.y)
-                                            / zoom) as f32,
-                                    );
-                                    view.create_widget_at(&id, "browser", "Browser", center);
-                                    view.widget_command(
-                                        &id,
-                                        json!({ "op": "browser_navigate", "url": url }),
-                                        cx,
-                                    );
+                                slate_app::webview::WebViewEvent::OpenTab { url, .. } => {
+                                    // App.tsx's app-wide burst cap — at most
+                                    // 3 `window.open`s per sliding 5s across
+                                    // every browser, on top of webview.rs's
+                                    // per-page 350ms dedup and 5/10s budget.
+                                    // Dropping here is what kept a popup
+                                    // loop from minting MAX_WIDGETS widgets.
+                                    let now = Instant::now();
+                                    while view
+                                        .popup_opens
+                                        .front()
+                                        .is_some_and(|stamp| {
+                                            now.duration_since(*stamp)
+                                                > std::time::Duration::from_secs(5)
+                                        })
+                                    {
+                                        view.popup_opens.pop_front();
+                                    }
+                                    if view.popup_opens.len() < 3 {
+                                        view.popup_opens.push_back(now);
+                                        let id = view.fresh_id("browser");
+                                        let zoom = view.canvas.camera.zoom;
+                                        let center = Pos2::new(
+                                            ((view.viewport.x as f64 / 2.0
+                                                - view.canvas.camera.x)
+                                                / zoom) as f32,
+                                            ((view.viewport.y as f64 / 2.0
+                                                - view.canvas.camera.y)
+                                                / zoom) as f32,
+                                        );
+                                        view.create_widget_at(
+                                            &id, "browser", "Browser", center,
+                                        );
+                                        view.widget_command(
+                                            &id,
+                                            json!({ "op": "browser_navigate", "url": url }),
+                                            cx,
+                                        );
+                                    }
+                                }
+                                slate_app::webview::WebViewEvent::Loaded { widget } => {
+                                    // did-stop-loading reset
+                                    // `retryCountRef` — a clean load
+                                    // re-arms the error banner's Retry.
+                                    // A load that ended in `status.error`
+                                    // keeps the counter so the 3-try cap
+                                    // still engages.
+                                    let clean = slate_app::webview::status_for(&widget)
+                                        .map(|status| status.error.is_none())
+                                        .unwrap_or(true);
+                                    let counted = view
+                                        .canvas
+                                        .widgets
+                                        .get(&widget)
+                                        .and_then(|widget| widget.state.as_ref())
+                                        .and_then(|state| state.get("retry"))
+                                        .and_then(Value::as_u64)
+                                        .unwrap_or(0);
+                                    if clean && counted > 0 {
+                                        view.widget_command(
+                                            &widget,
+                                            json!({ "op": "set", "state": { "retry": 0 } }),
+                                            cx,
+                                        );
+                                    }
                                 }
                             }
                         }
                         // Journal-side removals never run close_widget —
                         // drop webviews whose widgets vanished, and clear
                         // an omnibox edit whose widget is gone.
-                        crate::webview::gc(
+                        slate_app::webview::gc(
                             &view.canvas.widgets.keys().cloned().collect(),
                         );
                         if let Some(editing) = &view.browser_editing {
                             if !view.canvas.widgets.contains_key(editing) {
                                 view.browser_editing = None;
                                 view.browser_address.clear();
+                                view.browser_cursor = 0;
+                                view.browser_sel = None;
                             }
                         }
                         // Renames land on the widget title and the journal —
@@ -3055,10 +3120,12 @@ impl CanvasView {
         self.startup_notice.remove(id);
         // Browser widgets own a native webview — it dies with the widget.
         // A no-op for every other kind (no key registered).
-        crate::webview::remove_widget(id);
+        slate_app::webview::remove_widget(id);
         if self.browser_editing.as_deref() == Some(id) {
             self.browser_editing = None;
             self.browser_address.clear();
+            self.browser_cursor = 0;
+            self.browser_sel = None;
         }
         // `vn` — widget dispose dropped the localStorage agent keys too.
         if self.agent_picks.launched.contains_key(id) || self.agent_picks.select.contains_key(id) {
@@ -3791,16 +3858,18 @@ impl CanvasView {
                 if let Some(raw) = action.get("url").and_then(Value::as_str) {
                     match slate_app::browser::to_navigation_url(raw) {
                         Some(url) => {
+                            // `navigate()` also ran `setMedia(null)` — a
+                            // submit leaves the media viewer for the page.
                             self.widget_command(
                                 id,
-                                json!({ "op": "set", "state": { "url": url } }),
+                                json!({ "op": "set", "state": { "url": url, "media": Value::Null } }),
                                 cx,
                             );
-                            crate::webview::navigate(id, &url);
-                            crate::webview::set_error(id, None);
+                            slate_app::webview::navigate(id, &url);
+                            slate_app::webview::set_error(id, None);
                         }
                         None => {
-                            crate::webview::set_error(
+                            slate_app::webview::set_error(
                                 id,
                                 Some(format!("invalid address: {raw}")),
                             );
@@ -3809,30 +3878,79 @@ impl CanvasView {
                 }
             }
             Some("browser_nav") => match action.get("dir").and_then(Value::as_str) {
-                Some("back") => crate::webview::go_back(id),
-                Some("forward") => crate::webview::go_forward(id),
-                Some("reload") => crate::webview::reload(id),
-                Some("stop") => crate::webview::stop(id),
+                Some("back") => slate_app::webview::go_back(id),
+                Some("forward") => slate_app::webview::go_forward(id),
+                Some("reload") => slate_app::webview::reload(id),
+                Some("stop") => slate_app::webview::stop(id),
                 _ => {}
             },
             // The error banner's Home — back to the landing URL. The pane
             // stops mounting the element there, so drop the native view.
+            // The original also cleared the retry counter and any media.
             Some("browser_home") => {
                 self.widget_command(
                     id,
-                    json!({ "op": "set", "state": { "url": slate_app::browser::HOME_URL } }),
+                    json!({ "op": "set", "state": { "url": slate_app::browser::HOME_URL, "media": Value::Null, "retry": 0 } }),
                     cx,
                 );
-                crate::webview::remove_widget(id);
+                slate_app::webview::remove_widget(id);
+            }
+            // The error banner's Retry — `retryCountRef.current < 3` gates
+            // the button; the count is journaled so the cap survives a
+            // refold, and `Loaded` resets it after a clean load.
+            Some("browser_retry") => {
+                let retries = self
+                    .canvas
+                    .widgets
+                    .get(id)
+                    .and_then(|widget| widget.state.as_ref())
+                    .and_then(|state| state.get("retry"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                self.widget_command(
+                    id,
+                    json!({ "op": "set", "state": { "retry": retries + 1 } }),
+                    cx,
+                );
+                slate_app::webview::set_error(id, None);
+                slate_app::webview::reload(id);
+            }
+            // MediaViewer's close — `setMedia(null)`. The journaled
+            // `state.media` clears, `widget_url` falls back to the page URL,
+            // and the element's `maybe_sync_url` loads it on the next paint.
+            Some("browser_media_close") => {
+                self.widget_command(
+                    id,
+                    json!({ "op": "set", "state": { "media": Value::Null } }),
+                    cx,
+                );
+                slate_app::webview::set_error(id, None);
+            }
+            // The doc card's Open — `window.api.fs.openPath(path)` on the
+            // stored path (the media store sits outside the files jail, so
+            // no jail check — the shell's had none either).
+            Some("browser_media_open") => {
+                if let Some(path) = action.get("path").and_then(Value::as_str) {
+                    if let Err(error) =
+                        std::process::Command::new("xdg-open").arg(path).spawn()
+                    {
+                        self.notice(format!("open {path}: {error}"));
+                    }
+                }
             }
             // Omnibox focus tracking — carried as a pane op so the buffer
-            // lives on CanvasView next to `rename_buffer`.
+            // lives on CanvasView next to `rename_buffer`. Entering edit
+            // selects the whole value, the DOM input's `e.target.select()`.
             Some("browser_edit") => {
                 if action.get("editing").and_then(Value::as_bool).unwrap_or(false) {
                     self.browser_editing = Some(id.to_owned());
+                    self.browser_cursor = self.browser_address.len();
+                    self.browser_sel = Some(0);
                 } else if self.browser_editing.as_deref() == Some(id) {
                     self.browser_editing = None;
                     self.browser_address.clear();
+                    self.browser_cursor = 0;
+                    self.browser_sel = None;
                 }
             }
             _ => {}
@@ -4702,6 +4820,10 @@ fn widget_body(
     // mid-render would re-borrow the view and panic.
     browser_editing: Option<&str>,
     browser_address: &str,
+    // fix-browser: the omnibox's caret and selection anchor — the DOM
+    // input's `selectionStart`/`selectionEnd` pair for the buffer.
+    browser_cursor: usize,
+    browser_sel: Option<usize>,
     // The canvas region free of floating chrome — the X11 webview child is
     // not clipped by GPUI, so its bounds are intersected with this rect (and
     // the paint-time content mask) before they're handed to wry.
@@ -4881,6 +5003,8 @@ fn widget_body(
                 zoom,
                 browser_editing,
                 browser_address,
+                browser_cursor,
+                browser_sel,
                 browser_clip,
                 cx,
             ))
@@ -5815,7 +5939,7 @@ impl Render for CanvasView {
                 // webview child would keep its stale on-screen bounds —
                 // hide it here, before the skip.
                 if widget.kind.as_deref() == Some("browser") {
-                    crate::webview::hide(&widget.id);
+                    slate_app::webview::hide(&widget.id);
                 }
                 continue;
             }
@@ -6318,6 +6442,8 @@ impl Render for CanvasView {
                         self.prefs.terminals_flipped,
                         self.browser_editing.as_deref(),
                         &self.browser_address,
+                        self.browser_cursor,
+                        self.browser_sel,
                         clip,
                         &self.files_root(),
                         // fix-files:
@@ -8004,25 +8130,48 @@ impl CanvasView {
         }
 
         // The browser omnibox owns the keyboard while it is editing — the
-        // same shape as rename: Enter navigates, Escape reverts, Backspace
-        // edits, printable keys append.
+        // same shape as rename plus the DOM input's editing keys: Enter
+        // navigates, Escape reverts, arrows/Home/End move the caret (⇧
+        // extends the selection), ⌘/Ctrl+A selects all, ⌘/Ctrl+V pastes,
+        // printable keys replace the selection at the caret.
         if let Some(wid) = self.browser_editing.clone() {
+            let select_all = (mods.control || mods.platform) && keystroke.key == "a";
+            let paste = (mods.control || mods.platform) && keystroke.key == "v";
             match keystroke.key.as_str() {
                 "escape" => {
                     self.browser_editing = None;
                     self.browser_address.clear();
+                    self.browser_cursor = 0;
+                    self.browser_sel = None;
                 }
                 "enter" => {
                     let url = std::mem::take(&mut self.browser_address);
                     self.browser_editing = None;
+                    self.browser_cursor = 0;
+                    self.browser_sel = None;
                     self.widget_command(
                         &wid,
                         json!({ "op": "browser_navigate", "url": url }),
                         cx,
                     );
                 }
-                "backspace" => {
-                    self.browser_address.pop();
+                "backspace" => self.browser_edit_backspace(),
+                "delete" => self.browser_edit_delete(),
+                "left" => self.browser_edit_move(false, mods.shift),
+                "right" => self.browser_edit_move(true, mods.shift),
+                "home" => self.browser_edit_edge(false, mods.shift),
+                "end" => self.browser_edit_edge(true, mods.shift),
+                _ if select_all => {
+                    // `e.target.select()` — the whole buffer highlighted.
+                    self.browser_sel = Some(0);
+                    self.browser_cursor = self.browser_address.len();
+                }
+                _ if paste => {
+                    if let Some(item) = cx.read_from_clipboard() {
+                        if let Some(text) = item.text() {
+                            self.browser_edit_insert(&text);
+                        }
+                    }
                 }
                 _ => {
                     if !mods.control && !mods.alt && !mods.platform {
@@ -8036,7 +8185,7 @@ impl CanvasView {
                                     _ => None,
                                 });
                         if let Some(text) = text {
-                            self.browser_address.push_str(&text);
+                            self.browser_edit_insert(&text);
                         }
                     }
                 }
@@ -8610,5 +8759,129 @@ impl CanvasView {
         if self.files_editing.as_ref().map(|e| e.widget_id()) == Some(id) {
             self.files_editing = None;
         }
+    }
+
+    // fix-browser: the omnibox's DOM-input editing model — a caret
+    // (`browser_cursor`) plus an optional selection anchor (`browser_sel`),
+    // byte offsets always snapped to char boundaries.
+
+    /// The highlighted range `(lo, hi)`, or `None` for a bare caret.
+    fn browser_edit_selection(&self) -> Option<(usize, usize)> {
+        let anchor = self.browser_sel?;
+        if anchor == self.browser_cursor {
+            return None;
+        }
+        Some((
+            anchor.min(self.browser_cursor),
+            anchor.max(self.browser_cursor),
+        ))
+    }
+
+    /// Snap a byte offset to a char boundary — `replace_range` demands it.
+    fn browser_edit_snap(&self, mut at: usize) -> usize {
+        at = at.min(self.browser_address.len());
+        while at > 0 && !self.browser_address.is_char_boundary(at) {
+            at -= 1;
+        }
+        at
+    }
+
+    fn browser_edit_next(&self, at: usize) -> usize {
+        self.browser_address[at..]
+            .chars()
+            .next()
+            .map(|c| at + c.len_utf8())
+            .unwrap_or(at)
+    }
+
+    fn browser_edit_prev(&self, at: usize) -> usize {
+        self.browser_address[..at]
+            .chars()
+            .next_back()
+            .map(|c| at - c.len_utf8())
+            .unwrap_or(at)
+    }
+
+    /// Arrow keys: a bare caret steps a char; a selection collapses to the
+    /// arrow's edge (the DOM input's unmodified-arrow rule). ⇧ keeps the
+    /// anchor and moves the caret — the selection grows.
+    fn browser_edit_move(&mut self, forward: bool, shift: bool) {
+        self.browser_cursor = self.browser_edit_snap(self.browser_cursor);
+        if shift {
+            if self.browser_sel.is_none() {
+                self.browser_sel = Some(self.browser_cursor);
+            }
+        } else if let Some((lo, hi)) = self.browser_edit_selection() {
+            self.browser_cursor = if forward { hi } else { lo };
+            self.browser_sel = None;
+            return;
+        } else {
+            self.browser_sel = None;
+        }
+        self.browser_cursor = if forward {
+            self.browser_edit_next(self.browser_cursor)
+        } else {
+            self.browser_edit_prev(self.browser_cursor)
+        };
+    }
+
+    /// Home/End — caret to the buffer edge, ⇧ selecting to it.
+    fn browser_edit_edge(&mut self, end: bool, shift: bool) {
+        self.browser_cursor = self.browser_edit_snap(self.browser_cursor);
+        if shift {
+            if self.browser_sel.is_none() {
+                self.browser_sel = Some(self.browser_cursor);
+            }
+        } else {
+            self.browser_sel = None;
+        }
+        self.browser_cursor = if end {
+            self.browser_address.len()
+        } else {
+            0
+        };
+    }
+
+    /// Typed/pasted text replaces the selection (or inserts at the caret).
+    fn browser_edit_insert(&mut self, text: &str) {
+        let (lo, hi) = self.browser_edit_selection().unwrap_or_else(|| {
+            let at = self.browser_edit_snap(self.browser_cursor);
+            (at, at)
+        });
+        self.browser_address.replace_range(lo..hi, text);
+        self.browser_cursor = lo + text.len();
+        self.browser_sel = None;
+    }
+
+    /// Backspace — the selection first, else the char before the caret.
+    fn browser_edit_backspace(&mut self) {
+        if let Some((lo, hi)) = self.browser_edit_selection() {
+            self.browser_address.replace_range(lo..hi, "");
+            self.browser_cursor = lo;
+        } else {
+            let at = self.browser_edit_snap(self.browser_cursor);
+            let prev = self.browser_edit_prev(at);
+            if prev != at {
+                self.browser_address.replace_range(prev..at, "");
+            }
+            self.browser_cursor = prev;
+        }
+        self.browser_sel = None;
+    }
+
+    /// Delete — the selection first, else the char after the caret.
+    fn browser_edit_delete(&mut self) {
+        if let Some((lo, hi)) = self.browser_edit_selection() {
+            self.browser_address.replace_range(lo..hi, "");
+            self.browser_cursor = lo;
+        } else {
+            let at = self.browser_edit_snap(self.browser_cursor);
+            let next = self.browser_edit_next(at);
+            if next != at {
+                self.browser_address.replace_range(at..next, "");
+            }
+            self.browser_cursor = at;
+        }
+        self.browser_sel = None;
     }
 }
