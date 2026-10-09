@@ -3201,18 +3201,35 @@ fn locks_route(request: &Request, segments: &[String], deps: &mut RouteDeps<'_>)
 
 // --- browser ---------------------------------------------------------------
 
-/// `routeBrowser` for a build with no webview: the list is honest (canvas
-/// widgets that carry `kind: "browser"`, plus nothing else), and every verb
-/// that needs a renderer answers like the original did without `broadcast` —
-/// a 503 rather than a pretend-opened tab.
+/// `routeBrowser` — the control socket's browser surface. `GET /browser`
+/// lists the canvas browser widgets (the shell's Code-surface browsers and
+/// real-Chrome tabs never existed in the native build); `POST /browser/open`
+/// mints a `kind: "browser"` widget at the camera-derived spot and navigates
+/// it; the per-id verbs run `BrowserAgentAction`s over the wry eval bridge —
+/// the same `{ok:true,data}`/`{error,code}` answers the broadcast version
+/// produced, including the checkout guard on navigation.
 fn browser_route(request: &Request, segments: &[String], deps: &mut RouteDeps<'_>) -> Response {
     let method = request.method.as_str();
-    let env = match environment(deps, "/browser", "browser control needs the running app") {
-        Ok(env) => env,
-        Err(response) => return response,
-    };
+    let now = deps.now;
+    {
+        let env = match environment(deps, "/browser", "browser control needs the running app") {
+            Ok(env) => env,
+            Err(response) => return response,
+        };
+        // `registerHttpAgent` + `locks.heartbeat` ran before every branch.
+        let agent_id = match register_http_agent(request) {
+            Ok(agent_id) => agent_id,
+            Err(response) => return response,
+        };
+        env.locks().heartbeat(&agent_id, None, now);
+    }
+
     match (method, segments.get(1).map(String::as_str)) {
         ("GET", None) => {
+            let env = match environment(deps, "GET /browser", "the list folds the journal") {
+                Ok(env) => env,
+                Err(response) => return response,
+            };
             let canvas = match folded_canvas(env) {
                 Ok(canvas) => canvas,
                 Err(response) => return response,
@@ -3236,18 +3253,355 @@ fn browser_route(request: &Request, segments: &[String], deps: &mut RouteDeps<'_
                 }),
             )
         }
-        ("POST", Some("open")) => Response::json(
-            503,
-            json!({ "error": "browser control is unavailable in the native build", "code": "failed" }),
-        ),
-        _ => {
-            if segments.len() < 3 || !matches!(method, "POST" | "GET") {
-                return not_found("no such browser route");
+        ("POST", Some("open")) if segments.len() == 2 => browser_open(request, deps),
+        _ => browser_widget_action(request, segments, deps),
+    }
+}
+
+/// Merge a patch into a browser widget's journaled `state` — the `set` op's
+/// control-socket spelling: the shell persisted browser state in
+/// `localStorage`, here it is `widget.state` via `widget.update`.
+fn journal_browser_state(
+    deps: &mut RouteDeps<'_>,
+    request: &Request,
+    id: &str,
+    patch: Value,
+) -> Result<(), Response> {
+    let mut state = {
+        let env = environment(deps, "/browser", "browser state commits to the journal")?;
+        let canvas = folded_canvas(env)?;
+        canvas
+            .widgets
+            .get(id)
+            .and_then(|widget| widget.state.clone())
+            .unwrap_or_else(|| json!({}))
+    };
+    if let (Some(dst), Some(src)) = (state.as_object_mut(), patch.as_object()) {
+        for (key, value) in src {
+            dst.insert(key.clone(), value.clone());
+        }
+    }
+    journal_commit(
+        deps,
+        request,
+        "widget.update",
+        &format!("widget:{id}"),
+        json!({ "state": state }),
+        "/browser",
+    )?;
+    Ok(())
+}
+
+/// `POST /browser/open` — canvas surface only: the `chrome` (real browser)
+/// and `code` (Code-workspace webview) surfaces have no native counterpart
+/// and answer like the original's missing `broadcast`. The x/y math is the
+/// original's camera placement verbatim.
+fn browser_open(request: &Request, deps: &mut RouteDeps<'_>) -> Response {
+    // `body.url === undefined` distinguishes "absent" from null, which
+    // browserNavigationUrl then rejects — keep both branches.
+    let target_url = match request.body.get("url") {
+        None => None,
+        Some(value) => match value
+            .as_str()
+            .and_then(crate::browser::browser_navigation_url)
+        {
+            Some(url) => Some(url),
+            None => {
+                return invalid("url must be a valid http(s) address; localhost is supported")
             }
-            Response::json(
-                503,
-                json!({ "error": "browser control is unavailable in the native build", "code": "failed" }),
-            )
+        },
+    };
+    if target_url
+        .as_deref()
+        .map(crate::browser::is_protected_checkout_url)
+        .unwrap_or(false)
+    {
+        return invalid("checkout navigation is disabled");
+    }
+    if let Some(surface) = request.body.get("surface") {
+        let known = surface
+            .as_str()
+            .map(|s| matches!(s, "chrome" | "code" | "canvas"))
+            .unwrap_or(false);
+        if !known {
+            return invalid("surface must be \"chrome\", \"code\" or \"canvas\"");
+        }
+    }
+    // The shell defaulted to `chrome` — real Chrome over puppeteer — with
+    // `code` for Code agents. The canvas widget is the only surface this
+    // build can serve, so it is the default; explicit others get the 503 the
+    // missing broadcast produced.
+    let surface = request
+        .body
+        .get("surface")
+        .and_then(Value::as_str)
+        .unwrap_or("canvas");
+    if surface != "canvas" {
+        return Response::json(
+            503,
+            json!({
+                "error": format!("browser surface \"{surface}\" is unavailable in the native build"),
+                "code": "failed",
+            }),
+        );
+    }
+    let title = request
+        .body
+        .get("title")
+        .and_then(Value::as_str)
+        .map(|title| title.trim().chars().take(120).collect::<String>())
+        .filter(|title| !title.is_empty())
+        .unwrap_or_else(|| "Browser".to_owned());
+    // `const { camera } = canvas.snapshot()` — the spawn point is a fixed
+    // screen offset mapped through the zoom, stacked above the top widget.
+    let (x, y, z) = {
+        let env = match environment(
+            deps,
+            "POST /browser/open",
+            "creating a widget commits to the journal",
+        ) {
+            Ok(env) => env,
+            Err(response) => return response,
+        };
+        let canvas = match folded_canvas(env) {
+            Ok(canvas) => canvas,
+            Err(response) => return response,
+        };
+        let zoom = canvas.camera.zoom.max(0.1);
+        (
+            (-canvas.camera.x + 100.0) / zoom,
+            (-canvas.camera.y + 105.0) / zoom,
+            canvas
+                .widgets
+                .values()
+                .map(|widget| widget.z)
+                .fold(0.0, f64::max)
+                + 1.0,
+        )
+    };
+    let id = format!(
+        "browser-{}-{}",
+        deps.now,
+        &uuid::Uuid::new_v4().simple().to_string()[..5]
+    );
+    // `widgetType("browser").defaultSize` — 720×480 like `POST /widgets`.
+    let payload = json!({
+        "id": id, "title": title, "kind": "browser",
+        "x": x, "y": y, "w": 720.0, "h": 480.0, "z": z,
+        "maximized": false,
+    });
+    if let Err(response) = journal_commit(
+        deps,
+        request,
+        "widget.create",
+        "widget:new",
+        payload,
+        "POST /browser/open",
+    ) {
+        return response;
+    }
+    let Some(url) = target_url else {
+        return Response::json(
+            201,
+            json!({ "ok": true, "data": { "id": id, "title": title, "surface": "canvas" } }),
+        );
+    };
+    // `requestBrowserAgentAction(navigate)` — journal `state.url` first so a
+    // not-yet-mounted webview loads the target on first paint, then drive
+    // the real page load and await it like the original's 45s promise.
+    if let Err(response) =
+        journal_browser_state(deps, request, &id, json!({ "url": url }))
+    {
+        return response;
+    }
+    let action = crate::browser::BrowserAgentAction::Navigate { url: url.clone() };
+    match crate::webview::agent_action(&id, &action) {
+        Ok(_) => Response::json(
+            201,
+            json!({
+                "ok": true,
+                "data": { "id": id, "title": title, "surface": "canvas", "url": url },
+            }),
+        ),
+        Err(error) => Response::json(
+            502,
+            json!({ "error": error, "code": "failed", "data": { "id": id } }),
+        ),
+    }
+}
+
+/// `String(body.x ?? '')` — JS coerces numbers and bools where a strict
+/// `as_str` would not; the regex validation after it rejects everything else.
+fn js_coerced_string(value: Option<&Value>) -> String {
+    match value {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Number(n)) => n.to_string(),
+        Some(Value::Bool(b)) => b.to_string(),
+        _ => String::new(),
+    }
+}
+
+/// `/^\d{1,3}$/` plus the 1–100 range — `assertRefInRange`.
+fn parse_ref(raw: &str) -> Option<u32> {
+    if raw.is_empty() || raw.len() > 3 || !raw.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let value = raw.parse::<u32>().ok()?;
+    (1..=100).contains(&value).then_some(value)
+}
+
+/// The per-widget verbs — `POST /browser/{id}/{action}` and the GET
+/// `snapshot` — validated exactly as `routeBrowser` validated them.
+fn browser_widget_action(
+    request: &Request,
+    segments: &[String],
+    deps: &mut RouteDeps<'_>,
+) -> Response {
+    let method = request.method.as_str();
+    if segments.len() < 3 || !matches!(method, "POST" | "GET") {
+        return not_found("no such browser route");
+    }
+    let raw_id = segments[1].as_str();
+    if raw_id.is_empty()
+        || raw_id.len() > 128
+        || !raw_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-'))
+    {
+        return invalid("invalid browser widget id");
+    }
+    {
+        let env = match environment(
+            deps,
+            "/browser/{id}",
+            "browser actions need the running app",
+        ) {
+            Ok(env) => env,
+            Err(response) => return response,
+        };
+        let canvas = match folded_canvas(env) {
+            Ok(canvas) => canvas,
+            Err(response) => return response,
+        };
+        let is_browser = canvas
+            .widgets
+            .get(raw_id)
+            .map(|widget| widget.kind.as_deref() == Some("browser"))
+            .unwrap_or(false);
+        if !is_browser {
+            return not_found(format!("browser widget {raw_id} not found"));
+        }
+    }
+
+    use crate::browser::BrowserAgentAction as Action;
+    let action = if segments[2] == "snapshot" && method == "GET" && segments.len() == 3 {
+        Action::Snapshot
+    } else if method == "POST" && segments.len() == 3 {
+        match segments[2].as_str() {
+            "navigate" => {
+                let Some(url) = request
+                    .text("url")
+                    .and_then(crate::browser::browser_navigation_url)
+                else {
+                    return invalid(
+                        "url must be a valid http(s) address; localhost is supported",
+                    );
+                };
+                if crate::browser::is_protected_checkout_url(&url) {
+                    return invalid("checkout navigation is disabled");
+                }
+                Action::Navigate { url }
+            }
+            "click" | "fill" | "select" => {
+                let Some(ref_index) = parse_ref(&js_coerced_string(request.body.get("ref")))
+                else {
+                    return invalid("ref must be a number from 1 to 100");
+                };
+                if segments[2] == "click" {
+                    Action::Click { ref_index }
+                } else {
+                    let Some(value) = request.text("value") else {
+                        return invalid("value must be a string up to 4000 characters");
+                    };
+                    if value.chars().count() > 4000 {
+                        return invalid("value must be a string up to 4000 characters");
+                    }
+                    if segments[2] == "select" {
+                        Action::Select {
+                            ref_index,
+                            value: value.to_owned(),
+                        }
+                    } else {
+                        Action::Fill {
+                            ref_index,
+                            value: value.to_owned(),
+                        }
+                    }
+                }
+            }
+            "press" => {
+                let key = js_coerced_string(request.body.get("key"));
+                if !crate::browser::SUPPORTED_PRESS_KEYS.contains(&key.as_str()) {
+                    return invalid("unsupported key");
+                }
+                let ref_index = match request.body.get("ref") {
+                    None => None,
+                    Some(_) => match parse_ref(&js_coerced_string(request.body.get("ref"))) {
+                        Some(value) => Some(value),
+                        None => return invalid("ref must be a number from 1 to 100"),
+                    },
+                };
+                Action::Press { key, ref_index }
+            }
+            "scroll" => {
+                // `Number(body.pixels ?? 600)` — strings parse, null defaults.
+                let pixels = match request.body.get("pixels") {
+                    None | Some(Value::Null) => 600.0,
+                    Some(Value::Number(n)) => n.as_f64().unwrap_or(f64::NAN),
+                    Some(Value::Bool(b)) => {
+                        if *b {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    }
+                    Some(Value::String(s)) => {
+                        s.trim().parse::<f64>().unwrap_or(f64::NAN)
+                    }
+                    Some(_) => f64::NAN,
+                };
+                if !pixels.is_finite() {
+                    return invalid("pixels must be a number");
+                }
+                Action::Scroll {
+                    pixels: pixels.clamp(-1200.0, 1200.0),
+                }
+            }
+            _ => return not_found("unknown browser action"),
+        }
+    } else {
+        return not_found("no such browser route");
+    };
+
+    // `navigate()`'s `setUrl` persisted the target — the journaled
+    // `state.url` is the equivalent, and it doubles as the load directive
+    // for a webview that has not been created yet. `setMedia(null)` rides
+    // the same write.
+    if let Action::Navigate { url } = &action {
+        if let Err(response) = journal_browser_state(
+            deps,
+            request,
+            raw_id,
+            json!({ "url": url, "media": Value::Null }),
+        ) {
+            return response;
+        }
+    }
+
+    match crate::webview::agent_action(raw_id, &action) {
+        Ok(result) => Response::json(200, json!({ "ok": true, "data": result })),
+        Err(error) => {
+            Response::json(502, json!({ "error": error, "code": "failed" }))
         }
     }
 }

@@ -42,8 +42,10 @@ pub mod theme;
 pub mod ui_preferences;
 pub mod versioned;
 pub mod workspace;
-// The vendored wry element lived behind the `webview` feature, which was
-// never part of the default build and pinned gtk 0.18, deadlocking the dep
-// resolver against upstream gpui. The Browser tab renders a placeholder.
+// The wry webview element (X11 child / Wayland window, the agent-eval
+// transport) — on Linux it builds against the target-gated gtk/wry deps,
+// elsewhere it compiles to no-ops. Moved from the binary into the lib so
+// `http::browser_route` can drive it from the control socket.
+pub mod webview;
 
 pub mod platform;

@@ -88,6 +88,9 @@ pub enum WebViewEvent {
     /// `window.open` — the shell's `browser:onOpenTab`: the renderer spawned
     /// a centered browser widget for it (subject to its own 3/5s budget).
     OpenTab { widget: String, url: String },
+    /// did-stop-loading: the original reset `retryCountRef` here, re-arming
+    /// the error banner's Retry — the canvas folds it into `state.retry`.
+    Loaded { widget: String },
 }
 
 static EVENTS: std::sync::LazyLock<Mutex<Vec<WebViewEvent>>> =
@@ -299,6 +302,215 @@ pub fn gc(live_widgets: &std::collections::HashSet<String>) {
     }
 }
 
+// --- agent actions -----------------------------------------------------------
+//
+// `browserAutomation.ts`/`requestBrowserAgentAction`: the control route handed
+// an action to the widget's own JS bridge and awaited `browser:respond`.
+// Here the bridge is `evaluate_script_with_callback` on the webview's GTK
+// thread; the respond channel is a oneshot `mpsc` the caller blocks on. The
+// same bookkeeping survives: `busyWidgets` (one action per browser at a time),
+// the navigate/others timeouts (45s/20s), and the 96KB response cap.
+
+/// `busyWidgets` — a second action on one widget fails fast instead of
+/// queueing behind the page.
+static BUSY_WIDGETS: std::sync::LazyLock<Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+
+/// requestId → responder, the `pending` map the GTK-thread eval callback
+/// resolves. Values are the eval's raw JSON string or a ready-made error.
+static EVAL_PENDING: std::sync::LazyLock<
+    Mutex<HashMap<u64, std::sync::mpsc::Sender<Result<String, String>>>>,
+> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+static NEXT_EVAL_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// `MAX_RESPONSE_BYTES` — a page bigger than this answers with the same
+/// "request a smaller snapshot" message the renderer enforced.
+const MAX_RESPONSE_BYTES: usize = 96 * 1024;
+
+/// A native webview exists for this widget — the `!view` check the original
+/// threw `'browser page is not ready'` on. A home/culled widget has no
+/// webview until the pane mounts one.
+pub fn exists(widget: &str) -> bool {
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    {
+        lock(&KEY_TO_ID)
+            .get(widget)
+            .copied()
+            .map(is_created)
+            .unwrap_or(false)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+    {
+        let _ = widget;
+        false
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn is_created(id: usize) -> bool {
+    if is_wayland() {
+        gtk_thread::is_created(id)
+    } else {
+        x11_child_thread::is_created(id)
+    }
+}
+
+/// The GTK-side counterpart of `resolveBrowserAgentAction` — the eval
+/// callback lands here, then wakes the blocked caller.
+fn resolve_eval(request_id: u64, result: Result<String, String>) {
+    let sender = lock(&EVAL_PENDING).remove(&request_id);
+    if let Some(sender) = sender {
+        let _ = sender.send(result);
+    }
+}
+
+/// `view.executeJavaScript(script)` with the respond channel: sends the
+/// wrapped script to the widget's webview and waits for the JSON string back.
+/// The script must self-report errors (see `browser::BrowserAgentAction`'s
+/// try/catch envelope) — WebKitGTK gives no exception text.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn eval_script(
+    widget: &str,
+    script: &str,
+    timeout: std::time::Duration,
+) -> Result<String, String> {
+    let id = key_for(widget);
+    let request_id = NEXT_EVAL_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    lock(&EVAL_PENDING).insert(request_id, sender);
+    if is_wayland() {
+        gtk_thread::send(gtk_thread::GtkMessage::Eval {
+            id,
+            script: script.to_owned(),
+            request_id,
+        });
+    } else {
+        x11_child_thread::send(x11_child_thread::ChildMessage::Eval {
+            id,
+            script: script.to_owned(),
+            request_id,
+        });
+    }
+    let result = receiver
+        .recv_timeout(timeout)
+        .unwrap_or_else(|_| Err("browser action timed out".to_owned()));
+    lock(&EVAL_PENDING).remove(&request_id);
+    result
+}
+
+/// The `did-stop-loading`/`did-fail-load` half of the renderer's `navigate()`
+/// promise — poll the mirrored status until the page settles. A widget with
+/// no webview yet (fresh `open`, off-viewport) still queues the URL through
+/// `SENT_URL` + the journaled `state.url`, so a short grace answers ok: the
+/// load lands when the element next paints.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn wait_for_load(widget: &str, timeout: std::time::Duration) -> Result<(), String> {
+    let id = key_for(widget);
+    let deadline = std::time::Instant::now() + timeout;
+    let mut uncreated_polls = 0u32;
+    loop {
+        let status = lock(&STATUS).get(&id).cloned().unwrap_or_default();
+        if let Some(error) = status.error {
+            return Err(error);
+        }
+        if !status.loading {
+            return Ok(());
+        }
+        if !is_created(id) {
+            uncreated_polls += 1;
+            if uncreated_polls >= 8 {
+                return Ok(());
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("browser action timed out".to_owned());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// `requestBrowserAgentAction` — validate, run, and answer with the same
+/// `{ok, result}`/`{ok, error}` payload the renderer produced, flattened to
+/// `Result<Value, String>` for the route's `{ok:true,data}`/`{error,code}`
+/// envelope.
+pub fn agent_action(
+    widget: &str,
+    action: &crate::browser::BrowserAgentAction,
+) -> Result<serde_json::Value, String> {
+    if !lock(&BUSY_WIDGETS).insert(widget.to_owned()) {
+        return Err("browser widget is handling another action".to_owned());
+    }
+    let result = agent_action_inner(widget, action);
+    lock(&BUSY_WIDGETS).remove(widget);
+    result
+}
+
+fn agent_action_inner(
+    widget: &str,
+    action: &crate::browser::BrowserAgentAction,
+) -> Result<serde_json::Value, String> {
+    use crate::browser::BrowserAgentAction as Action;
+    if let Action::Navigate { url } = action {
+        // The renderer's own checks — the route validates too, but a
+        // caller reaching the action layer gets the same refusal.
+        if !(url.len() >= 5 && url[..5].eq_ignore_ascii_case("http:"))
+            && !(url.len() >= 6 && url[..6].eq_ignore_ascii_case("https:"))
+        {
+            return Err("only http and https addresses are allowed".to_owned());
+        }
+        if crate::browser::is_protected_checkout_url(url) {
+            return Err("checkout navigation is disabled".to_owned());
+        }
+        navigate(widget, url);
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        wait_for_load(widget, std::time::Duration::from_millis(45_000))?;
+        #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+        let _ = widget;
+        return Ok(serde_json::json!({ "url": url }));
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+    {
+        let _ = (widget, action);
+        return Err("browser page is not ready".to_owned());
+    }
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    {
+        let script = match action.eval_script() {
+            Some(script) => script,
+            None => return Err("unsupported browser action".to_owned()),
+        };
+        if !exists(widget) {
+            return Err("browser page is not ready".to_owned());
+        }
+        let raw = eval_script(widget, &script, std::time::Duration::from_millis(20_000))?;
+        if raw.is_empty() {
+            // run_javascript itself failed — no page context answered.
+            return Err("browser page is not ready".to_owned());
+        }
+        let parsed: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|_| "browser returned an unsupported result".to_owned())?;
+        if parsed.get("ok").and_then(serde_json::Value::as_bool) == Some(false) {
+            let error = parsed
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("browser action failed");
+            return Err(error.chars().take(1000).collect());
+        }
+        let result = parsed.get("result").cloned().unwrap_or(serde_json::Value::Null);
+        // `resolveBrowserAgentAction` measured the serialized result, not
+        // the raw page text.
+        if result.to_string().len() > MAX_RESPONSE_BYTES {
+            return Err("browser result is too large; request a smaller snapshot".to_owned());
+        }
+        let settle = action.settle_ms();
+        if settle > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(settle));
+        }
+        Ok(result)
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 fn is_wayland() -> bool {
     std::env::var("XDG_SESSION_TYPE").unwrap_or_default() == "Wayland"
@@ -410,6 +622,9 @@ fn wired_builder(
                             status.url = Some(url);
                         }
                     });
+                    if let Some(widget) = widget_for(id) {
+                        push_event(WebViewEvent::Loaded { widget });
+                    }
                 }
             }
         })
@@ -578,6 +793,11 @@ mod x11_child_thread {
         Forward {
             id: usize,
         },
+        Eval {
+            id: usize,
+            script: String,
+            request_id: u64,
+        },
         Close {
             id: usize,
         },
@@ -585,6 +805,15 @@ mod x11_child_thread {
 
     static CREATED: std::sync::LazyLock<Mutex<std::collections::HashSet<usize>>> =
         std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+
+    /// Whether the native webview for `id` was ever built — the agent
+    /// bridge's `!view` check.
+    pub fn is_created(id: usize) -> bool {
+        CREATED
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .contains(&id)
+    }
 
     // wry::WebView isn't Send, so we store them on the GTK thread.
     thread_local! {
@@ -742,6 +971,48 @@ mod x11_child_thread {
                                         }
                                     }
                                 });
+                            }
+                            ChildMessage::Eval {
+                                id,
+                                script,
+                                request_id,
+                            } => {
+                                // `view.executeJavaScript` + `browser:respond`
+                                // — evaluate_script_with_callback serializes
+                                // the page result to JSON, then the pending
+                                // map wakes the caller. A widget with no
+                                // webview answers "page is not ready" like
+                                // the original's `!view` throw.
+                                let missing = WEBVIEWS.with(|webviews| {
+                                    match webviews.borrow().get(&id) {
+                                        Some(webview) => {
+                                            if let Err(error) = webview
+                                                .evaluate_script_with_callback(
+                                                    &script,
+                                                    move |result| {
+                                                        resolve_eval(
+                                                            request_id,
+                                                            Ok(result),
+                                                        )
+                                                    },
+                                                )
+                                            {
+                                                resolve_eval(
+                                                    request_id,
+                                                    Err(error.to_string()),
+                                                );
+                                            }
+                                            false
+                                        }
+                                        None => true,
+                                    }
+                                });
+                                if missing {
+                                    resolve_eval(
+                                        request_id,
+                                        Err("browser page is not ready".to_owned()),
+                                    );
+                                }
                             }
                             ChildMessage::Close { id } => {
                                 WEBVIEWS.with(|webviews| {
@@ -952,11 +1223,21 @@ mod gtk_thread {
         Stop { id: usize },
         Back { id: usize },
         Forward { id: usize },
+        Eval { id: usize, script: String, request_id: u64 },
         Close { id: usize },
     }
 
     static CREATED: std::sync::LazyLock<Mutex<std::collections::HashSet<usize>>> =
         std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+
+    /// Whether the native webview for `id` was ever built — the agent
+    /// bridge's `!view` check.
+    pub fn is_created(id: usize) -> bool {
+        CREATED
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .contains(&id)
+    }
 
     // gtk::Window and wry::WebView aren't Send, so they live on the GTK
     // thread; the webview is kept alive as long as the window exists.
@@ -1039,6 +1320,42 @@ mod gtk_thread {
                                         let _ = webview.go_forward();
                                     }
                                 });
+                            }
+                            GtkMessage::Eval {
+                                id,
+                                script,
+                                request_id,
+                            } => {
+                                let missing = WEBVIEWS.with(|webviews| {
+                                    match webviews.borrow().get(&id) {
+                                        Some(webview) => {
+                                            if let Err(error) = webview
+                                                .evaluate_script_with_callback(
+                                                    &script,
+                                                    move |result| {
+                                                        resolve_eval(
+                                                            request_id,
+                                                            Ok(result),
+                                                        )
+                                                    },
+                                                )
+                                            {
+                                                resolve_eval(
+                                                    request_id,
+                                                    Err(error.to_string()),
+                                                );
+                                            }
+                                            false
+                                        }
+                                        None => true,
+                                    }
+                                });
+                                if missing {
+                                    resolve_eval(
+                                        request_id,
+                                        Err("browser page is not ready".to_owned()),
+                                    );
+                                }
                             }
                             GtkMessage::Close { id } => close_window(id),
                         }

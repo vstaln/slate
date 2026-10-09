@@ -5,7 +5,6 @@ pub mod assets;
 pub mod canvas_view;
 pub mod cli_run;
 pub mod engine;
-pub mod webview;
 pub mod views_browser;
 pub mod views_calendar;
 pub mod views_code;
