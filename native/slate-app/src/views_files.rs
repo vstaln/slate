@@ -165,7 +165,17 @@ fn has_image_extension(path: &Path) -> bool {
         .unwrap_or_default();
     matches!(
         ext.as_str(),
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "avif" | "bmp" | "svg" | "ico" | "tif" | "tiff"
+        "png"
+            | "jpg"
+            | "jpeg"
+            | "gif"
+            | "webp"
+            | "avif"
+            | "bmp"
+            | "svg"
+            | "ico"
+            | "tif"
+            | "tiff"
             | "heic"
     )
 }

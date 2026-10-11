@@ -118,7 +118,9 @@ struct TitlePicker {
 impl TitlePicker {
     /// Returns true when a strong title landed — the caller can stop reading.
     fn offer(&mut self, candidate: Option<TitleCandidate>) -> bool {
-        let Some(candidate) = candidate else { return false };
+        let Some(candidate) = candidate else {
+            return false;
+        };
         if candidate.weak {
             if self.weak.is_empty() {
                 self.weak = candidate.text;
@@ -190,7 +192,11 @@ fn parse_sql_time(value: &Value) -> u64 {
     let days = era * 146097 + doe - 719468;
     let secs = t[0] * 3600.0 + t[1] * 60.0 + t.get(2).copied().unwrap_or(0.0);
     let ms = days * 86_400_000 + (secs * 1000.0) as i64;
-    if ms > 0 { ms as u64 } else { 0 }
+    if ms > 0 {
+        ms as u64
+    } else {
+        0
+    }
 }
 
 /// Linux/Android paths are case-sensitive — the original's case-folding only
@@ -244,10 +250,9 @@ fn read_chunk(file: &Path, bytes: u64, from_end: bool) -> String {
     }
     let length = size.min(bytes);
     let mut buffer = vec![0u8; length as usize];
-    if from_end
-        && handle.seek(SeekFrom::End(-(length as i64))).is_err() {
-            return String::new();
-        }
+    if from_end && handle.seek(SeekFrom::End(-(length as i64))).is_err() {
+        return String::new();
+    }
     let mut filled = 0usize;
     while filled < buffer.len() {
         match handle.read(&mut buffer[filled..]) {
@@ -302,7 +307,11 @@ fn message_candidate(content: Option<&Value>) -> Option<TitleCandidate> {
         if kind != "text" && kind != "input_text" {
             continue;
         }
-        if picker.offer(part.get("text").and_then(Value::as_str).and_then(candidate_title)) {
+        if picker.offer(
+            part.get("text")
+                .and_then(Value::as_str)
+                .and_then(candidate_title),
+        ) {
             break;
         }
     }
@@ -355,7 +364,10 @@ fn parse_codex_meta(head: &str) -> Option<(String, String)> {
             continue;
         }
         let payload = entry.get("payload")?;
-        let id = payload.get("session_id").and_then(Value::as_str).unwrap_or("");
+        let id = payload
+            .get("session_id")
+            .and_then(Value::as_str)
+            .unwrap_or("");
         let cwd = payload.get("cwd").and_then(Value::as_str).unwrap_or("");
         if !safe_id(id) || cwd.is_empty() {
             return None;
@@ -368,7 +380,9 @@ fn parse_codex_meta(head: &str) -> Option<(String, String)> {
 fn parse_codex_title(head: &str) -> String {
     let mut picker = TitlePicker::default();
     for entry in json_lines(head) {
-        let Some(payload) = entry.get("payload") else { continue };
+        let Some(payload) = entry.get("payload") else {
+            continue;
+        };
         if payload.get("type").and_then(Value::as_str) != Some("message")
             || payload.get("role").and_then(Value::as_str) != Some("user")
         {
@@ -387,23 +401,30 @@ fn parse_antigravity_history(tail: &str, dir: &str) -> Vec<AgentConversation> {
     let mut by_id: HashMap<String, AgentConversation> = HashMap::new();
     let mut pickers: HashMap<String, TitlePicker> = HashMap::new();
     for entry in json_lines(tail) {
-        let id = entry.get("conversationId").and_then(Value::as_str).unwrap_or("");
+        let id = entry
+            .get("conversationId")
+            .and_then(Value::as_str)
+            .unwrap_or("");
         let workspace = entry.get("workspace").and_then(Value::as_str).unwrap_or("");
         if !safe_id(id) || !same_path(workspace, dir) {
             continue;
         }
         let at = epoch_ms(entry.get("timestamp").unwrap_or(&Value::Null));
-        pickers
+        pickers.entry(id.to_owned()).or_default().offer(
+            entry
+                .get("display")
+                .and_then(Value::as_str)
+                .and_then(candidate_title),
+        );
+        let known = by_id
             .entry(id.to_owned())
-            .or_default()
-            .offer(entry.get("display").and_then(Value::as_str).and_then(candidate_title));
-        let known = by_id.entry(id.to_owned()).or_insert_with(|| AgentConversation {
-            id: id.to_owned(),
-            agent_id: "antigravity",
-            title: String::new(),
-            updated_at: at,
-            command: format!("agy --conversation {id}"),
-        });
+            .or_insert_with(|| AgentConversation {
+                id: id.to_owned(),
+                agent_id: "antigravity",
+                title: String::new(),
+                updated_at: at,
+                command: format!("agy --conversation {id}"),
+            });
         // The last prompt of a conversation is what dates it.
         if at > known.updated_at {
             known.updated_at = at;
@@ -462,7 +483,13 @@ fn parse_grok_summary(text: &str) -> Option<GrokSummary> {
     };
     let cwd = pick(&["cwd", "working_directory", "workingDirectory"]);
     let title = candidate_title(&pick(&["generated_title", "title"]))
-        .or_else(|| candidate_title(&pick(&["session_summary", "last_turn_summary", "last_recap"])))
+        .or_else(|| {
+            candidate_title(&pick(&[
+                "session_summary",
+                "last_turn_summary",
+                "last_recap",
+            ]))
+        })
         .map(|c| c.text)
         .unwrap_or_default();
     let updated_at = ["updated_at", "created_at"]
@@ -485,7 +512,10 @@ fn parse_grok_title(head: &str) -> String {
     let mut picker = TitlePicker::default();
     let mut chunks = String::new();
     for entry in json_lines(head) {
-        let kind = entry.get("sessionUpdate").and_then(Value::as_str).unwrap_or("");
+        let kind = entry
+            .get("sessionUpdate")
+            .and_then(Value::as_str)
+            .unwrap_or("");
         if kind != "user_message" && kind != "user_message_chunk" {
             // Anything after the prompt belongs to the agent; a stitched
             // prompt is complete as soon as the turn moves on.
@@ -561,12 +591,9 @@ fn claude_conversations(dir: &str, home: &Path, limit: usize) -> Vec<AgentConver
     let projects = home.join(".claude").join("projects");
     let mut root = PathBuf::new();
     let mut names: Vec<String> = Vec::new();
-    for slug in [
-        claude_project_slug(dir),
-        claude_project_slug_unicode(dir),
-    ]
-    .into_iter()
-    .collect::<HashSet<_>>()
+    for slug in [claude_project_slug(dir), claude_project_slug_unicode(dir)]
+        .into_iter()
+        .collect::<HashSet<_>>()
     {
         if slug.is_empty() {
             continue;
@@ -677,7 +704,10 @@ fn codex_conversations(dir: &str, home: &Path, limit: usize) -> Vec<AgentConvers
 /// tail — the store that holds the user's own words — is all we scan.
 fn antigravity_conversations(dir: &str, home: &Path) -> Vec<AgentConversation> {
     let root = home.join(".gemini").join("antigravity-cli");
-    parse_antigravity_history(&read_chunk(&root.join("history.jsonl"), HISTORY_TAIL_BYTES, true), dir)
+    parse_antigravity_history(
+        &read_chunk(&root.join("history.jsonl"), HISTORY_TAIL_BYTES, true),
+        dir,
+    )
 }
 
 fn grok_roots(home: &Path) -> Vec<PathBuf> {
@@ -718,7 +748,11 @@ fn grok_group_dir(root: &Path, dir: &str) -> Option<PathBuf> {
             if budget < 0 {
                 break;
             }
-            let text = read_chunk(&group.join(&id).join("summary.json"), GROK_SUMMARY_BYTES, false);
+            let text = read_chunk(
+                &group.join(&id).join("summary.json"),
+                GROK_SUMMARY_BYTES,
+                false,
+            );
             if let Some(summary) = parse_grok_summary(&text) {
                 if !summary.cwd.is_empty() && same_path(&summary.cwd, dir) {
                     return Some(group);
@@ -739,7 +773,9 @@ fn grok_conversations(dir: &str, home: &Path, limit: usize) -> Vec<AgentConversa
             break;
         }
     }
-    let Some(group) = group else { return Vec::new() };
+    let Some(group) = group else {
+        return Vec::new();
+    };
     let candidates = stat_files(
         list_names(&group)
             .into_iter()
@@ -780,7 +816,10 @@ fn grok_conversations(dir: &str, home: &Path, limit: usize) -> Vec<AgentConversa
             id: id.to_owned(),
             agent_id: "grok",
             title,
-            updated_at: summary.map(|s| s.updated_at).filter(|t| *t > 0).unwrap_or(candidate.mtime),
+            updated_at: summary
+                .map(|s| s.updated_at)
+                .filter(|t| *t > 0)
+                .unwrap_or(candidate.mtime),
             command: format!("grok --resume {id}"),
         });
     }
@@ -816,7 +855,10 @@ pub fn list(dir: &str, home: Option<&Path>, limit: Option<usize>) -> Vec<AgentCo
     // agent does not use goes back to plain recency.
     let mut queues: HashMap<&'static str, VecDeque<AgentConversation>> = HashMap::new();
     for conversation in all {
-        queues.entry(conversation.agent_id).or_default().push_back(conversation);
+        queues
+            .entry(conversation.agent_id)
+            .or_default()
+            .push_back(conversation);
     }
     let mut picked: Vec<AgentConversation> = Vec::new();
     while picked.len() < limit {
@@ -847,7 +889,8 @@ pub fn relative_time(at_ms: u64, now_ms: u64) -> String {
         return "just now".to_owned();
     }
     let delta = now_ms - at_ms;
-    let plural = |value: u64, unit: &str| format!("{value} {unit}{} ago", if value == 1 { "" } else { "s" });
+    let plural =
+        |value: u64, unit: &str| format!("{value} {unit}{} ago", if value == 1 { "" } else { "s" });
     if delta < 3_600_000 {
         return plural(delta / 60_000, "minute");
     }
@@ -907,13 +950,13 @@ pub fn load_dismissed(dir: &str) -> HashSet<String> {
 }
 
 /// Persists the dismissals that still match a live conversation.
-pub fn save_dismissed(
-    dir: &str,
-    dismissed: &HashSet<String>,
-    live: &HashSet<String>,
-) {
+pub fn save_dismissed(dir: &str, dismissed: &HashSet<String>, live: &HashSet<String>) {
     let mut store = read_store();
-    let kept: Vec<String> = dismissed.iter().filter(|k| live.contains(*k)).cloned().collect();
+    let kept: Vec<String> = dismissed
+        .iter()
+        .filter(|k| live.contains(*k))
+        .cloned()
+        .collect();
     if kept.is_empty() {
         store.remove(dir);
     } else {

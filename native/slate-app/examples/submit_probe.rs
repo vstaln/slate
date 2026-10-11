@@ -43,7 +43,10 @@ impl RouteEnv for StubEnv {
         _target: &str,
         _caller: Option<&str>,
     ) -> Result<String, CommandError> {
-        Err(CommandError::new(ErrorCode::NotFound, "no terminals in the stub"))
+        Err(CommandError::new(
+            ErrorCode::NotFound,
+            "no terminals in the stub",
+        ))
     }
     fn resolve_write_target(&mut self, _requested: &str) -> Option<String> {
         None
@@ -93,7 +96,10 @@ impl RouteEnv for StubEnv {
 
 fn entries(env: &mut StubEnv) -> Vec<Value> {
     let log = JournalLog::open(&env.journal_path).expect("journal opens");
-    log.entries().iter().map(|e| serde_json::to_value(e).unwrap()).collect()
+    log.entries()
+        .iter()
+        .map(|e| serde_json::to_value(e).unwrap())
+        .collect()
 }
 
 fn main() {
@@ -135,9 +141,11 @@ fn main() {
     // 1. widget.create → intent + commit, commandId + version 1, data = row.
     let response = {
         let mut deps = deps!();
-        let request = Request::get("POST", "/widgets").as_agent("probe").with_body(json!({
-            "agentId": "probe", "kind": "browser", "title": "demo", "x": 10, "y": 20,
-        }));
+        let request = Request::get("POST", "/widgets")
+            .as_agent("probe")
+            .with_body(json!({
+                "agentId": "probe", "kind": "browser", "title": "demo", "x": 10, "y": 20,
+            }));
         slate_app::http::route(&request, &mut deps).unwrap()
     };
     check(
@@ -158,7 +166,11 @@ fn main() {
             .iter()
             .filter_map(|e| e.get("phase").and_then(Value::as_str))
             .collect();
-        check("create journaled intent+commit", phases == ["intent", "commit"], json!(tail));
+        check(
+            "create journaled intent+commit",
+            phases == ["intent", "commit"],
+            json!(tail),
+        );
         let commit = tail.last().unwrap();
         check(
             "commit carries commandId+version 1",
@@ -177,14 +189,17 @@ fn main() {
     let before = entries(&mut env).len();
     let response = {
         let mut deps = deps!();
-        let request = (Request::get("PATCH", &format!("/widgets/{widget_id}"))).as_agent("probe").with_body(json!({
-            "agentId": "probe", "title": "stale", "baseVersion": 7,
-        }));
+        let request = (Request::get("PATCH", &format!("/widgets/{widget_id}")))
+            .as_agent("probe")
+            .with_body(json!({
+                "agentId": "probe", "title": "stale", "baseVersion": 7,
+            }));
         slate_app::http::route(&request, &mut deps).unwrap()
     };
     check(
         "stale baseVersion conflicts",
-        response.status == 409 && response.body.get("code").and_then(Value::as_str) == Some("conflict"),
+        response.status == 409
+            && response.body.get("code").and_then(Value::as_str) == Some("conflict"),
         response.body.clone(),
     );
     check(
@@ -208,14 +223,17 @@ fn main() {
         .unwrap();
     let response = {
         let mut deps = deps!();
-        let request = (Request::get("PATCH", &format!("/widgets/{widget_id}"))).as_agent("probe").with_body(json!({
-            "agentId": "probe", "title": "blocked",
-        }));
+        let request = (Request::get("PATCH", &format!("/widgets/{widget_id}")))
+            .as_agent("probe")
+            .with_body(json!({
+                "agentId": "probe", "title": "blocked",
+            }));
         slate_app::http::route(&request, &mut deps).unwrap()
     };
     check(
         "foreign lock conflicts",
-        response.status == 409 && response.body.get("code").and_then(Value::as_str) == Some("locked"),
+        response.status == 409
+            && response.body.get("code").and_then(Value::as_str) == Some("locked"),
         response.body.clone(),
     );
     env.locks()
@@ -225,9 +243,11 @@ fn main() {
     // 4. Implicit lock + successful patch → intent+commit, version bumps.
     let response = {
         let mut deps = deps!();
-        let request = (Request::get("PATCH", &format!("/widgets/{widget_id}"))).as_agent("probe").with_body(json!({
-            "agentId": "probe", "title": "renamed", "baseVersion": 1,
-        }));
+        let request = (Request::get("PATCH", &format!("/widgets/{widget_id}")))
+            .as_agent("probe")
+            .with_body(json!({
+                "agentId": "probe", "title": "renamed", "baseVersion": 1,
+            }));
         slate_app::http::route(&request, &mut deps).unwrap()
     };
     check(
@@ -244,16 +264,20 @@ fn main() {
     let key = "probe-key-1";
     let first = {
         let mut deps = deps!();
-        let request = Request::get("POST", "/widgets").as_agent("probe").with_body(json!({
-            "agentId": "probe", "kind": "browser", "title": "idem", "idempotencyKey": key,
-        }));
+        let request = Request::get("POST", "/widgets")
+            .as_agent("probe")
+            .with_body(json!({
+                "agentId": "probe", "kind": "browser", "title": "idem", "idempotencyKey": key,
+            }));
         slate_app::http::route(&request, &mut deps).unwrap()
     };
     let second = {
         let mut deps = deps!();
-        let request = Request::get("POST", "/widgets").as_agent("probe").with_body(json!({
-            "agentId": "probe", "kind": "browser", "title": "idem", "idempotencyKey": key,
-        }));
+        let request = Request::get("POST", "/widgets")
+            .as_agent("probe")
+            .with_body(json!({
+                "agentId": "probe", "kind": "browser", "title": "idem", "idempotencyKey": key,
+            }));
         slate_app::http::route(&request, &mut deps).unwrap()
     };
     check(
@@ -266,12 +290,18 @@ fn main() {
     // 6. Abort — patch a widget that does not exist → intent+abort pair.
     let response = {
         let mut deps = deps!();
-        let request = Request::get("PATCH", "/widgets/widget-missing").as_agent("probe").with_body(json!({
-            "agentId": "probe", "title": "ghost",
-        }));
+        let request = Request::get("PATCH", "/widgets/widget-missing")
+            .as_agent("probe")
+            .with_body(json!({
+                "agentId": "probe", "title": "ghost",
+            }));
         slate_app::http::route(&request, &mut deps).unwrap()
     };
-    check("missing widget 404s", response.status == 404, response.body.clone());
+    check(
+        "missing widget 404s",
+        response.status == 404,
+        response.body.clone(),
+    );
     {
         let log = entries(&mut env);
         let tail: Vec<&Value> = log.iter().rev().take(2).rev().collect();
@@ -279,15 +309,21 @@ fn main() {
             .iter()
             .filter_map(|e| e.get("phase").and_then(Value::as_str))
             .collect();
-        check("failed work journals intent+abort", phases == ["intent", "abort"], json!(tail));
+        check(
+            "failed work journals intent+abort",
+            phases == ["intent", "abort"],
+            json!(tail),
+        );
     }
 
     // 7. Orchestration create through the flow — run.create commits at v1.
     let response = {
         let mut deps = deps!();
-        let request = Request::get("POST", "/orchestration/runs").as_agent("probe").with_body(json!({
-            "agentId": "probe", "objective": "probe run",
-        }));
+        let request = Request::get("POST", "/orchestration/runs")
+            .as_agent("probe")
+            .with_body(json!({
+                "agentId": "probe", "objective": "probe run",
+            }));
         slate_app::http::route(&request, &mut deps).unwrap()
     };
     check(
@@ -305,9 +341,11 @@ fn main() {
     // 8. orctask.create + version-gated update: wrong baseVersion → 409.
     let response = {
         let mut deps = deps!();
-        let request = Request::get("POST", "/orchestration/tasks").as_agent("probe").with_body(json!({
-            "agentId": "probe", "runId": run_id, "spec": "probe task",
-        }));
+        let request = Request::get("POST", "/orchestration/tasks")
+            .as_agent("probe")
+            .with_body(json!({
+                "agentId": "probe", "runId": run_id, "spec": "probe task",
+            }));
         slate_app::http::route(&request, &mut deps).unwrap()
     };
     let task_id = response
@@ -316,10 +354,16 @@ fn main() {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned();
-    check("orctask.create accepted", response.status == 201, response.body.clone());
+    check(
+        "orctask.create accepted",
+        response.status == 201,
+        response.body.clone(),
+    );
     let response = {
         let mut deps = deps!();
-        let request = Request::get("PATCH", &format!("/orchestration/tasks/{task_id}")).as_agent("probe")            .with_body(json!({ "agentId": "probe", "status": "done", "baseVersion": 99 }));
+        let request = Request::get("PATCH", &format!("/orchestration/tasks/{task_id}"))
+            .as_agent("probe")
+            .with_body(json!({ "agentId": "probe", "status": "done", "baseVersion": 99 }));
         slate_app::http::route(&request, &mut deps).unwrap()
     };
     check(
@@ -331,10 +375,12 @@ fn main() {
     // 9. orc.send through the flow — mail lands in the store.
     let response = {
         let mut deps = deps!();
-        let request = Request::get("POST", "/orchestration/messages").as_agent("probe").with_body(json!({
-            "agentId": "probe", "runId": run_id, "type": "note", "to": "@coordinator",
-            "subject": "s", "body": "b",
-        }));
+        let request = Request::get("POST", "/orchestration/messages")
+            .as_agent("probe")
+            .with_body(json!({
+                "agentId": "probe", "runId": run_id, "type": "note", "to": "@coordinator",
+                "subject": "s", "body": "b",
+            }));
         slate_app::http::route(&request, &mut deps).unwrap()
     };
     check(
@@ -349,9 +395,11 @@ fn main() {
     let before = entries(&mut env).len();
     let response = {
         let mut deps = deps!();
-        let request = Request::get("POST", "/widgets/terminal").as_agent("probe").with_body(json!({
-            "agentId": "probe", "title": "agent shell", "cwd": "/tmp",
-        }));
+        let request = Request::get("POST", "/widgets/terminal")
+            .as_agent("probe")
+            .with_body(json!({
+                "agentId": "probe", "title": "agent shell", "cwd": "/tmp",
+            }));
         slate_app::http::route(&request, &mut deps).unwrap()
     };
     check(
@@ -361,7 +409,13 @@ fn main() {
     );
     let spawned: Vec<String> = entries(&mut env)[before..]
         .iter()
-        .map(|e| format!("{}:{}", e["type"].as_str().unwrap_or(""), e["phase"].as_str().unwrap_or("")))
+        .map(|e| {
+            format!(
+                "{}:{}",
+                e["type"].as_str().unwrap_or(""),
+                e["phase"].as_str().unwrap_or("")
+            )
+        })
         .collect();
     check(
         "terminal.create journaled intent+commit",

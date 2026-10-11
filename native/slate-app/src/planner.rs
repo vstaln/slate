@@ -370,7 +370,14 @@ fn resolve_create_status(payload: Option<&Value>) -> (bool, PlanStatus) {
         return (status == PlanStatus::Done, status);
     }
     let done = matches!(get("done"), Some(Value::Bool(true)));
-    (done, if done { PlanStatus::Done } else { PlanStatus::Todo })
+    (
+        done,
+        if done {
+            PlanStatus::Done
+        } else {
+            PlanStatus::Todo
+        },
+    )
 }
 
 /// `resolveStatus` from the Electron store. An explicit status patch wins a

@@ -209,9 +209,7 @@ fn is_partial_report(tail: &str) -> bool {
     if bytes.get(i) == Some(&b'<') {
         i += 1;
     }
-    bytes[i..]
-        .iter()
-        .all(|b| b.is_ascii_digit() || *b == b';')
+    bytes[i..].iter().all(|b| b.is_ascii_digit() || *b == b';')
 }
 
 /// `ESC ] 0 ; <title> (BEL | ESC \)` — the console titles set in `text`,
@@ -559,8 +557,7 @@ mod tests {
     #[test]
     fn stays_quiet_for_reports_in_prose() {
         let mut probe = ModeRecoveryProbe::default();
-        let prose =
-            "a press is ^[[<0;10;5M, a release ^[[<0;10;5m, and motion ^[[<35;36;37M.\r\n";
+        let prose = "a press is ^[[<0;10;5M, a release ^[[<0;10;5m, and motion ^[[<35;36;37M.\r\n";
         for _ in 0..20 {
             assert!(!echoed(&mut probe, prose));
         }
@@ -595,10 +592,7 @@ mod tests {
     #[test]
     fn sees_a_report_split_across_a_transport_boundary() {
         let mut probe = ModeRecoveryProbe::default();
-        assert!(!echoed(
-            &mut probe,
-            "^[[<35;36;37M^[[<35;37;37M^[[<35;"
-        ));
+        assert!(!echoed(&mut probe, "^[[<35;36;37M^[[<35;37;37M^[[<35;"));
         assert!(echoed(&mut probe, "38;36M"));
     }
 
@@ -616,7 +610,12 @@ mod tests {
     #[test]
     fn reports_a_powershell_highlighted_burst() {
         let mut probe = ModeRecoveryProbe::default();
-        let burst = format!("{}{}{}", ps_report(87, 30), ps_report(88, 31), ps_report(89, 32));
+        let burst = format!(
+            "{}{}{}",
+            ps_report(87, 30),
+            ps_report(88, 31),
+            ps_report(89, 32)
+        );
         assert!(echoed(&mut probe, &burst));
     }
 
@@ -657,11 +656,7 @@ mod tests {
         ] {
             assert!(is_shell_own_title(title), "{title}");
         }
-        for title in [
-            "C:\\WINDOWS\\system32\\cmd.exe - opencode",
-            "opencode",
-            "",
-        ] {
+        for title in ["C:\\WINDOWS\\system32\\cmd.exe - opencode", "opencode", ""] {
             assert!(!is_shell_own_title(title), "{title}");
         }
     }
@@ -727,8 +722,7 @@ mod tests {
             probe.read_child_title(&started[6..]),
             Some(ChildTitle::Started)
         );
-        let exited =
-            title("C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+        let exited = title("C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
         assert_eq!(probe.read_child_title(&exited[..20]), None);
         assert_eq!(
             probe.read_child_title(&exited[20..]),
@@ -772,10 +766,7 @@ mod tests {
             title(&format!("{SHELL} - opencode")),
             title(SHELL)
         );
-        assert_eq!(
-            probe.read_child_title(&history),
-            Some(ChildTitle::Exited)
-        );
+        assert_eq!(probe.read_child_title(&history), Some(ChildTitle::Exited));
     }
 
     #[test]
@@ -786,10 +777,7 @@ mod tests {
             title(SHELL),
             title(&format!("{SHELL} - opencode"))
         );
-        assert_eq!(
-            probe.read_child_title(&history),
-            Some(ChildTitle::Started)
-        );
+        assert_eq!(probe.read_child_title(&history), Some(ChildTitle::Started));
     }
 
     #[test]

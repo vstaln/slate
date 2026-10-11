@@ -29,8 +29,8 @@ const VIDEO_EXTENSIONS: &[&str] = &[
 /// The renderer's `TEXT_EXTS` (BrowserWidget.tsx) — markup, documents and
 /// source files the shell's media viewer rendered in a sandboxed frame.
 const TEXT_EXTENSIONS: &[&str] = &[
-    "txt", "md", "markdown", "json", "csv", "tsv", "yaml", "yml", "xml", "html", "htm", "log", "js",
-    "ts", "jsx", "tsx", "py", "sh", "bat", "cmd", "ps1",
+    "txt", "md", "markdown", "json", "csv", "tsv", "yaml", "yml", "xml", "html", "htm", "log",
+    "js", "ts", "jsx", "tsx", "py", "sh", "bat", "cmd", "ps1",
 ];
 
 /// The shell's `DroppedMediaKind` — `mediaKindForName`/`mediaKindOf` bucket a
@@ -198,10 +198,7 @@ fn is_local_source(source: &Path) -> bool {
         return false;
     };
     let extended_drive = text.starts_with("\\\\?\\")
-        && text
-            .as_bytes()
-            .get(4)
-            .is_some_and(u8::is_ascii_alphabetic)
+        && text.as_bytes().get(4).is_some_and(u8::is_ascii_alphabetic)
         && text.as_bytes().get(5) == Some(&b':')
         && text.as_bytes().get(6) == Some(&b'\\');
     if text.starts_with("\\\\") && !extended_drive {
@@ -303,7 +300,12 @@ pub fn import_media(source: &Path, directory: &Path) -> Result<PathBuf, String> 
         }
         output.sync_all().map_err(|e| e.to_string())?;
         drop(output);
-        publish_hashed(directory, &temporary, &format!("{:x}", hash.finalize()), &extension)
+        publish_hashed(
+            directory,
+            &temporary,
+            &format!("{:x}", hash.finalize()),
+            &extension,
+        )
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&temporary);
@@ -418,9 +420,8 @@ mod tests {
         let media = root.join("media");
         std::fs::write(&source, b"# hello").unwrap();
         let imported = import_media(&source, &media).unwrap();
-        assert!(imported.ends_with(
-            "ea67f39f2a707e536439ee31e49fdd586b4a8437d3408f0466112d040cd06681.md"
-        ));
+        assert!(imported
+            .ends_with("ea67f39f2a707e536439ee31e49fdd586b4a8437d3408f0466112d040cd06681.md"));
         // A non-image imports through the general path but is refused by
         // the image-only wrapper.
         assert!(import_image(&source, &media).is_err());

@@ -36,11 +36,11 @@
 //!   HTML fullscreen is confined to the widget's bounds by WebKitGTK rather
 //!   than promoting the widget the way `onFullscreenChange` did.
 
-use gpui::{
-    App, Bounds, Element, ElementId, GlobalElementId, InspectorElementId, IntoElement, LayoutId,
-    Pixels, Style, StyleRefinement, Styled, Window, px,
-};
 use gpui::Refineable;
+use gpui::{
+    px, App, Bounds, Element, ElementId, GlobalElementId, InspectorElementId, IntoElement,
+    LayoutId, Pixels, Style, StyleRefinement, Styled, Window,
+};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -95,9 +95,7 @@ pub enum WebViewEvent {
 static EVENTS: std::sync::LazyLock<Mutex<Vec<WebViewEvent>>> =
     std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
 
-fn lock<'a, T>(
-    mutex: &'a std::sync::LazyLock<Mutex<T>>,
-) -> std::sync::MutexGuard<'a, T> {
+fn lock<'a, T>(mutex: &'a std::sync::LazyLock<Mutex<T>>) -> std::sync::MutexGuard<'a, T> {
     mutex.lock().unwrap_or_else(|poison| poison.into_inner())
 }
 
@@ -369,11 +367,7 @@ fn resolve_eval(request_id: u64, result: Result<String, String>) {
 /// The script must self-report errors (see `browser::BrowserAgentAction`'s
 /// try/catch envelope) — WebKitGTK gives no exception text.
 #[cfg(slate_browser)]
-fn eval_script(
-    widget: &str,
-    script: &str,
-    timeout: std::time::Duration,
-) -> Result<String, String> {
+fn eval_script(widget: &str, script: &str, timeout: std::time::Duration) -> Result<String, String> {
     let id = key_for(widget);
     let request_id = NEXT_EVAL_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let (sender, receiver) = std::sync::mpsc::channel();
@@ -497,7 +491,10 @@ fn agent_action_inner(
                 .unwrap_or("browser action failed");
             return Err(error.chars().take(1000).collect());
         }
-        let result = parsed.get("result").cloned().unwrap_or(serde_json::Value::Null);
+        let result = parsed
+            .get("result")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
         // `resolveBrowserAgentAction` measured the serialized result, not
         // the raw page text.
         if result.to_string().len() > MAX_RESPONSE_BYTES {
@@ -740,8 +737,7 @@ mod x11_child_thread {
     impl raw_window_handle::HasWindowHandle for RawXlibHandle {
         fn window_handle(
             &self,
-        ) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError>
-        {
+        ) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
             let handle = raw_window_handle::XlibWindowHandle::new(self.window_id);
             Ok(unsafe { raw_window_handle::WindowHandle::borrow_raw(handle.into()) })
         }
@@ -750,8 +746,7 @@ mod x11_child_thread {
     impl raw_window_handle::HasDisplayHandle for RawXlibHandle {
         fn display_handle(
             &self,
-        ) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError>
-        {
+        ) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
             let handle = raw_window_handle::XlibDisplayHandle::new(None, self.screen);
             Ok(unsafe { raw_window_handle::DisplayHandle::borrow_raw(handle.into()) })
         }
@@ -892,11 +887,7 @@ mod x11_child_thread {
                                 WEBVIEWS.with(|webviews| {
                                     if let Some(webview) = webviews.borrow().get(&id) {
                                         if let Err(error) = webview.zoom(zoom) {
-                                            log::error!(
-                                                "WebView #{}: zoom failed: {}",
-                                                id,
-                                                error
-                                            );
+                                            log::error!("WebView #{}: zoom failed: {}", id, error);
                                         }
                                     }
                                 });
@@ -934,14 +925,9 @@ mod x11_child_thread {
                             ChildMessage::Stop { id } => {
                                 WEBVIEWS.with(|webviews| {
                                     if let Some(webview) = webviews.borrow().get(&id) {
-                                        if let Err(error) =
-                                            webview.evaluate_script("window.stop()")
+                                        if let Err(error) = webview.evaluate_script("window.stop()")
                                         {
-                                            log::error!(
-                                                "WebView #{}: stop failed: {}",
-                                                id,
-                                                error
-                                            );
+                                            log::error!("WebView #{}: stop failed: {}", id, error);
                                         }
                                     }
                                 });
@@ -983,30 +969,23 @@ mod x11_child_thread {
                                 // map wakes the caller. A widget with no
                                 // webview answers "page is not ready" like
                                 // the original's `!view` throw.
-                                let missing = WEBVIEWS.with(|webviews| {
-                                    match webviews.borrow().get(&id) {
+                                let missing =
+                                    WEBVIEWS.with(|webviews| match webviews.borrow().get(&id) {
                                         Some(webview) => {
                                             if let Err(error) = webview
                                                 .evaluate_script_with_callback(
                                                     &script,
                                                     move |result| {
-                                                        resolve_eval(
-                                                            request_id,
-                                                            Ok(result),
-                                                        )
+                                                        resolve_eval(request_id, Ok(result))
                                                     },
                                                 )
                                             {
-                                                resolve_eval(
-                                                    request_id,
-                                                    Err(error.to_string()),
-                                                );
+                                                resolve_eval(request_id, Err(error.to_string()));
                                             }
                                             false
                                         }
                                         None => true,
-                                    }
-                                });
+                                    });
                                 if missing {
                                     resolve_eval(
                                         request_id,
@@ -1069,12 +1048,7 @@ mod x11_child_thread {
         }
     }
 
-    pub fn request_create(
-        id: usize,
-        content: &WebViewContent,
-        bounds: wry::Rect,
-        window: &Window,
-    ) {
+    pub fn request_create(id: usize, content: &WebViewContent, bounds: wry::Rect, window: &Window) {
         let mut created = CREATED.lock().unwrap_or_else(|poison| poison.into_inner());
         if created.contains(&id) {
             return;
@@ -1217,14 +1191,34 @@ mod gtk_thread {
     use wry::WebViewBuilderExtUnix;
 
     pub enum GtkMessage {
-        Create { id: usize, content: WebViewContent },
-        Navigate { id: usize, url: String },
-        Reload { id: usize },
-        Stop { id: usize },
-        Back { id: usize },
-        Forward { id: usize },
-        Eval { id: usize, script: String, request_id: u64 },
-        Close { id: usize },
+        Create {
+            id: usize,
+            content: WebViewContent,
+        },
+        Navigate {
+            id: usize,
+            url: String,
+        },
+        Reload {
+            id: usize,
+        },
+        Stop {
+            id: usize,
+        },
+        Back {
+            id: usize,
+        },
+        Forward {
+            id: usize,
+        },
+        Eval {
+            id: usize,
+            script: String,
+            request_id: u64,
+        },
+        Close {
+            id: usize,
+        },
     }
 
     static CREATED: std::sync::LazyLock<Mutex<std::collections::HashSet<usize>>> =
@@ -1326,30 +1320,23 @@ mod gtk_thread {
                                 script,
                                 request_id,
                             } => {
-                                let missing = WEBVIEWS.with(|webviews| {
-                                    match webviews.borrow().get(&id) {
+                                let missing =
+                                    WEBVIEWS.with(|webviews| match webviews.borrow().get(&id) {
                                         Some(webview) => {
                                             if let Err(error) = webview
                                                 .evaluate_script_with_callback(
                                                     &script,
                                                     move |result| {
-                                                        resolve_eval(
-                                                            request_id,
-                                                            Ok(result),
-                                                        )
+                                                        resolve_eval(request_id, Ok(result))
                                                     },
                                                 )
                                             {
-                                                resolve_eval(
-                                                    request_id,
-                                                    Err(error.to_string()),
-                                                );
+                                                resolve_eval(request_id, Err(error.to_string()));
                                             }
                                             false
                                         }
                                         None => true,
-                                    }
-                                });
+                                    });
                                 if missing {
                                     resolve_eval(
                                         request_id,

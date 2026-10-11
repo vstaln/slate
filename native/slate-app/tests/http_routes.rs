@@ -131,9 +131,7 @@ impl RouteEnv for TestEnv {
         0
     }
 
-    fn idempotency(
-        &mut self,
-    ) -> MutexGuard<'_, slate_app::idempotency::IdempotencyCache> {
+    fn idempotency(&mut self) -> MutexGuard<'_, slate_app::idempotency::IdempotencyCache> {
         self.idem.lock().unwrap()
     }
 
@@ -242,8 +240,11 @@ fn creating_a_run_answers_201_with_the_accepted_envelope() {
 #[test]
 fn a_run_without_an_objective_is_refused_as_invalid() {
     let mut server = Server::new();
-    let response = server
-        .call(Request::get("POST", "/orchestration/runs").as_agent("alice").with_body(json!({ "objective": "  " })));
+    let response = server.call(
+        Request::get("POST", "/orchestration/runs")
+            .as_agent("alice")
+            .with_body(json!({ "objective": "  " })),
+    );
     assert_eq!(response.status, 400);
     assert_eq!(response.body["code"], json!("invalid"));
     assert!(response.body["error"]
@@ -275,7 +276,9 @@ fn closing_a_run_clears_it_from_active() {
     let mut server = Server::new();
     let id = server.run();
     let response = server.call(
-        Request::get("POST", &format!("/orchestration/runs/{id}/close")).as_agent("alice").with_body(json!({})),
+        Request::get("POST", &format!("/orchestration/runs/{id}/close"))
+            .as_agent("alice")
+            .with_body(json!({})),
     );
     assert_eq!(response.status, 200);
     assert!(response.body["data"]["closedAt"].is_number());
@@ -305,8 +308,11 @@ fn a_task_files_under_the_newest_open_run_when_none_is_named() {
 #[test]
 fn a_task_with_no_open_run_is_refused() {
     let mut server = Server::new();
-    let response = server
-        .call(Request::get("POST", "/orchestration/tasks").as_agent("alice").with_body(json!({ "spec": "work" })));
+    let response = server.call(
+        Request::get("POST", "/orchestration/tasks")
+            .as_agent("alice")
+            .with_body(json!({ "spec": "work" })),
+    );
     assert_eq!(response.status, 404);
     assert!(response.body["error"].as_str().unwrap().contains("run"));
 }
@@ -349,7 +355,8 @@ fn patching_a_task_updates_it() {
     server.run();
     let id = server.task("work");
     let response = server.call(
-        Request::get("PATCH", &format!("/orchestration/tasks/{id}")).as_agent("alice")
+        Request::get("PATCH", &format!("/orchestration/tasks/{id}"))
+            .as_agent("alice")
             .with_body(json!({ "title": "Renamed" })),
     );
     assert_eq!(response.status, 200);
@@ -371,7 +378,8 @@ fn dispatch_without_a_runtime_environment_is_rejected_without_mutation() {
         env: None,
     };
     let response = route(
-        &Request::get("POST", "/orchestration/dispatches").as_agent("alice")
+        &Request::get("POST", "/orchestration/dispatches")
+            .as_agent("alice")
             .with_body(json!({"taskId": task, "terminalId": "term-1", "agent": "claude"})),
         &mut deps,
     )
@@ -390,13 +398,18 @@ fn a_dispatch_conflict_answers_409_with_the_code() {
 
     assert_eq!(
         server
-            .call(Request::get("POST", "/orchestration/dispatches").as_agent("alice").with_body(body.clone()))
+            .call(
+                Request::get("POST", "/orchestration/dispatches")
+                    .as_agent("alice")
+                    .with_body(body.clone())
+            )
             .status,
         201
     );
 
     let second = server.call(
-        Request::get("POST", "/orchestration/dispatches").as_agent("alice")
+        Request::get("POST", "/orchestration/dispatches")
+            .as_agent("alice")
             .with_body(json!({ "taskId": task, "terminalId": "term-2", "agent": "codex" })),
     );
     assert_eq!(second.status, 409, "two workers on one task");
@@ -424,7 +437,8 @@ fn settling_reports_the_task_status_and_what_it_promoted() {
         .to_owned();
 
     let dispatch = server.call(
-        Request::get("POST", "/orchestration/dispatches").as_agent("alice")
+        Request::get("POST", "/orchestration/dispatches")
+            .as_agent("alice")
             .with_body(json!({ "taskId": first, "terminalId": "term-1", "agent": "claude" })),
     );
     let dispatch_id = dispatch.body["data"]["dispatchId"]
@@ -436,7 +450,8 @@ fn settling_reports_the_task_status_and_what_it_promoted() {
         Request::get(
             "POST",
             &format!("/orchestration/dispatches/{dispatch_id}/settle"),
-        ).as_agent("alice")
+        )
+        .as_agent("alice")
         .with_body(json!({ "outcome": "succeeded" })),
     );
     assert_eq!(settled.status, 200);
@@ -450,7 +465,8 @@ fn an_unknown_outcome_is_refused_before_the_store_is_touched() {
     server.run();
     let task = server.task("work");
     let dispatch = server.call(
-        Request::get("POST", "/orchestration/dispatches").as_agent("alice")
+        Request::get("POST", "/orchestration/dispatches")
+            .as_agent("alice")
             .with_body(json!({ "taskId": task, "terminalId": "term-1", "agent": "claude" })),
     );
     let id = dispatch.body["data"]["dispatchId"]
@@ -459,7 +475,8 @@ fn an_unknown_outcome_is_refused_before_the_store_is_touched() {
         .to_owned();
 
     let response = server.call(
-        Request::get("POST", &format!("/orchestration/dispatches/{id}/settle")).as_agent("alice")
+        Request::get("POST", &format!("/orchestration/dispatches/{id}/settle"))
+            .as_agent("alice")
             .with_body(json!({ "outcome": "mostly" })),
     );
     assert_eq!(response.status, 400);
@@ -467,7 +484,8 @@ fn an_unknown_outcome_is_refused_before_the_store_is_touched() {
 
     // The dispatch is untouched and can still be settled properly.
     let good = server.call(
-        Request::get("POST", &format!("/orchestration/dispatches/{id}/settle")).as_agent("alice")
+        Request::get("POST", &format!("/orchestration/dispatches/{id}/settle"))
+            .as_agent("alice")
             .with_body(json!({ "outcome": "succeeded" })),
     );
     assert_eq!(good.status, 200);
@@ -479,7 +497,8 @@ fn the_dispatch_listing_names_what_is_unaccounted() {
     server.run();
     let task = server.task("work");
     let dispatch = server.call(
-        Request::get("POST", "/orchestration/dispatches").as_agent("alice")
+        Request::get("POST", "/orchestration/dispatches")
+            .as_agent("alice")
             .with_body(json!({ "taskId": task, "terminalId": "term-1", "agent": "claude" })),
     );
     let id = dispatch.body["data"]["dispatchId"]
@@ -487,7 +506,8 @@ fn the_dispatch_listing_names_what_is_unaccounted() {
         .unwrap()
         .to_owned();
     server.call(
-        Request::get("POST", &format!("/orchestration/dispatches/{id}/settle")).as_agent("alice")
+        Request::get("POST", &format!("/orchestration/dispatches/{id}/settle"))
+            .as_agent("alice")
             .with_body(json!({ "outcome": "succeeded" })),
     );
 
@@ -495,7 +515,8 @@ fn the_dispatch_listing_names_what_is_unaccounted() {
     assert_eq!(listed.body["unaccounted"], json!([id.clone()]));
 
     server.call(
-        Request::get("POST", &format!("/orchestration/dispatches/{id}/account")).as_agent("alice")
+        Request::get("POST", &format!("/orchestration/dispatches/{id}/account"))
+            .as_agent("alice")
             .with_body(json!({ "state": "released" })),
     );
     let after = server.call(Request::get("GET", "/orchestration/dispatches"));
@@ -587,14 +608,16 @@ fn a_gate_can_be_opened_listed_and_resolved_once() {
     assert_eq!(open.body["gates"].as_array().unwrap().len(), 1);
 
     let resolved = server.call(
-        Request::get("POST", &format!("/orchestration/gates/{id}/resolve")).as_agent("alice")
+        Request::get("POST", &format!("/orchestration/gates/{id}/resolve"))
+            .as_agent("alice")
             .with_body(json!({ "resolution": "yes" })),
     );
     assert_eq!(resolved.status, 200);
     assert_eq!(resolved.body["data"]["resolution"], json!("yes"));
 
     let again = server.call(
-        Request::get("POST", &format!("/orchestration/gates/{id}/resolve")).as_agent("alice")
+        Request::get("POST", &format!("/orchestration/gates/{id}/resolve"))
+            .as_agent("alice")
             .with_body(json!({ "resolution": "no" })),
     );
     assert_eq!(
@@ -710,7 +733,8 @@ mod cli_to_router {
             Request::get(
                 "POST",
                 &format!("/orchestration/dispatches/{dispatch_id}/settle"),
-            ).as_agent("alice")
+            )
+            .as_agent("alice")
             .with_body(json!({ "outcome": "succeeded" })),
         );
         assert_eq!(settled.status, 200);

@@ -361,7 +361,6 @@ fn history_button(
     el
 }
 
-
 /// The "Flip terminals" toggle (`title-bar-flip-terminals`): `VIEW_TAB`
 /// with the eye glyph and the state-flipping label — EyeOff "Flip
 /// terminals" at rest, Eye "Show terminals" while flipped — and the
@@ -625,7 +624,6 @@ pub fn titlebar_pane(
         )
         .child(drag_space(cx));
 
-
     // Right: drag space, the flip toggle, the Arrange menu, the git
     // pill, divider, window controls — the shell's island order. The
     // column clips its own overflow (`min-w-0` + justify-end), so on a
@@ -644,23 +642,23 @@ pub fn titlebar_pane(
 
     // The flip toggle and the Arrange (CodeLayout modes) button — the
     // Code view is the only view, so both are unconditional now.
-        right = right.child(
-            div()
-                .flex_none()
-                .mr(px(4.0))
-                .child(pill_wrap().child(flip_button(state.terminals_flipped, cx))),
-        );
+    right = right.child(
+        div()
+            .flex_none()
+            .mr(px(4.0))
+            .child(pill_wrap().child(flip_button(state.terminals_flipped, cx))),
+    );
     right = right.child(
         div()
             .flex_none()
             .mr(px(4.0))
             .child(pill_wrap().child(action_button("layout-grid", 14.0, "arrange", cx))),
     );
-    right = right.child(
-        div()
-            .flex_none()
-            .child(pill_wrap().child(git_button(state.git, state.window_width, cx))),
-    );
+    right = right.child(div().flex_none().child(pill_wrap().child(git_button(
+        state.git,
+        state.window_width,
+        cx,
+    ))));
 
     // `!vt` — window controls exist only off macOS, flush to the right
     // edge (`pr-0`). Separator: `mx-0.5 h-4 w-px bg-line-soft/80`.

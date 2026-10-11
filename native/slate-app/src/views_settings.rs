@@ -330,10 +330,7 @@ pub fn settings_modal(
         .py_1();
 
     // — Panes (native-ui.json prefs) —
-    body = body.child(section(
-        "Panes",
-        "Startup state for the workspace shell.",
-    ));
+    body = body.child(section("Panes", "Startup state for the workspace shell."));
     body = body.child(toggle_row(
         "slate-settings-sidebar",
         prefs.sidebar_open,

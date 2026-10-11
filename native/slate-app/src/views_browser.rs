@@ -237,7 +237,11 @@ pub fn browser_pane(
         media.name.clone()
     } else {
         // `value={isHome ? '' : address}` — home shows the placeholder.
-        if home { String::new() } else { shown_url.clone() }
+        if home {
+            String::new()
+        } else {
+            shown_url.clone()
+        }
     };
     let host = browser::host_of(&shown_url);
     let is_https = shown_url.starts_with("https://");
@@ -369,9 +373,7 @@ pub fn browser_pane(
                             };
                             let cursor = snap(editing_cursor);
                             let (lo, hi) = editing_sel
-                                .map(|anchor| {
-                                    (snap(anchor).min(cursor), snap(anchor).max(cursor))
-                                })
+                                .map(|anchor| (snap(anchor).min(cursor), snap(anchor).max(cursor)))
                                 .unwrap_or((cursor, cursor));
                             let mut row = el
                                 .child(address[..lo].to_owned())
@@ -423,16 +425,19 @@ pub fn browser_pane(
                     }),
                 ),
         )
-        .when(!editing && media.is_none() && !home && !host.is_empty(), |el| {
-            el.child(
-                div()
-                    .flex_none()
-                    .px_1()
-                    .text_size(px(10.0 * zoom))
-                    .text_color(rgb(theme::hex(theme::text::FAINT)))
-                    .child(host),
-            )
-        })
+        .when(
+            !editing && media.is_none() && !home && !host.is_empty(),
+            |el| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .px_1()
+                        .text_size(px(10.0 * zoom))
+                        .text_color(rgb(theme::hex(theme::text::FAINT)))
+                        .child(host),
+                )
+            },
+        )
         // The MediaViewer's chrome-row close — `closeMedia` wore "✕ Browser".
         .when(media.is_some(), |el| {
             el.child(
@@ -564,9 +569,7 @@ pub fn browser_pane(
                                     .text_color(rgb(theme::hex(theme::text::DIM)))
                                     .bg(rgb(theme::hex(theme::monochrome::RAISED)))
                                     .cursor_pointer()
-                                    .hover(|b| {
-                                        b.bg(rgb(theme::hex(theme::monochrome::ELEVATED)))
-                                    })
+                                    .hover(|b| b.bg(rgb(theme::hex(theme::monochrome::ELEVATED))))
                                     .child("Home")
                                     .on_mouse_down(
                                         MouseButton::Left,
@@ -591,10 +594,13 @@ pub fn browser_pane(
             // surface (the MediaViewer's overlay): viewable kinds ride the
             // webview at their file: URL under the original's name bar,
             // `doc` gets the open-externally card.
-            div().flex_1().min_h_0().flex().flex_col().child(
-                if let Some(media) = &media {
-                    media_surface(&wid, media, &url, widget.z, zoom, clip, cx)
-                        .into_any_element()
+            div()
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .flex_col()
+                .child(if let Some(media) = &media {
+                    media_surface(&wid, media, &url, widget.z, zoom, clip, cx).into_any_element()
                 } else if home {
                     div()
                         .size_full()
@@ -622,8 +628,7 @@ pub fn browser_pane(
                         .clip(clip)
                         .size_full()
                         .into_any_element()
-                },
-            ),
+                }),
         );
 
     let _ = &mut pane;
@@ -692,11 +697,7 @@ fn media_surface<'a>(
                         MouseButton::Left,
                         cx.listener(move |this, _e, _w, cx| {
                             cx.stop_propagation();
-                            this.widget_command(
-                                &wid,
-                                json!({ "op": "browser_media_close" }),
-                                cx,
-                            );
+                            this.widget_command(&wid, json!({ "op": "browser_media_close" }), cx);
                         }),
                     ),
             )

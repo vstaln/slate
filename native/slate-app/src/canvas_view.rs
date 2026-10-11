@@ -18,8 +18,8 @@ use slate_app::canvas::{self, Pos2, Vec2};
 use slate_app::journal_log::JournalLog;
 use slate_app::projection::{self, CanvasState, Widget};
 use slate_app::terminal_screen::{
-    KeyInput, KeyMods, MouseButton as TermMouseButton, MouseKind, CELL_H, CELL_W,
-    FONT_FAMILY, FONT_PX,
+    KeyInput, KeyMods, MouseButton as TermMouseButton, MouseKind, CELL_H, CELL_W, FONT_FAMILY,
+    FONT_PX,
 };
 use slate_app::theme;
 
@@ -45,13 +45,11 @@ fn default_size(kind: &str) -> (f64, f64) {
     }
 }
 
-
 /// The shell's `isTerminal`: a widget with no kind is a terminal, not an
 /// "unknown widget" — legacy journal entries rely on it.
 fn is_terminal_kind(kind: Option<&str>) -> bool {
     matches!(kind, None | Some("terminal"))
 }
-
 
 /// StartupWordmark's fixed beats, in seconds since the first frame: the
 /// particle timeline runs to t=8, and the startup screen itself fades out
@@ -139,8 +137,10 @@ fn paint_splash_particles(window: &mut Window, points: &[SplashPoint], t: f32) {
         // moveCloudPoint(cloud, t * .3) — the tiny idle drift on the
         // scattered start position.
         let drift_t = t * 0.3;
-        let cloud_x = p.cloud[0] + (drift_t * r[2] + std::f32::consts::TAU * r[3]).sin() * (0.015 + 0.06 * r[0]);
-        let cloud_y = p.cloud[1] + (drift_t * r[1] + std::f32::consts::TAU * r[0]).sin() * (0.015 + 0.06 * r[3]);
+        let cloud_x = p.cloud[0]
+            + (drift_t * r[2] + std::f32::consts::TAU * r[3]).sin() * (0.015 + 0.06 * r[0]);
+        let cloud_y = p.cloud[1]
+            + (drift_t * r[1] + std::f32::consts::TAU * r[0]).sin() * (0.015 + 0.06 * r[3]);
         let sx = r[0] * width + cloud_x * 12.0;
         let sy = r[1] * height + cloud_y * 12.0;
         let angle = (sy - cy).atan2(sx - cx) + pull * (2.5 + r[3] * 2.0);
@@ -216,7 +216,6 @@ fn kbd_hint(chip: &'static str, suffix: &'static str, tip: &'static str) -> Stat
         .child(kbd_chip(chip))
         .child(suffix)
 }
-
 
 pub struct CanvasView {
     pub(crate) focus: FocusHandle,
@@ -637,7 +636,12 @@ fn widget_alias(name: &str) -> Option<&'static str> {
 /// mode; the shell's `role=menuitemradio` row. The click handler stays
 /// with the caller: Canvas rows journal an arrange, Code rows pick a
 /// terminal layout.
-fn arrange_menu_row(slug: String, label: &'static str, hint: &'static str, current: bool) -> Stateful<Div> {
+fn arrange_menu_row(
+    slug: String,
+    label: &'static str,
+    hint: &'static str,
+    current: bool,
+) -> Stateful<Div> {
     div()
         .id(slug)
         .w_full()
@@ -694,9 +698,7 @@ fn parse_widget_invocation(input: &str, prefix: &str) -> Option<(&'static str, S
         .filter(|c| matches!(c, '/' | '.' | '@'));
     // `prefix !== 'any'` requires the invocation to open with that exact
     // sigil — `/` typed while commandPrefix is `.` is just a message.
-    if prefix != "any"
-        && sigil.map(|c| c.to_string()).as_deref() != Some(prefix)
-    {
+    if prefix != "any" && sigil.map(|c| c.to_string()).as_deref() != Some(prefix) {
         return None;
     }
     let bare = match sigil {
@@ -767,7 +769,10 @@ fn toolbar_suggestions(buffer: &str, command_prefix: &str) -> Vec<(String, Strin
     // applies only when the user actually typed one; a bare query suggests
     // regardless of the configured prefix.
     if command_prefix != "any"
-        && sigil.map(|c| c.to_string()).as_deref().is_some_and(|s| s != command_prefix)
+        && sigil
+            .map(|c| c.to_string())
+            .as_deref()
+            .is_some_and(|s| s != command_prefix)
     {
         return Vec::new();
     }
@@ -781,8 +786,7 @@ fn toolbar_suggestions(buffer: &str, command_prefix: &str) -> Vec<(String, Strin
         .iter()
         .filter(|(kind, _, _)| renderable(kind))
         .filter(|(kind, _, _)| {
-            kind.starts_with(query.as_str())
-                || kind.replace('-', "").starts_with(squashed.as_str())
+            kind.starts_with(query.as_str()) || kind.replace('-', "").starts_with(squashed.as_str())
         })
         .map(|&(kind, label, hint)| (kind.to_owned(), label.to_owned(), hint.to_owned()))
         .collect();
@@ -818,7 +822,6 @@ fn agent_launchers(
         .collect()
 }
 
-
 fn journal_path() -> std::path::PathBuf {
     slate_app::ipc::user_data_dir().join("command-journal.ndjson")
 }
@@ -848,7 +851,9 @@ struct GuiEnv<'a> {
 }
 
 fn lock_recover<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// The apply's `throw new CommandError(code, message)` — the abort entry
@@ -876,10 +881,7 @@ fn gui_submit(
     target: &str,
     payload: Value,
     work: impl FnOnce() -> Result<Value, slate_app::http::Response>,
-) -> Result<
-    (slate_app::journal::JournalEntry, Value),
-    slate_app::http::Response,
-> {
+) -> Result<(slate_app::journal::JournalEntry, Value), slate_app::http::Response> {
     let mut env = GuiEnv { manager };
     let mut orchestration = load_orchestration_store();
     let mut deps = slate_app::http::RouteDeps {
@@ -943,15 +945,16 @@ fn mount_spawn(
         &format!("terminal:{id}"),
         payload,
         || {
-            let adopted = manager.spawn_with_options(
-                id.to_owned(),
-                cols,
-                rows,
-                cwd,
-                slate_app::platform::shell_command(),
-                HashMap::new(),
-            )
-            .map_err(|error| command_failed(slate_app::command::ErrorCode::Failed, error))?;
+            let adopted = manager
+                .spawn_with_options(
+                    id.to_owned(),
+                    cols,
+                    rows,
+                    cwd,
+                    slate_app::platform::shell_command(),
+                    HashMap::new(),
+                )
+                .map_err(|error| command_failed(slate_app::command::ErrorCode::Failed, error))?;
             live = Some(adopted);
             // The apply answered `{ok, live, scrollback}` — `fullOutput` for
             // a reconnect, the retained scrollback otherwise.
@@ -1016,15 +1019,12 @@ impl slate_app::http::RouteEnv for GuiEnv<'_> {
         caller: Option<&str>,
     ) -> Result<String, slate_app::command::CommandError> {
         let id = self.manager.resolve(target, caller)?;
-        self.manager
-            .snapshot(&id)
-            .map(|_| id.clone())
-            .map_err(|_| {
-                slate_app::command::CommandError::new(
-                    slate_app::command::ErrorCode::NotFound,
-                    format!("no terminal \"{id}\""),
-                )
-            })
+        self.manager.snapshot(&id).map(|_| id.clone()).map_err(|_| {
+            slate_app::command::CommandError::new(
+                slate_app::command::ErrorCode::NotFound,
+                format!("no terminal \"{id}\""),
+            )
+        })
     }
 
     fn resolve_write_target(&mut self, requested: &str) -> Option<String> {
@@ -1174,7 +1174,6 @@ impl CanvasView {
                             });
                         }
                     }
-
                 }
             }
         }
@@ -1300,7 +1299,7 @@ impl CanvasView {
                 let alive = this
                     .update(cx, |view, cx| {
                         view.snapshots = view.manager.snapshots();
-        view.refresh_agent_states();
+                        view.refresh_agent_states();
                         // Recovery timers — the child-exit confirmation and
                         // the Ctrl-C/D corpse check (the shell's
                         // `modeRecoveryTimer`/`interruptRecoveryTimer`).
@@ -1316,10 +1315,8 @@ impl CanvasView {
                                 // screen (the shell's `status:'finished'`
                                 // gray dot); a widget.remove journal entry
                                 // for a widget that never existed is noise.
-                                if let Some(session) = view
-                                    .code_sessions
-                                    .iter_mut()
-                                    .find(|s| s.terminal_id == *id)
+                                if let Some(session) =
+                                    view.code_sessions.iter_mut().find(|s| s.terminal_id == *id)
                                 {
                                     session.alive = false;
                                     if view.active.as_deref() == Some(id.as_str()) {
@@ -1428,9 +1425,7 @@ impl CanvasView {
                                                 && is_terminal_kind(w.kind.as_deref())
                                                 && view.manager.snapshot(&w.id).is_err()
                                         })
-                                        .map(|w| {
-                                            (w.id.clone(), w.title.clone(), w.w, w.h)
-                                        })
+                                        .map(|w| (w.id.clone(), w.title.clone(), w.w, w.h))
                                         .collect();
                                     for (id, title, w, h) in newcomers {
                                         let (cols, rows) =
@@ -1457,7 +1452,7 @@ impl CanvasView {
                                     // widget one beat after it appeared.
                                     // Refresh so `live` sees the spawns.
                                     view.snapshots = view.manager.snapshots();
-        view.refresh_agent_states();
+                                    view.refresh_agent_states();
                                     // A focused widget can vanish in the
                                     // refold (`slate canvas remove`) — a
                                     // stale id would keep swallowing keys
@@ -1534,8 +1529,7 @@ impl CanvasView {
                                 .get(&id)
                                 .map(|widget| (widget.w, widget.h))
                                 .unwrap_or((352.0, 295.0));
-                            let (cols, rows) =
-                                terminal_cells(w, h, view.canvas.camera.zoom);
+                            let (cols, rows) = terminal_cells(w, h, view.canvas.camera.zoom);
                             let _ = mount_spawn(
                                 &view.manager,
                                 view.workspace_dir.as_deref(),
@@ -1583,14 +1577,10 @@ impl CanvasView {
                                     // Dropping here is what kept a popup
                                     // loop from minting MAX_WIDGETS widgets.
                                     let now = Instant::now();
-                                    while view
-                                        .popup_opens
-                                        .front()
-                                        .is_some_and(|stamp| {
-                                            now.duration_since(*stamp)
-                                                > std::time::Duration::from_secs(5)
-                                        })
-                                    {
+                                    while view.popup_opens.front().is_some_and(|stamp| {
+                                        now.duration_since(*stamp)
+                                            > std::time::Duration::from_secs(5)
+                                    }) {
                                         view.popup_opens.pop_front();
                                     }
                                     if view.popup_opens.len() < 3 {
@@ -1598,16 +1588,14 @@ impl CanvasView {
                                         let id = view.fresh_id("browser");
                                         let zoom = view.canvas.camera.zoom;
                                         let center = Pos2::new(
-                                            ((view.viewport.x as f64 / 2.0
-                                                - view.canvas.camera.x)
-                                                / zoom) as f32,
-                                            ((view.viewport.y as f64 / 2.0
-                                                - view.canvas.camera.y)
-                                                / zoom) as f32,
+                                            ((view.viewport.x as f64 / 2.0 - view.canvas.camera.x)
+                                                / zoom)
+                                                as f32,
+                                            ((view.viewport.y as f64 / 2.0 - view.canvas.camera.y)
+                                                / zoom)
+                                                as f32,
                                         );
-                                        view.create_widget_at(
-                                            &id, "browser", "Browser", center,
-                                        );
+                                        view.create_widget_at(&id, "browser", "Browser", center);
                                         view.widget_command(
                                             &id,
                                             json!({ "op": "browser_navigate", "url": url }),
@@ -1646,9 +1634,7 @@ impl CanvasView {
                         // Journal-side removals never run close_widget —
                         // drop webviews whose widgets vanished, and clear
                         // an omnibox edit whose widget is gone.
-                        slate_app::webview::gc(
-                            &view.canvas.widgets.keys().cloned().collect(),
-                        );
+                        slate_app::webview::gc(&view.canvas.widgets.keys().cloned().collect());
                         if let Some(editing) = &view.browser_editing {
                             if !view.canvas.widgets.contains_key(editing) {
                                 view.browser_editing = None;
@@ -1775,8 +1761,7 @@ impl CanvasView {
                     if view.git_polling || Instant::now() < view.git_next_poll {
                         None
                     } else {
-                        view.git_next_poll =
-                            Instant::now() + crate::views_titlebar::GIT_POLL_EVERY;
+                        view.git_next_poll = Instant::now() + crate::views_titlebar::GIT_POLL_EVERY;
                         match view.workspace_dir.clone() {
                             Some(dir) => {
                                 view.git_polling = true;
@@ -1952,7 +1937,7 @@ impl CanvasView {
         let Some(agent_id) = self.agent_picks.launched.get(id).cloned() else {
             return;
         };
-                if let Some((_, _, command)) = agent_launchers(&self.prefs)
+        if let Some((_, _, command)) = agent_launchers(&self.prefs)
             .iter()
             .find(|(aid, _, _)| *aid == *agent_id)
         {
@@ -2067,7 +2052,9 @@ impl CanvasView {
         } else {
             (&mut self.undo_stack, &mut self.redo_stack)
         };
-        let Some(mut restored) = from.pop() else { return };
+        let Some(mut restored) = from.pop() else {
+            return;
+        };
         // The shell's history snapshots never included the camera — undo
         // walks widgets/strokes/connections, the view stays put.
         restored.camera = self.canvas.camera.clone();
@@ -2242,14 +2229,12 @@ impl CanvasView {
                                 .and_then(|e| e.to_str())
                                 .unwrap_or("")
                                 .to_ascii_lowercase();
-                            let safe_ext =
-                                if WALLPAPER_EXTENSIONS.contains(&ext.as_str()) {
-                                    ext
-                                } else {
-                                    "png".to_owned()
-                                };
-                            let dir =
-                                slate_app::ipc::user_data_dir().join("backgrounds");
+                            let safe_ext = if WALLPAPER_EXTENSIONS.contains(&ext.as_str()) {
+                                ext
+                            } else {
+                                "png".to_owned()
+                            };
+                            let dir = slate_app::ipc::user_data_dir().join("backgrounds");
                             if std::fs::create_dir_all(&dir).is_err() {
                                 return;
                             }
@@ -2451,7 +2436,6 @@ impl CanvasView {
         );
     }
 
-
     /// Double-clicking a widget title opens the shell's rename input. The
     /// buffer seeds from the current title; Enter or a click elsewhere
     /// commits, Escape cancels.
@@ -2522,11 +2506,8 @@ impl CanvasView {
         self.workspace_dir = Some(dir);
         let journal_path = slate_app::ipc::user_data_dir().join("command-journal.ndjson");
         if let Ok(log) = slate_app::journal_log::JournalLog::open(&journal_path) {
-            self.canvas = slate_app::canvas_store::load_with_tail(
-                self.workspace_dir.as_deref(),
-                &log,
-            )
-            .0;
+            self.canvas =
+                slate_app::canvas_store::load_with_tail(self.workspace_dir.as_deref(), &log).0;
             // The shell reset `cascadeRef` on hydrate — a fresh canvas
             // starts the adoption grid over.
             self.cascade_count = 0;
@@ -2664,10 +2645,7 @@ impl CanvasView {
             let (w, h) = self.spawn_size(widget_kind);
             // `placeWidget` → `addWidget`: the requested point is clamped
             // into the visible world first, then stored at `point - 16`.
-            let mut at = Pos2::new(
-                drop.x + placed as f32 * 28.0,
-                drop.y + placed as f32 * 28.0,
-            );
+            let mut at = Pos2::new(drop.x + placed as f32 * 28.0, drop.y + placed as f32 * 28.0);
             if self.viewport.x > 0.0 {
                 at = canvas::clamp_to_visible_world(&self.canvas.camera, self.viewport, at, w, h);
             }
@@ -2684,8 +2662,8 @@ impl CanvasView {
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| name.clone());
-            let image_path = (widget_kind == "image")
-                .then(|| imported.to_string_lossy().into_owned());
+            let image_path =
+                (widget_kind == "image").then(|| imported.to_string_lossy().into_owned());
             // For a browser widget the media reference rides in `state.media`
             // — `{mediaUrl, path, name, kind}`, the shape the shell persisted
             // under `orcspace-browser-media:<id>` after the open-media event.
@@ -2740,8 +2718,6 @@ impl CanvasView {
         }
         cx.notify();
     }
-
-
 
     /// Spawn centred in the current viewport, like the Electron app's T/N.
     fn spawn_terminal(&mut self, viewport: Vec2, cx: &mut Context<Self>) {
@@ -2860,7 +2836,6 @@ impl CanvasView {
         cx.notify();
     }
 
-
     fn close_widget(&mut self, id: &str, cx: &mut Context<Self>) {
         let is_terminal = self
             .canvas
@@ -2959,7 +2934,6 @@ impl CanvasView {
             .max_by(|a, b| a.z.total_cmp(&b.z))
             .map(|w| w.id.clone())
     }
-
 
     /// The command bar's `activeTerminalId`: the configured target while
     /// that terminal still lives, else the topmost one — the shell's
@@ -3071,9 +3045,10 @@ impl CanvasView {
 
     fn adopt_suggestion(&mut self) {
         let suggestions = self.command_suggestions();
-        let Some((kind, _, _)) = suggestions
-            .get(self.command_suggestion.min(suggestions.len().saturating_sub(1)))
-        else {
+        let Some((kind, _, _)) = suggestions.get(
+            self.command_suggestion
+                .min(suggestions.len().saturating_sub(1)),
+        ) else {
             return;
         };
         self.adopt_kind(&kind.clone());
@@ -3111,7 +3086,10 @@ impl CanvasView {
             .unwrap_or_default();
         let suggestions = self.command_suggestions();
         let picked = suggestions
-            .get(self.command_suggestion.min(suggestions.len().saturating_sub(1)))
+            .get(
+                self.command_suggestion
+                    .min(suggestions.len().saturating_sub(1)),
+            )
             .map(|(kind, _, _)| kind.as_str());
         if picked.is_some_and(|kind| kind != typed) {
             self.adopt_suggestion();
@@ -3129,10 +3107,7 @@ impl CanvasView {
         // `/agent <name> <command>` — the launcher's "+ Other" flow. Runs
         // in command mode only; message mode keeps treating it as text.
         if !self.command_message {
-            let first = buffer
-                .split_whitespace()
-                .next()
-                .unwrap_or("");
+            let first = buffer.split_whitespace().next().unwrap_or("");
             let verb = first
                 .strip_prefix(|c: char| "/.@".contains(c))
                 .unwrap_or(first);
@@ -3185,7 +3160,11 @@ impl CanvasView {
     /// `PlannerStore.nextOrder` against the folded planner state — snapshot
     /// items plus the journal tail, read-only. `None` when the store can't
     /// be read; the fold then falls back to the payload's own `order`.
-    fn planner_next_order(&self, day: Option<&str>, today: &slate_app::planner::Today) -> Option<f64> {
+    fn planner_next_order(
+        &self,
+        day: Option<&str>,
+        today: &slate_app::planner::Today,
+    ) -> Option<f64> {
         let dir = slate_app::ipc::user_data_dir();
         let document =
             slate_app::planner_document::PlannerDocument::open(dir.join("workspace-planner.json"))
@@ -3418,9 +3397,7 @@ impl CanvasView {
                             self.notice(format!("refusing to delete a symlink: {raw}"));
                         }
                         _ => match self.file_jail(raw) {
-                            None => {
-                                self.notice("delete refused — path escapes workspace")
-                            }
+                            None => self.notice("delete refused — path escapes workspace"),
                             // `file.delete` on `file:{path}` — the removal
                             // runs inside the gate chain like the original's
                             // apply, so a failed delete journals
@@ -3463,14 +3440,12 @@ impl CanvasView {
                                         } else {
                                             std::fs::remove_file(&for_work)
                                         };
-                                        result
-                                            .map(|_| json!({ "ok": true }))
-                                            .map_err(|e| {
-                                                command_failed(
-                                                    slate_app::command::ErrorCode::Failed,
-                                                    e.to_string(),
-                                                )
-                                            })
+                                        result.map(|_| json!({ "ok": true })).map_err(|e| {
+                                            command_failed(
+                                                slate_app::command::ErrorCode::Failed,
+                                                e.to_string(),
+                                            )
+                                        })
                                     },
                                 );
                             }
@@ -3543,14 +3518,12 @@ impl CanvasView {
                                                 }
                                             })
                                     };
-                                    result
-                                        .map(|_| json!({ "ok": true }))
-                                        .map_err(|message| {
-                                            command_failed(
-                                                slate_app::command::ErrorCode::Failed,
-                                                message,
-                                            )
-                                        })
+                                    result.map(|_| json!({ "ok": true })).map_err(|message| {
+                                        command_failed(
+                                            slate_app::command::ErrorCode::Failed,
+                                            message,
+                                        )
+                                    })
                                 },
                             );
                             if committed.is_ok() {
@@ -3600,8 +3573,7 @@ impl CanvasView {
                                     .map(|parent| parent.join(name))
                                     .and_then(|t| self.file_jail(&t.to_string_lossy()));
                                 match target {
-                                    None => self
-                                        .notice("rename refused — path escapes workspace"),
+                                    None => self.notice("rename refused — path escapes workspace"),
                                     // `file.rename` on `file:{src}` —
                                     // `{path: src, to: destination}` like
                                     // `sendFileCommand` sent.
@@ -3653,8 +3625,7 @@ impl CanvasView {
                                                     && p.path == src.to_string_lossy()
                                             );
                                             if previewed {
-                                                match crate::views_files::preview_load(&target)
-                                                {
+                                                match crate::views_files::preview_load(&target) {
                                                     Ok((body, size)) => {
                                                         self.files_preview = Some(
                                                             crate::views_files::FilesPreview {
@@ -3707,19 +3678,48 @@ impl CanvasView {
                             // `notes.txt` symlink to `payload.sh` is caught
                             // from either side.
                             const EXECUTABLE: &[&str] = &[
-                                "exe", "bat", "cmd", "com", "scr", "msi", "ps1", "vbs", "vbe",
-                                "js", "mjs", "cjs", "jse", "wsf", "wsh", "jar", "sh", "bash",
-                                "lnk", "reg", "py", "pyw", "iso", "vhd", "vhdx", "hta", "msc",
-                                "cpl", "url", "inf", "pif", "appref-ms", "wsb", "mof", "gadget",
+                                "exe",
+                                "bat",
+                                "cmd",
+                                "com",
+                                "scr",
+                                "msi",
+                                "ps1",
+                                "vbs",
+                                "vbe",
+                                "js",
+                                "mjs",
+                                "cjs",
+                                "jse",
+                                "wsf",
+                                "wsh",
+                                "jar",
+                                "sh",
+                                "bash",
+                                "lnk",
+                                "reg",
+                                "py",
+                                "pyw",
+                                "iso",
+                                "vhd",
+                                "vhdx",
+                                "hta",
+                                "msc",
+                                "cpl",
+                                "url",
+                                "inf",
+                                "pif",
+                                "appref-ms",
+                                "wsb",
+                                "mof",
+                                "gadget",
                             ];
                             const ACTIVE_MARKUP: &[&str] =
                                 &["html", "htm", "xhtml", "shtml", "svg", "mhtml", "xht"];
                             let trimmed = path.with_file_name(
                                 path.file_name()
                                     .map(|n| {
-                                        n.to_string_lossy()
-                                            .trim_end_matches(['.', ' '])
-                                            .to_owned()
+                                        n.to_string_lossy().trim_end_matches(['.', ' ']).to_owned()
                                     })
                                     .unwrap_or_default(),
                             );
@@ -3793,17 +3793,16 @@ impl CanvasView {
                                 // The dialog traps focus — an open field
                                 // edit releases first.
                                 self.files_editing = None;
-                                self.files_preview =
-                                    Some(crate::views_files::FilesPreview {
-                                        id: id.to_owned(),
-                                        name: path
-                                            .file_name()
-                                            .map(|n| n.to_string_lossy().into_owned())
-                                            .unwrap_or_default(),
-                                        path: path.to_string_lossy().into_owned(),
-                                        size,
-                                        body,
-                                    });
+                                self.files_preview = Some(crate::views_files::FilesPreview {
+                                    id: id.to_owned(),
+                                    name: path
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().into_owned())
+                                        .unwrap_or_default(),
+                                    path: path.to_string_lossy().into_owned(),
+                                    size,
+                                    body,
+                                });
                             }
                         },
                     }
@@ -3822,12 +3821,8 @@ impl CanvasView {
             Some("file_copy_content") => {
                 if let Some(preview) = &self.files_preview {
                     if preview.id == id {
-                        if let crate::views_files::FilesPreviewBody::Text(text) =
-                            &preview.body
-                        {
-                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-                                text.clone(),
-                            ));
+                        if let crate::views_files::FilesPreviewBody::Text(text) = &preview.body {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.clone()));
                         }
                     }
                 }
@@ -3912,9 +3907,7 @@ impl CanvasView {
             // no jail check — the shell's had none either).
             Some("browser_media_open") => {
                 if let Some(path) = action.get("path").and_then(Value::as_str) {
-                    if let Err(error) =
-                        std::process::Command::new("xdg-open").arg(path).spawn()
-                    {
+                    if let Err(error) = std::process::Command::new("xdg-open").arg(path).spawn() {
                         self.notice(format!("open {path}: {error}"));
                     }
                 }
@@ -3923,7 +3916,11 @@ impl CanvasView {
             // lives on CanvasView next to `rename_buffer`. Entering edit
             // selects the whole value, the DOM input's `e.target.select()`.
             Some("browser_edit") => {
-                if action.get("editing").and_then(Value::as_bool).unwrap_or(false) {
+                if action
+                    .get("editing")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
                     self.browser_editing = Some(id.to_owned());
                     self.browser_cursor = self.browser_address.len();
                     self.browser_sel = Some(0);
@@ -4096,7 +4093,6 @@ impl CanvasView {
         }
     }
 
-
     fn widget_kind(&self, id: &str) -> Option<String> {
         self.canvas
             .widgets
@@ -4114,7 +4110,6 @@ impl CanvasView {
                 .iter()
                 .any(|session| session.terminal_id == id)
     }
-
 
     /// The Code grid's top-left in window space — the cover's offset plus
     /// the pane's own chrome (title strip, then the launcher row).
@@ -4256,12 +4251,7 @@ impl CanvasView {
 
     /// The Code view's verbs — `views_code::code_pane` dispatches here
     /// (see its module doc for the payload contract).
-    pub(crate) fn code_command(
-        &mut self,
-        action: &str,
-        payload: Value,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn code_command(&mut self, action: &str, payload: Value, cx: &mut Context<Self>) {
         match action {
             "launcher" => self.code_launcher_open = !self.code_launcher_open,
             "add_agent" => {
@@ -4274,18 +4264,14 @@ impl CanvasView {
             "toggle_worktree" => self.code_worktree = !self.code_worktree,
             "pin_session" => {
                 if let Some(id) = payload.get("id").and_then(Value::as_str) {
-                    if let Some(session) =
-                        self.code_sessions.iter_mut().find(|s| s.id == id)
-                    {
+                    if let Some(session) = self.code_sessions.iter_mut().find(|s| s.id == id) {
                         session.pinned = !session.pinned;
                     }
                 }
             }
             "settle_session" => {
                 if let Some(id) = payload.get("id").and_then(Value::as_str) {
-                    if let Some(session) =
-                        self.code_sessions.iter_mut().find(|s| s.id == id)
-                    {
+                    if let Some(session) = self.code_sessions.iter_mut().find(|s| s.id == id) {
                         session.settled = true;
                         session.pinned = false;
                         if self.code_focused.as_deref() == Some(id) {
@@ -4296,9 +4282,7 @@ impl CanvasView {
             }
             "restore_session" => {
                 if let Some(id) = payload.get("id").and_then(Value::as_str) {
-                    if let Some(session) =
-                        self.code_sessions.iter_mut().find(|s| s.id == id)
-                    {
+                    if let Some(session) = self.code_sessions.iter_mut().find(|s| s.id == id) {
                         session.settled = false;
                     }
                 }
@@ -4321,10 +4305,7 @@ impl CanvasView {
                     .get("agent")
                     .and_then(Value::as_str)
                     .unwrap_or("custom");
-                let command = payload
-                    .get("command")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
+                let command = payload.get("command").and_then(Value::as_str).unwrap_or("");
                 // `browser` opened a webview widget, not a PTY — point at
                 // the canvas widget instead. `custom` (empty command)
                 // launches a bare shell.
@@ -4421,15 +4402,25 @@ impl CanvasView {
                 let all_selected = self
                     .code_conversations
                     .iter()
-                    .filter(|c| !dismissed.contains(&slate_app::code_resume::conversation_key(c.agent_id, &c.id)))
-                    .all(|c| self.code_resume_selected.contains(&slate_app::code_resume::conversation_key(c.agent_id, &c.id)));
+                    .filter(|c| {
+                        !dismissed
+                            .contains(&slate_app::code_resume::conversation_key(c.agent_id, &c.id))
+                    })
+                    .all(|c| {
+                        self.code_resume_selected
+                            .contains(&slate_app::code_resume::conversation_key(c.agent_id, &c.id))
+                    });
                 if all_selected {
                     self.code_resume_selected.clear();
                 } else {
                     self.code_resume_selected = self
                         .code_conversations
                         .iter()
-                        .filter(|c| !dismissed.contains(&slate_app::code_resume::conversation_key(c.agent_id, &c.id)))
+                        .filter(|c| {
+                            !dismissed.contains(&slate_app::code_resume::conversation_key(
+                                c.agent_id, &c.id,
+                            ))
+                        })
                         .map(|c| slate_app::code_resume::conversation_key(c.agent_id, &c.id))
                         .collect();
                     if self.code_resume_selected.len() > slate_app::code_resume::COLLAPSED_ROWS {
@@ -4473,10 +4464,7 @@ impl CanvasView {
                     .get("agent")
                     .and_then(Value::as_str)
                     .unwrap_or("custom");
-                let command = payload
-                    .get("command")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
+                let command = payload.get("command").and_then(Value::as_str).unwrap_or("");
                 let title = payload
                     .get("title")
                     .and_then(Value::as_str)
@@ -4493,9 +4481,9 @@ impl CanvasView {
                     .code_conversations
                     .iter()
                     .filter(|c| {
-                        !self.code_resume_dismissed.contains(
-                            &slate_app::code_resume::conversation_key(c.agent_id, &c.id),
-                        )
+                        !self
+                            .code_resume_dismissed
+                            .contains(&slate_app::code_resume::conversation_key(c.agent_id, &c.id))
                     })
                     .cloned()
                     .collect();
@@ -4506,22 +4494,31 @@ impl CanvasView {
                     remaining,
                 ) {
                     let title = {
-                        let t = conversation.title.trim().chars().take(80).collect::<String>();
+                        let t = conversation
+                            .title
+                            .trim()
+                            .chars()
+                            .take(80)
+                            .collect::<String>();
                         if t.is_empty() {
                             None
                         } else {
                             Some(t)
                         }
                     };
-                    self.launch_code_session(conversation.agent_id, &conversation.command, title, false, cx);
+                    self.launch_code_session(
+                        conversation.agent_id,
+                        &conversation.command,
+                        title,
+                        false,
+                        cx,
+                    );
                 }
                 self.code_resume_selected.clear();
             }
             "focus_session" => {
                 if let Some(id) = payload.get("id").and_then(Value::as_str) {
-                    if let Some(session) =
-                        self.code_sessions.iter().find(|s| s.id == id)
-                    {
+                    if let Some(session) = self.code_sessions.iter().find(|s| s.id == id) {
                         self.code_focused = Some(session.id.clone());
                         self.active = Some(session.terminal_id.clone());
                         let _ = self.manager.focus_input(&session.terminal_id, true);
@@ -4578,7 +4575,9 @@ impl CanvasView {
     /// The resume scan's dismissal list, persisted for `workspace_dir` —
     /// the original's `writeDismissed` localStorage key.
     fn save_resume_dismissed(&self) {
-        let Some(dir) = self.workspace_dir.clone() else { return };
+        let Some(dir) = self.workspace_dir.clone() else {
+            return;
+        };
         let live: std::collections::HashSet<String> = self
             .code_conversations
             .iter()
@@ -4591,12 +4590,12 @@ impl CanvasView {
     /// `ResumeAgents` mount in the original. `code_resume_dir` arms once
     /// per folder; a refresh or a workspace switch re-arms it.
     fn maybe_scan_resume(&mut self, cx: &mut Context<Self>) {
-        if !self.code_sessions.is_empty()
-            || self.code_resume_loading
-        {
+        if !self.code_sessions.is_empty() || self.code_resume_loading {
             return;
         }
-        let Some(dir) = self.workspace_dir.clone() else { return };
+        let Some(dir) = self.workspace_dir.clone() else {
+            return;
+        };
         if self.code_resume_dir.as_deref() == Some(dir.as_str()) {
             return;
         }
@@ -4751,17 +4750,14 @@ impl CanvasView {
                 0.0
             };
         let height = (viewport.y - canvas::TITLE_BAR_HEIGHT - chrome).max(0.0);
-        let area = canvas::Rect::from_min_size(
-            canvas::Pos2::ZERO,
-            canvas::Vec2::new(viewport.x, height),
-        );
+        let area =
+            canvas::Rect::from_min_size(canvas::Pos2::ZERO, canvas::Vec2::new(viewport.x, height));
         let focus = self
             .code_focused
             .as_deref()
             .and_then(|id| self.code_sessions.iter().position(|s| s.id == id))
             .unwrap_or(0);
-        let rects =
-            slate_app::code_layout::arrange(self.code_layout, area, count, focus);
+        let rects = slate_app::code_layout::arrange(self.code_layout, area, count, focus);
         // The card header takes 24px; the terminal body pads 4px a side
         // and its grid advances CELL_W×CELL_H px — the painter's metrics.
         // Collect first — the iterator borrows `code_sessions`, and the
@@ -4772,9 +4768,7 @@ impl CanvasView {
             .zip(rects)
             .map(|(session, rect)| {
                 let cols = ((rect.width() - 8.0) / CELL_W).floor().clamp(20.0, 500.0) as u16;
-                let rows = ((rect.height() - 32.0) / CELL_H)
-                    .floor()
-                    .clamp(4.0, 300.0) as u16;
+                let rows = ((rect.height() - 32.0) / CELL_H).floor().clamp(4.0, 300.0) as u16;
                 (session.terminal_id.clone(), cols, rows)
             })
             .collect();
@@ -4808,7 +4802,6 @@ impl CanvasView {
             self.term_resize_pending.remove(id);
         }
     }
-
 }
 
 /// The title case the spawn paths give every kind ("files" → "Files").
@@ -4860,8 +4853,7 @@ fn terminal_cells(w: f64, h: f64, zoom: f64) -> (u16, u16) {
     // CELL_W advance / CELL_H row, 1px frame + 4px p_1 padding per side — so
     // the PTY grid fills the card the glyph layout actually draws into.
     let body_w = (w * zoom - 10.0).max(40.0) as f32;
-    let body_h =
-        (h * zoom - theme::geometry::HEADER_HEIGHT as f64 * zoom - 10.0).max(20.0) as f32;
+    let body_h = (h * zoom - theme::geometry::HEADER_HEIGHT as f64 * zoom - 10.0).max(20.0) as f32;
     let cols = (body_w / (CELL_W * zoom as f32).max(2.0)).clamp(20.0, 500.0) as u16;
     let rows = (body_h / (CELL_H * zoom as f32).max(2.0)).clamp(4.0, 300.0) as u16;
     (cols, rows)
@@ -4891,11 +4883,7 @@ const MAX_WALLPAPER_BYTES: u64 = 256 * 1024 * 1024;
 
 /// `media.mimeTypeForPath` for the wallpaper read-back.
 fn wallpaper_mime(path: &str) -> &'static str {
-    let ext = path
-        .rsplit('.')
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
+    let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
     match ext.as_str() {
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
@@ -5117,11 +5105,7 @@ fn widget_body(
             } else {
                 let base_bg = theme::hex(theme::monochrome::BASE);
                 for row in styled {
-                    let mut line = div()
-                        .h(px(CELL_H * zoom))
-                        .flex()
-                        .flex_row()
-                        .flex_none();
+                    let mut line = div().h(px(CELL_H * zoom)).flex().flex_row().flex_none();
                     if row.is_empty() {
                         line = line.child("\u{00a0}");
                     }
@@ -5227,7 +5211,12 @@ fn widget_body(
         Some("notes") => div()
             .size_full()
             .text_size(font)
-            .child(crate::views_notes::notes_pane(widget, notes_editing, notes_buffer, cx))
+            .child(crate::views_notes::notes_pane(
+                widget,
+                notes_editing,
+                notes_buffer,
+                cx,
+            ))
             .into_any_element(),
         Some("timer") => div()
             .size_full()
@@ -5329,8 +5318,7 @@ impl Render for CanvasView {
         let mut sizes: Vec<(String, u16, u16)> = Vec::new();
         for widget in self.canvas.widgets.values() {
             if is_terminal_kind(widget.kind.as_deref()) {
-                let (w, h) = if shown_id.as_deref() == Some(widget.id.as_str())
-                    || widget.maximized
+                let (w, h) = if shown_id.as_deref() == Some(widget.id.as_str()) || widget.maximized
                 {
                     (pane.width() as f64, pane.height() as f64)
                 } else {
@@ -5563,7 +5551,6 @@ impl Render for CanvasView {
                 cx.notify();
             }));
 
-
         // The wallpaper — the shell's `.wallpaper-container`: a full-bleed
         // image under everything (settings `background` holds a data:image
         // URL; `backgroundImage` holds the Electron managed path, resolved
@@ -5586,9 +5573,7 @@ impl Render for CanvasView {
                 cx.spawn(async move |this, cx| {
                     let source = cx
                         .background_executor()
-                        .spawn(async move {
-                            blur_wallpaper(&url_for_job, blur, viewport_for_job)
-                        })
+                        .spawn(async move { blur_wallpaper(&url_for_job, blur, viewport_for_job) })
                         .await;
                     let _ = this.update(cx, |this, cx| {
                         // `wallpaper_blurring` stays set — it marks the key
@@ -5634,8 +5619,7 @@ impl Render for CanvasView {
                             .object_fit(gpui::ObjectFit::Cover),
                     ),
                 );
-                let dim =
-                    (self.settings.background_dim.min(100) as f32 / 100.0 * 255.0) as u32;
+                let dim = (self.settings.background_dim.min(100) as f32 / 100.0 * 255.0) as u32;
                 if dim > 0 {
                     root = root.child(div().absolute().inset_0().bg(rgba(0x08080800 | dim)));
                 }
@@ -5644,7 +5628,6 @@ impl Render for CanvasView {
             self.wallpaper_cache = None;
             self.wallpaper_raw = None;
         }
-
 
         // The X11 webview child can't be clipped by GPUI compositing, so
         // the shown browser pane gets an explicit window-space clip — the
@@ -5656,7 +5639,13 @@ impl Render for CanvasView {
         // shell's maximized overlay did. Hidden panes keep running — but a
         // browser's native webview child must be told to stop painting or
         // X11 leaves it on screen.
-        for widget in self.canvas.widgets.values().cloned().collect::<Vec<Widget>>() {
+        for widget in self
+            .canvas
+            .widgets
+            .values()
+            .cloned()
+            .collect::<Vec<Widget>>()
+        {
             if shown_id.as_deref() != Some(widget.id.as_str()) {
                 if widget.kind.as_deref() == Some("browser") {
                     slate_app::webview::hide(&widget.id);
@@ -5869,9 +5858,7 @@ impl Render for CanvasView {
                                 .justify_center()
                                 .text_color(rgb(theme::hex(theme::text::DIM)))
                                 .cursor_pointer()
-                                .hover(|el| {
-                                    el.bg(rgb(0xE04343)).text_color(rgb(0xFFFFFF))
-                                })
+                                .hover(|el| el.bg(rgb(0xE04343)).text_color(rgb(0xFFFFFF)))
                                 .child(crate::assets::icon(
                                     "x",
                                     13.0 * zoom,
@@ -6220,8 +6207,7 @@ impl Render for CanvasView {
                 .bg(rgba(0x0C0C0CDD))
                 .border_b_1()
                 .border_color(rgb(theme::hex(theme::hairline::FAINT)));
-            let mut ordered: Vec<Widget> =
-                self.canvas.widgets.values().cloned().collect();
+            let mut ordered: Vec<Widget> = self.canvas.widgets.values().cloned().collect();
             ordered.sort_by(|a, b| a.z.total_cmp(&b.z));
             for w in ordered {
                 let wid = w.id.clone();
@@ -6277,9 +6263,7 @@ impl Render for CanvasView {
                                 MouseButton::Left,
                                 cx.listener(move |this, _e, _w, cx| {
                                     cx.stop_propagation();
-                                    if is_terminal_kind(
-                                        this.widget_kind(&wid_close).as_deref(),
-                                    ) {
+                                    if is_terminal_kind(this.widget_kind(&wid_close).as_deref()) {
                                         this.pending_close = Some(wid_close.clone());
                                         cx.notify();
                                     } else {
@@ -6317,7 +6301,6 @@ impl Render for CanvasView {
             );
             root = root.child(strip);
         }
-
 
         // The agent picker — WidgetFrame's "Select Agent" dropdown, parked
         // under the header's right edge of the terminal that opened it.
@@ -6376,9 +6359,7 @@ impl Render for CanvasView {
                                         // the moment the agent command was
                                         // typed — same here.
                                         Ok(_) => this.arm_startup_watch(&menu_id, &command),
-                                        Err(error) => {
-                                            this.notice(format!("agent launch: {error}"))
-                                        }
+                                        Err(error) => this.notice(format!("agent launch: {error}")),
                                     }
                                     cx.notify();
                                 }),
@@ -6584,185 +6565,204 @@ impl Render for CanvasView {
         // it hides. The shell did the same by unmounting the canvas DOM;
         // keeping it mounted is cheaper (no re-layout on the way back)
         // and the cover makes the world invisible anyway.
-            // The cover sits beside the open rail — its own width is
-            // viewport minus rail_w, so the workview lays out against the
-            // narrowed width (a full-width grid would slide rail_w under
-            // the sidebar and clip cards at the left edge).
-            let workview = Size {
-                width: px((f32::from(viewport.width) - rail_w).max(0.0)),
-                height: viewport.height,
-            };
-                self.resize_code_terminals(Vec2::new(
-                    f32::from(workview.width),
-                    f32::from(workview.height),
-                ));
-            let pane: AnyElement = {
-                    // `ResumeAgents` mounts with the empty board — scan once
-                    // per folder, on the background executor.
-                    self.maybe_scan_resume(cx);
-                    crate::views_code::code_pane(
-                        &crate::views_code::CodeState {
-                            sessions: {
-                                // t3code's pinned section — pinned threads
-                                // sort to the top, order stable otherwise.
-                                let mut sessions = self.code_sessions.clone();
-                                sessions.sort_by_key(|s| !s.pinned);
-                                sessions
-                            },
-                            focused: self.code_focused.clone(),
-                            viewport: workview,
-                            launcher_open: self.code_launcher_open,
-                            layout: self.code_layout,
-                            workspace_name: self
-                                .workspace_dir
-                                .as_deref()
-                                .and_then(|dir| std::path::Path::new(dir).file_name())
-                                .map(|name| name.to_string_lossy().into_owned()),
-                            workspace_dir: self.workspace_dir.clone(),
-                            conversations: self.code_conversations.clone(),
-                            resume_loading: self.code_resume_loading,
-                            resume_expanded: self.code_resume_expanded,
-                            resume_selected: self.code_resume_selected.clone(),
-                            resume_dismissed: self.code_resume_dismissed.clone(),
-                            selected_agents: self.code_selected_agents.clone(),
-                            agent_counts: self.code_agent_counts.clone(),
-                            active_agent: self.code_active_agent.clone(),
-                            custom_agents: self.prefs.custom_agents.clone(),
-                            agent_states: self.agent_states.clone(),
-                            worktree: self.code_worktree,
-                        },
-                        &self.snapshots,
-                        cx,
-                    )
-                    .into_any_element()
-            };
-            root = root.child(
-                div()
-                    .id("slate-workview")
-                    .absolute()
-                    .top(px(canvas::TITLE_BAR_HEIGHT))
-                    // Beside the open rail, not under it — the sidebar
-                    // floats over the canvas, and a cover at left 0 put the
-                    // launcher row and the first grid column behind it.
-                    .left(px(rail_w))
-                    .right(px(0.0))
-                    .bottom(px(0.0))
-                    .bg(rgb(theme::hex(theme::monochrome::BASE)))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|_this, _event, _window, cx| {
-                            cx.stop_propagation();
-                        }),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(|_this, _event, _window, cx| {
-                            cx.stop_propagation();
-                        }),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Middle,
-                        cx.listener(|_this, _event, _window, cx| {
-                            cx.stop_propagation();
-                        }),
-                    )
-                    .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {
-                        // A code session under the pointer owns the wheel —
-                        // the same scrollback / mouse-report routing the
-                        // canvas's wheel handler runs for terminal widgets.
-                            let pointer = pos(event.position);
-                            if let Some((index, rect)) = this.code_hit(pointer) {
-                                let offset = this.code_grid_offset();
-                                let session = &this.code_sessions[index];
-                                // Over the card header the card owns the
-                                // event but nothing scrolls — same rule as
-                                // a canvas widget's header.
-                                if pointer.y - offset.y - rect.top()
-                                    > crate::views_code::CARD_HEADER_H
-                                {
-                                    let reporting = this
-                                        .snapshots
-                                        .iter()
-                                        .find(|s| s.id == session.terminal_id)
-                                        .map(|s| s.mouse_reporting)
-                                        .unwrap_or(false);
-                                    if reporting {
-                                        let (dy, dx) = match event.delta {
-                                            ScrollDelta::Pixels(p) => {
-                                                (f32::from(p.y), f32::from(p.x))
-                                            }
-                                            ScrollDelta::Lines(p) => (p.y, p.x),
-                                        };
-                                        let mods = KeyMods {
-                                            shift: event.modifiers.shift,
-                                            alt: event.modifiers.alt,
-                                            ctrl: event.modifiers.control,
-                                            mac_cmd: event.modifiers.platform,
-                                        };
-                                        let (col, row) =
-                                            Self::code_cell(&rect, offset, pointer);
-                                        let kind = if dy != 0.0 {
-                                            Some(if dy < 0.0 {
-                                                MouseKind::WheelDown
-                                            } else {
-                                                MouseKind::WheelUp
-                                            })
-                                        } else if dx != 0.0 {
-                                            Some(if dx < 0.0 {
-                                                MouseKind::WheelRight
-                                            } else {
-                                                MouseKind::WheelLeft
-                                            })
-                                        } else {
-                                            None
-                                        };
-                                        if let Some(kind) = kind {
-                                            let _ = this.manager.mouse_input(
-                                                &session.terminal_id,
-                                                kind,
-                                                col,
-                                                row,
-                                                mods,
-                                            );
-                                        }
-                                    } else {
-                                        let pixels = match event.delta {
-                                            ScrollDelta::Pixels(p) => f32::from(p.y),
-                                            ScrollDelta::Lines(p) => p.y * CELL_H,
-                                        };
-                                        let _ = this.manager.scroll_pixels(
-                                            &session.terminal_id,
-                                            pixels,
-                                            CELL_H,
-                                        );
-                                    }
-                                }
-                            }
+        // The cover sits beside the open rail — its own width is
+        // viewport minus rail_w, so the workview lays out against the
+        // narrowed width (a full-width grid would slide rail_w under
+        // the sidebar and clip cards at the left edge).
+        let workview = Size {
+            width: px((f32::from(viewport.width) - rail_w).max(0.0)),
+            height: viewport.height,
+        };
+        self.resize_code_terminals(Vec2::new(
+            f32::from(workview.width),
+            f32::from(workview.height),
+        ));
+        let pane: AnyElement = {
+            // `ResumeAgents` mounts with the empty board — scan once
+            // per folder, on the background executor.
+            self.maybe_scan_resume(cx);
+            crate::views_code::code_pane(
+                &crate::views_code::CodeState {
+                    sessions: {
+                        // t3code's pinned section — pinned threads
+                        // sort to the top, order stable otherwise.
+                        let mut sessions = self.code_sessions.clone();
+                        sessions.sort_by_key(|s| !s.pinned);
+                        sessions
+                    },
+                    focused: self.code_focused.clone(),
+                    viewport: workview,
+                    launcher_open: self.code_launcher_open,
+                    layout: self.code_layout,
+                    workspace_name: self
+                        .workspace_dir
+                        .as_deref()
+                        .and_then(|dir| std::path::Path::new(dir).file_name())
+                        .map(|name| name.to_string_lossy().into_owned()),
+                    workspace_dir: self.workspace_dir.clone(),
+                    conversations: self.code_conversations.clone(),
+                    resume_loading: self.code_resume_loading,
+                    resume_expanded: self.code_resume_expanded,
+                    resume_selected: self.code_resume_selected.clone(),
+                    resume_dismissed: self.code_resume_dismissed.clone(),
+                    selected_agents: self.code_selected_agents.clone(),
+                    agent_counts: self.code_agent_counts.clone(),
+                    active_agent: self.code_active_agent.clone(),
+                    custom_agents: self.prefs.custom_agents.clone(),
+                    agent_states: self.agent_states.clone(),
+                    worktree: self.code_worktree,
+                },
+                &self.snapshots,
+                cx,
+            )
+            .into_any_element()
+        };
+        root = root.child(
+            div()
+                .id("slate-workview")
+                .absolute()
+                .top(px(canvas::TITLE_BAR_HEIGHT))
+                // Beside the open rail, not under it — the sidebar
+                // floats over the canvas, and a cover at left 0 put the
+                // launcher row and the first grid column behind it.
+                .left(px(rail_w))
+                .right(px(0.0))
+                .bottom(px(0.0))
+                .bg(rgb(theme::hex(theme::monochrome::BASE)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|_this, _event, _window, cx| {
                         cx.stop_propagation();
-                    }))
-                    // Button releases land here when the press went to a
-                    // reporting program (selection drags skip the release,
-                    // like the widget body's `selection_drag.is_none()`
-                    // gate); held-button moves become the drag report.
-                    .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, _cx| {
-                        let Some(button) = event.pressed_button else {
+                    }),
+                )
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(|_this, _event, _window, cx| {
+                        cx.stop_propagation();
+                    }),
+                )
+                .on_mouse_down(
+                    MouseButton::Middle,
+                    cx.listener(|_this, _event, _window, cx| {
+                        cx.stop_propagation();
+                    }),
+                )
+                .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {
+                    // A code session under the pointer owns the wheel —
+                    // the same scrollback / mouse-report routing the
+                    // canvas's wheel handler runs for terminal widgets.
+                    let pointer = pos(event.position);
+                    if let Some((index, rect)) = this.code_hit(pointer) {
+                        let offset = this.code_grid_offset();
+                        let session = &this.code_sessions[index];
+                        // Over the card header the card owns the
+                        // event but nothing scrolls — same rule as
+                        // a canvas widget's header.
+                        if pointer.y - offset.y - rect.top() > crate::views_code::CARD_HEADER_H {
+                            let reporting = this
+                                .snapshots
+                                .iter()
+                                .find(|s| s.id == session.terminal_id)
+                                .map(|s| s.mouse_reporting)
+                                .unwrap_or(false);
+                            if reporting {
+                                let (dy, dx) = match event.delta {
+                                    ScrollDelta::Pixels(p) => (f32::from(p.y), f32::from(p.x)),
+                                    ScrollDelta::Lines(p) => (p.y, p.x),
+                                };
+                                let mods = KeyMods {
+                                    shift: event.modifiers.shift,
+                                    alt: event.modifiers.alt,
+                                    ctrl: event.modifiers.control,
+                                    mac_cmd: event.modifiers.platform,
+                                };
+                                let (col, row) = Self::code_cell(&rect, offset, pointer);
+                                let kind = if dy != 0.0 {
+                                    Some(if dy < 0.0 {
+                                        MouseKind::WheelDown
+                                    } else {
+                                        MouseKind::WheelUp
+                                    })
+                                } else if dx != 0.0 {
+                                    Some(if dx < 0.0 {
+                                        MouseKind::WheelRight
+                                    } else {
+                                        MouseKind::WheelLeft
+                                    })
+                                } else {
+                                    None
+                                };
+                                if let Some(kind) = kind {
+                                    let _ = this.manager.mouse_input(
+                                        &session.terminal_id,
+                                        kind,
+                                        col,
+                                        row,
+                                        mods,
+                                    );
+                                }
+                            } else {
+                                let pixels = match event.delta {
+                                    ScrollDelta::Pixels(p) => f32::from(p.y),
+                                    ScrollDelta::Lines(p) => p.y * CELL_H,
+                                };
+                                let _ = this.manager.scroll_pixels(
+                                    &session.terminal_id,
+                                    pixels,
+                                    CELL_H,
+                                );
+                            }
+                        }
+                    }
+                    cx.stop_propagation();
+                }))
+                // Button releases land here when the press went to a
+                // reporting program (selection drags skip the release,
+                // like the widget body's `selection_drag.is_none()`
+                // gate); held-button moves become the drag report.
+                .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, _cx| {
+                    let Some(button) = event.pressed_button else {
+                        return;
+                    };
+                    let pointer = pos(event.position);
+                    if let Some((index, rect)) = this.code_hit(pointer) {
+                        let session = &this.code_sessions[index];
+                        if this.selection_drag.as_deref() == Some(session.terminal_id.as_str()) {
                             return;
+                        }
+                        let offset = this.code_grid_offset();
+                        let (col, row) = Self::code_cell(&rect, offset, pointer);
+                        let button = match button {
+                            MouseButton::Middle => TermMouseButton::Middle,
+                            MouseButton::Right => TermMouseButton::Secondary,
+                            _ => TermMouseButton::Primary,
                         };
+                        let mods = KeyMods {
+                            shift: event.modifiers.shift,
+                            alt: event.modifiers.alt,
+                            ctrl: event.modifiers.control,
+                            mac_cmd: event.modifiers.platform,
+                        };
+                        let _ = this.manager.mouse_input(
+                            &session.terminal_id,
+                            MouseKind::Move(Some(button)),
+                            col,
+                            row,
+                            mods,
+                        );
+                    }
+                }))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, event: &MouseUpEvent, _window, _cx| {
+                        if this.selection_drag.is_some() {
+                            return;
+                        }
                         let pointer = pos(event.position);
                         if let Some((index, rect)) = this.code_hit(pointer) {
                             let session = &this.code_sessions[index];
-                            if this.selection_drag.as_deref()
-                                == Some(session.terminal_id.as_str())
-                            {
-                                return;
-                            }
                             let offset = this.code_grid_offset();
                             let (col, row) = Self::code_cell(&rect, offset, pointer);
-                            let button = match button {
-                                MouseButton::Middle => TermMouseButton::Middle,
-                                MouseButton::Right => TermMouseButton::Secondary,
-                                _ => TermMouseButton::Primary,
-                            };
                             let mods = KeyMods {
                                 shift: event.modifiers.shift,
                                 alt: event.modifiers.alt,
@@ -6771,90 +6771,64 @@ impl Render for CanvasView {
                             };
                             let _ = this.manager.mouse_input(
                                 &session.terminal_id,
-                                MouseKind::Move(Some(button)),
+                                MouseKind::Release(TermMouseButton::Primary),
                                 col,
                                 row,
                                 mods,
                             );
                         }
-                    }))
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(|this, event: &MouseUpEvent, _window, _cx| {
-                            if this.selection_drag.is_some() {
-                                return;
-                            }
-                            let pointer = pos(event.position);
-                            if let Some((index, rect)) = this.code_hit(pointer) {
-                                let session = &this.code_sessions[index];
-                                let offset = this.code_grid_offset();
-                                let (col, row) = Self::code_cell(&rect, offset, pointer);
-                                let mods = KeyMods {
-                                    shift: event.modifiers.shift,
-                                    alt: event.modifiers.alt,
-                                    ctrl: event.modifiers.control,
-                                    mac_cmd: event.modifiers.platform,
-                                };
-                                let _ = this.manager.mouse_input(
-                                    &session.terminal_id,
-                                    MouseKind::Release(TermMouseButton::Primary),
-                                    col,
-                                    row,
-                                    mods,
-                                );
-                            }
-                        }),
-                    )
-                    .on_mouse_up(
-                        MouseButton::Middle,
-                        cx.listener(|this, event: &MouseUpEvent, _window, _cx| {
-                            let pointer = pos(event.position);
-                            if let Some((index, rect)) = this.code_hit(pointer) {
-                                let session = &this.code_sessions[index];
-                                let offset = this.code_grid_offset();
-                                let (col, row) = Self::code_cell(&rect, offset, pointer);
-                                let mods = KeyMods {
-                                    shift: event.modifiers.shift,
-                                    alt: event.modifiers.alt,
-                                    ctrl: event.modifiers.control,
-                                    mac_cmd: event.modifiers.platform,
-                                };
-                                let _ = this.manager.mouse_input(
-                                    &session.terminal_id,
-                                    MouseKind::Release(TermMouseButton::Middle),
-                                    col,
-                                    row,
-                                    mods,
-                                );
-                            }
-                        }),
-                    )
-                    .on_mouse_up(
-                        MouseButton::Right,
-                        cx.listener(|this, event: &MouseUpEvent, _window, _cx| {
-                            let pointer = pos(event.position);
-                            if let Some((index, rect)) = this.code_hit(pointer) {
-                                let session = &this.code_sessions[index];
-                                let offset = this.code_grid_offset();
-                                let (col, row) = Self::code_cell(&rect, offset, pointer);
-                                let mods = KeyMods {
-                                    shift: event.modifiers.shift,
-                                    alt: event.modifiers.alt,
-                                    ctrl: event.modifiers.control,
-                                    mac_cmd: event.modifiers.platform,
-                                };
-                                let _ = this.manager.mouse_input(
-                                    &session.terminal_id,
-                                    MouseKind::Release(TermMouseButton::Secondary),
-                                    col,
-                                    row,
-                                    mods,
-                                );
-                            }
-                        }),
-                    )
-                    .child(pane),
-            );
+                    }),
+                )
+                .on_mouse_up(
+                    MouseButton::Middle,
+                    cx.listener(|this, event: &MouseUpEvent, _window, _cx| {
+                        let pointer = pos(event.position);
+                        if let Some((index, rect)) = this.code_hit(pointer) {
+                            let session = &this.code_sessions[index];
+                            let offset = this.code_grid_offset();
+                            let (col, row) = Self::code_cell(&rect, offset, pointer);
+                            let mods = KeyMods {
+                                shift: event.modifiers.shift,
+                                alt: event.modifiers.alt,
+                                ctrl: event.modifiers.control,
+                                mac_cmd: event.modifiers.platform,
+                            };
+                            let _ = this.manager.mouse_input(
+                                &session.terminal_id,
+                                MouseKind::Release(TermMouseButton::Middle),
+                                col,
+                                row,
+                                mods,
+                            );
+                        }
+                    }),
+                )
+                .on_mouse_up(
+                    MouseButton::Right,
+                    cx.listener(|this, event: &MouseUpEvent, _window, _cx| {
+                        let pointer = pos(event.position);
+                        if let Some((index, rect)) = this.code_hit(pointer) {
+                            let session = &this.code_sessions[index];
+                            let offset = this.code_grid_offset();
+                            let (col, row) = Self::code_cell(&rect, offset, pointer);
+                            let mods = KeyMods {
+                                shift: event.modifiers.shift,
+                                alt: event.modifiers.alt,
+                                ctrl: event.modifiers.control,
+                                mac_cmd: event.modifiers.platform,
+                            };
+                            let _ = this.manager.mouse_input(
+                                &session.terminal_id,
+                                MouseKind::Release(TermMouseButton::Secondary),
+                                col,
+                                row,
+                                mods,
+                            );
+                        }
+                    }),
+                )
+                .child(pane),
+        );
 
         // The command bar — a summon-only overlay now, not the Electron
         // strip: it renders only while `command_bar` owns the keyboard
@@ -7047,29 +7021,29 @@ impl Render for CanvasView {
                 .border_color(rgb(theme::hex(theme::hairline::SOFT)))
                 .py_1()
                 .shadow_2xl();
-                    for mode in slate_app::code_layout::CodeLayout::ALL {
-                        let current = mode == self.code_layout;
-                        popup = popup.child(
-                            arrange_menu_row(
-                                format!("slate-arrange-{}", mode.label().to_lowercase()),
-                                mode.label(),
-                                mode.hint(),
-                                current,
-                            )
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, _e, _w, cx| {
-                                    cx.stop_propagation();
-                                    this.arrange_menu = false;
-                                    this.code_command(
-                                        "layout",
-                                        json!({ "mode": serde_json::to_value(mode).unwrap_or_default() }),
-                                        cx,
-                                    );
-                                }),
-                            ),
-                        );
-                    }
+            for mode in slate_app::code_layout::CodeLayout::ALL {
+                let current = mode == self.code_layout;
+                popup = popup.child(
+                    arrange_menu_row(
+                        format!("slate-arrange-{}", mode.label().to_lowercase()),
+                        mode.label(),
+                        mode.hint(),
+                        current,
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _e, _w, cx| {
+                            cx.stop_propagation();
+                            this.arrange_menu = false;
+                            this.code_command(
+                                "layout",
+                                json!({ "mode": serde_json::to_value(mode).unwrap_or_default() }),
+                                cx,
+                            );
+                        }),
+                    ),
+                );
+            }
             root = root.child(popup);
         }
 
@@ -7389,9 +7363,7 @@ impl CanvasView {
             cx.stop_propagation();
             return;
         }
-        if (self.agent_menu.is_some() || self.arrange_menu)
-            && keystroke.key.as_str() == "escape"
-        {
+        if (self.agent_menu.is_some() || self.arrange_menu) && keystroke.key.as_str() == "escape" {
             self.agent_menu = None;
             self.arrange_menu = false;
             cx.notify();
@@ -7594,13 +7566,15 @@ impl CanvasView {
                 _ if paste => self.planner_paste(cx),
                 _ => {
                     if !mods.control && !mods.alt && !mods.platform {
-                        let text = keystroke.key_char.clone().or_else(|| {
-                            match keystroke.key.as_str() {
-                                "space" => Some(" ".to_owned()),
-                                k if k.chars().count() == 1 => Some(k.to_owned()),
-                                _ => None,
-                            }
-                        });
+                        let text =
+                            keystroke
+                                .key_char
+                                .clone()
+                                .or_else(|| match keystroke.key.as_str() {
+                                    "space" => Some(" ".to_owned()),
+                                    k if k.chars().count() == 1 => Some(k.to_owned()),
+                                    _ => None,
+                                });
                         if let Some(text) = text {
                             self.planner_edit_insert(&text);
                         }
@@ -7667,11 +7641,7 @@ impl CanvasView {
                     self.browser_editing = None;
                     self.browser_cursor = 0;
                     self.browser_sel = None;
-                    self.widget_command(
-                        &wid,
-                        json!({ "op": "browser_navigate", "url": url }),
-                        cx,
-                    );
+                    self.widget_command(&wid, json!({ "op": "browser_navigate", "url": url }), cx);
                 }
                 "backspace" => self.browser_edit_backspace(),
                 "delete" => self.browser_edit_delete(),
@@ -7786,11 +7756,14 @@ impl CanvasView {
                         }
                     };
                     if keep {
-                        self.files_editing =
-                            Some(crate::views_files::FilesEditing::Search { id });
+                        self.files_editing = Some(crate::views_files::FilesEditing::Search { id });
                     }
                 }
-                crate::views_files::FilesEditing::Rename { id, path, mut buffer } => {
+                crate::views_files::FilesEditing::Rename {
+                    id,
+                    path,
+                    mut buffer,
+                } => {
                     match keystroke.key.as_str() {
                         "escape" => {
                             // `renameCancelled` — the edit drops with no
@@ -7806,11 +7779,7 @@ impl CanvasView {
                         "backspace" => {
                             buffer.pop();
                             self.files_editing =
-                                Some(crate::views_files::FilesEditing::Rename {
-                                    id,
-                                    path,
-                                    buffer,
-                                });
+                                Some(crate::views_files::FilesEditing::Rename { id, path, buffer });
                         }
                         _ => {
                             if !mods.control && !mods.alt && !mods.platform {
@@ -7826,11 +7795,7 @@ impl CanvasView {
                                 }
                             }
                             self.files_editing =
-                                Some(crate::views_files::FilesEditing::Rename {
-                                    id,
-                                    path,
-                                    buffer,
-                                });
+                                Some(crate::views_files::FilesEditing::Rename { id, path, buffer });
                         }
                     }
                 }
@@ -8028,16 +7993,15 @@ impl CanvasView {
         // Exception: Escape dismisses the floating layers — menus first,
         // then the Code launcher row (the original's CodeLauncher dialog
         // closed on Escape/backdrop).
-            if keystroke.key.as_str() == "escape" {
-                if self.arrange_menu {
-                    self.arrange_menu = false;
-                } else if self.code_launcher_open {
-                    self.code_launcher_open = false;
-                }
+        if keystroke.key.as_str() == "escape" {
+            if self.arrange_menu {
+                self.arrange_menu = false;
+            } else if self.code_launcher_open {
+                self.code_launcher_open = false;
             }
-            cx.notify();
-            cx.stop_propagation();
-
+        }
+        cx.notify();
+        cx.stop_propagation();
     }
 
     // fix-files: release the files pane's keyboard owner — the original's
@@ -8124,11 +8088,7 @@ impl CanvasView {
         } else {
             self.browser_sel = None;
         }
-        self.browser_cursor = if end {
-            self.browser_address.len()
-        } else {
-            0
-        };
+        self.browser_cursor = if end { self.browser_address.len() } else { 0 };
     }
 
     /// Typed/pasted text replaces the selection (or inserts at the caret).
@@ -8185,7 +8145,11 @@ impl CanvasView {
         cx: &mut Context<Self>,
     ) {
         // A click inside the field that already owns the caret keeps the caret.
-        if self.planner_editing.as_ref().is_some_and(|edit| edit.field == field) {
+        if self
+            .planner_editing
+            .as_ref()
+            .is_some_and(|edit| edit.field == field)
+        {
             return;
         }
         self.planner_flush(cx);
@@ -8225,10 +8189,7 @@ impl CanvasView {
                     PlannerField::Note(_) => json!({ "note": text }),
                     _ => {
                         let today = slate_app::planner::today_local();
-                        match slate_app::planner::normalize_day(
-                            Some(&json!(text.trim())),
-                            &today,
-                        ) {
+                        match slate_app::planner::normalize_day(Some(&json!(text.trim())), &today) {
                             Ok(day) => json!({ "day": day }),
                             Err(error) => {
                                 self.notice(error.0);
@@ -8384,9 +8345,7 @@ impl CanvasView {
                             slate_app::attachments::classify_media(path)
                                 == slate_app::attachments::MediaKind::Image
                         })
-                        .filter_map(|path| {
-                            slate_app::attachments::import_media(path, &media).ok()
-                        })
+                        .filter_map(|path| slate_app::attachments::import_media(path, &media).ok())
                         .collect::<Vec<_>>()
                 })
                 .await;
@@ -8591,13 +8550,15 @@ impl CanvasView {
             }
             _ => {
                 if !mods.control && !mods.alt && !mods.platform {
-                    let text = keystroke.key_char.clone().or_else(|| {
-                        match keystroke.key.as_str() {
-                            "space" => Some(" ".to_owned()),
-                            k if k.chars().count() == 1 => Some(k.to_owned()),
-                            _ => None,
-                        }
-                    });
+                    let text =
+                        keystroke
+                            .key_char
+                            .clone()
+                            .or_else(|| match keystroke.key.as_str() {
+                                "space" => Some(" ".to_owned()),
+                                k if k.chars().count() == 1 => Some(k.to_owned()),
+                                _ => None,
+                            });
                     if let Some(text) = text {
                         self.orc_drafts.entry(id).or_default().push_str(&text);
                     }

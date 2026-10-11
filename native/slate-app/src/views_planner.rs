@@ -180,8 +180,7 @@ pub(crate) fn create_action(
     let day = if typed.is_empty() {
         matches!(scope, Scope::Today | Scope::Week).then(|| today.0.clone())
     } else {
-        slate_app::planner::normalize_day(Some(&json!(typed)), &today)
-            .map_err(|e| e.0)?
+        slate_app::planner::normalize_day(Some(&json!(typed)), &today).map_err(|e| e.0)?
     };
     let project = filter.or_else(|| {
         let p = draft.project.trim();
@@ -718,21 +717,33 @@ fn planner_create_form(
         planner_text(base, field, &value, placeholder, &value, wid, editing, cx)
     };
     let title = input(
-        div().flex_1().min_w_0().text_sm().text_color(rgb(theme::hex(theme::text::NORMAL))),
+        div()
+            .flex_1()
+            .min_w_0()
+            .text_sm()
+            .text_color(rgb(theme::hex(theme::text::NORMAL))),
         PlannerField::CreateTitle,
         "Add a task…  (paste a photo)",
         cx,
     );
     let project = show_project.then(|| {
         input(
-            div().flex_1().min_w_0().text_xs().text_color(rgb(theme::hex(theme::text::DIM))),
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_xs()
+                .text_color(rgb(theme::hex(theme::text::DIM))),
             PlannerField::CreateProject,
             "Project (optional)",
             cx,
         )
     });
     let date = input(
-        div().flex_1().min_w_0().text_xs().text_color(rgb(theme::hex(theme::text::DIM))),
+        div()
+            .flex_1()
+            .min_w_0()
+            .text_xs()
+            .text_color(rgb(theme::hex(theme::text::DIM))),
         PlannerField::CreateDay,
         "Date YYYY-MM-DD  (empty = scope)",
         cx,

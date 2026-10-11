@@ -199,7 +199,10 @@ pub fn manifest_for(agent_id: &str, name: &str) -> Option<String> {
 /// so their rules cannot fire — the safe direction: a rule that cannot see
 /// its evidence never claims a state.
 fn region_text<'a>(region: &str, screen: &'a str, title: &'a str) -> Option<String> {
-    if region == "screen" || region == "whole_recent" || region == "whole_recent_without_current_prompt_marker" {
+    if region == "screen"
+        || region == "whole_recent"
+        || region == "whole_recent_without_current_prompt_marker"
+    {
         return Some(screen.to_owned());
     }
     if region == "osc_title" {
@@ -251,8 +254,7 @@ fn matcher_hits(m: &CompiledMatcher, text: &str) -> bool {
     let text = text.as_str();
     m.contains.iter().all(|c| text.contains(c.as_str()))
         && m.regex.iter().all(|r| r.is_match(text))
-        && m
-            .line_regex
+        && m.line_regex
             .iter()
             .all(|r| text.lines().any(|l| r.is_match(l)))
         && m.all.iter().all(|x| matcher_hits(x, text))

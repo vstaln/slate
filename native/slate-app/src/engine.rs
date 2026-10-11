@@ -87,7 +87,11 @@ async fn harden(
         .is_some_and(|value| value.starts_with("application/json"));
     if !preflight && (status.is_client_error() || status.is_server_error()) && !is_json {
         let (code, message, status) = match status {
-            StatusCode::METHOD_NOT_ALLOWED => ("not_found", "no such route".to_owned(), StatusCode::NOT_FOUND),
+            StatusCode::METHOD_NOT_ALLOWED => (
+                "not_found",
+                "no such route".to_owned(),
+                StatusCode::NOT_FOUND,
+            ),
             StatusCode::PAYLOAD_TOO_LARGE => (
                 "invalid",
                 format!("request body exceeds {} bytes", MAX_HTTP_BODY_BYTES),
@@ -99,7 +103,10 @@ async fn harden(
                     .unwrap_or_default();
                 let text = String::from_utf8_lossy(&bytes).trim().to_owned();
                 let message = if text.is_empty() {
-                    status.canonical_reason().unwrap_or("request failed").to_owned()
+                    status
+                        .canonical_reason()
+                        .unwrap_or("request failed")
+                        .to_owned()
                 } else {
                     text
                 };
@@ -2676,7 +2683,9 @@ async fn list_agents(
         .iter()
         .cloned()
         .collect();
-    Ok(Json(serde_json::json!({ "agents": agents, "transitions": transitions })))
+    Ok(Json(
+        serde_json::json!({ "agents": agents, "transitions": transitions }),
+    ))
 }
 
 /// Fold freshly-detected rows into the state cache; every flip lands in the
@@ -2861,7 +2870,11 @@ async fn tell_worker(
         },
     )
     .await?;
-    Ok(Json(envelope(response, entry.version.unwrap_or(0), entry.seq)))
+    Ok(Json(envelope(
+        response,
+        entry.version.unwrap_or(0),
+        entry.seq,
+    )))
 }
 
 /// The `reply(result)` wire shape: `{ok, version, seq, data}` — the apply's
@@ -2877,9 +2890,7 @@ fn envelope(flat: serde_json::Value, version: i64, seq: u64) -> serde_json::Valu
 
 /// A routed `Response` as the axum handlers' `(StatusCode, Json)` pair — the
 /// same envelope shape the pure router's path returns.
-fn response_failure(
-    response: slate_app::http::Response,
-) -> (StatusCode, Json<serde_json::Value>) {
+fn response_failure(response: slate_app::http::Response) -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::from_u16(response.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
         Json(response.body),
@@ -2927,7 +2938,10 @@ async fn submit_engine<F, Fut>(
     payload: serde_json::Value,
     what: &str,
     work: F,
-) -> Result<(slate_app::journal::JournalEntry, serde_json::Value), (StatusCode, Json<serde_json::Value>)>
+) -> Result<
+    (slate_app::journal::JournalEntry, serde_json::Value),
+    (StatusCode, Json<serde_json::Value>),
+>
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<serde_json::Value, slate_app::http::Response>>,
@@ -3167,8 +3181,8 @@ fn write_apply(
         let single_line = text.replace(['\r', '\n'], " ");
         // `command.payload?.pressEnter !== false` — absent presses too.
         let press_enter = json_not_false(payload.get("pressEnter"));
-        let delivery_timeout = json_duration_ms(payload.get("deliveryTimeoutMs"))
-            .unwrap_or(DELIVERY_TIMEOUT);
+        let delivery_timeout =
+            json_duration_ms(payload.get("deliveryTimeoutMs")).unwrap_or(DELIVERY_TIMEOUT);
         if json_is_true(payload.get("confirmDelivery")) {
             // `deliverLine` — the receipt answers `delivery` in the result.
             let receipt = state
@@ -3189,16 +3203,10 @@ fn write_apply(
         } else {
             // `writeLine` — same encoding, no acknowledgement wait.
             let bytes = encode_terminal_input(&single_line, press_enter).map_err(|error| {
-                slate_app::http::Response::from_error(&CommandError::new(
-                    ErrorCode::Failed,
-                    error,
-                ))
+                slate_app::http::Response::from_error(&CommandError::new(ErrorCode::Failed, error))
             })?;
             state.manager.write_raw(&id, &bytes).map_err(|error| {
-                slate_app::http::Response::from_error(&CommandError::new(
-                    ErrorCode::Failed,
-                    error,
-                ))
+                slate_app::http::Response::from_error(&CommandError::new(ErrorCode::Failed, error))
             })?;
             Ok(serde_json::json!({
                 "ok": true,
@@ -3223,7 +3231,11 @@ fn attachment_agent(command: &str) -> Option<String> {
     } else {
         trimmed.split_whitespace().next().unwrap_or("")
     };
-    let lowered = token.rsplit(['/', '\\']).next().unwrap_or("").to_lowercase();
+    let lowered = token
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("")
+        .to_lowercase();
     let name = lowered
         .strip_suffix(".exe")
         .or_else(|| lowered.strip_suffix(".cmd"))
@@ -3412,13 +3424,14 @@ fn attach_apply(
         }
         if mode == "path" {
             for file in &files {
-                let token = slate_app::attachments::path_token(&file.to_string_lossy())
-                    .map_err(|error| {
+                let token = slate_app::attachments::path_token(&file.to_string_lossy()).map_err(
+                    |error| {
                         slate_app::http::Response::from_error(&CommandError::new(
                             ErrorCode::Failed,
                             error,
                         ))
-                    })?;
+                    },
+                )?;
                 state
                     .manager
                     .write_raw(&id, token.as_bytes())
@@ -3445,8 +3458,8 @@ fn attach_apply(
             value => json_not_false(value),
         };
         let confirm_delivery = json_is_true(payload.get("confirmDelivery"));
-        let delivery_timeout = json_duration_ms(payload.get("deliveryTimeoutMs"))
-            .unwrap_or(DELIVERY_TIMEOUT);
+        let delivery_timeout =
+            json_duration_ms(payload.get("deliveryTimeoutMs")).unwrap_or(DELIVERY_TIMEOUT);
         if !single_line.is_empty() {
             if confirm_delivery {
                 // `deliverLine` — the only leg that answers with a receipt.
@@ -3476,10 +3489,7 @@ fn attach_apply(
             }
         } else if press_enter {
             state.manager.write_raw(&id, b"\r").map_err(|error| {
-                slate_app::http::Response::from_error(&CommandError::new(
-                    ErrorCode::Failed,
-                    error,
-                ))
+                slate_app::http::Response::from_error(&CommandError::new(ErrorCode::Failed, error))
             })?;
         }
         let mut response = serde_json::json!({
@@ -3579,17 +3589,11 @@ async fn write_terminal(
                 write_apply(&state, &actor, &raw, &payload_for_work)
             })
             .await
-            .map_err(|error| {
-                axum_failure(bad_request(format!("delivery task failed: {error}")))
-            })?
+            .map_err(|error| axum_failure(bad_request(format!("delivery task failed: {error}"))))?
         },
     )
     .await?;
-    Ok(Json(envelope(
-        flat,
-        entry.version.unwrap_or(0),
-        entry.seq,
-    )))
+    Ok(Json(envelope(flat, entry.version.unwrap_or(0), entry.seq)))
 }
 
 #[derive(Serialize)]
@@ -3912,9 +3916,7 @@ async fn rename_worker(
                         widget.version += 1.0;
                         slate_app::http::widget_row(&widget)
                     });
-                Ok(row.unwrap_or_else(|| {
-                    serde_json::json!({ "id": rename_id, "title": rename })
-                }))
+                Ok(row.unwrap_or_else(|| serde_json::json!({ "id": rename_id, "title": rename })))
             },
         )
         .await?;
@@ -4039,9 +4041,7 @@ async fn attach_terminal(
                 attach_apply(&state, &actor, &raw, &payload_for_work)
             })
             .await
-            .map_err(|error| {
-                axum_failure(bad_request(format!("delivery task failed: {error}")))
-            })?
+            .map_err(|error| axum_failure(bad_request(format!("delivery task failed: {error}"))))?
         },
     )
     .await?;
@@ -4179,11 +4179,7 @@ async fn dispose_terminal(
             },
         )
         .await?;
-        return Ok(Json(envelope(
-            data,
-            entry.version.unwrap_or(0),
-            entry.seq,
-        )));
+        return Ok(Json(envelope(data, entry.version.unwrap_or(0), entry.seq)));
     }
     // `submit(body, 'terminal.dispose', terminal:{id}, {})` — the apply ran
     // `terminals.dispose`, `failTerminalDispatches`, and `requestWidgetRemoval`.
@@ -4250,11 +4246,7 @@ async fn dispose_terminal(
         )
         .await;
     }
-    Ok(Json(envelope(
-        data,
-        entry.version.unwrap_or(0),
-        entry.seq,
-    )))
+    Ok(Json(envelope(data, entry.version.unwrap_or(0), entry.seq)))
 }
 
 /// `slate canvas focus`: park a camera request for the view's next tick.
@@ -4362,7 +4354,9 @@ async fn serve_media(
     let single_name = matches!(components.next(), Some(std::path::Component::Normal(_)))
         && components.next().is_none();
     if !single_name {
-        return Err(bad_request("media needs a file name, not a path".to_owned()));
+        return Err(bad_request(
+            "media needs a file name, not a path".to_owned(),
+        ));
     }
     let extension = std::path::Path::new(&name)
         .extension()
@@ -4437,8 +4431,8 @@ fn capture_screenshot(
         let resolved = manager
             .resolve(name, None)
             .unwrap_or_else(|_| name.to_owned());
-        let canvas =
-            folded_canvas().map_err(|error| format!("cannot read the workspace journal: {error}"))?;
+        let canvas = folded_canvas()
+            .map_err(|error| format!("cannot read the workspace journal: {error}"))?;
         let widget = find_widget(&canvas, &resolved)
             .or_else(|_| find_widget(&canvas, name))
             .map_err(|_| {
@@ -5294,7 +5288,7 @@ mod tests {
             preferred: std::sync::Mutex::new(None),
             spawn_order: std::sync::Mutex::new(Vec::new()),
             banned: std::sync::Mutex::new(std::collections::VecDeque::new()),
-                id_counter: std::sync::atomic::AtomicU64::new(0),
+            id_counter: std::sync::atomic::AtomicU64::new(0),
         });
 
         let first = "a".repeat(MAX_PENDING_EVENT_BYTES / 2);
@@ -5352,7 +5346,7 @@ mod tests {
             preferred: std::sync::Mutex::new(None),
             spawn_order: std::sync::Mutex::new(Vec::new()),
             banned: std::sync::Mutex::new(std::collections::VecDeque::new()),
-                id_counter: std::sync::atomic::AtomicU64::new(0),
+            id_counter: std::sync::atomic::AtomicU64::new(0),
         });
         super::push_event(
             &inner,

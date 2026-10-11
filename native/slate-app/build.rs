@@ -6,8 +6,7 @@ fn main() {
     // `browser` feature asked for it. webview.rs's cfg gates hang off this
     // one name instead of repeating the platform pair.
     let os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    if matches!(os.as_str(), "linux" | "freebsd")
-        && env::var_os("CARGO_FEATURE_BROWSER").is_some()
+    if matches!(os.as_str(), "linux" | "freebsd") && env::var_os("CARGO_FEATURE_BROWSER").is_some()
     {
         println!("cargo:rustc-cfg=slate_browser");
     }

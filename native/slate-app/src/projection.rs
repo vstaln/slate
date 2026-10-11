@@ -373,10 +373,7 @@ pub fn reduce(state: &CanvasState, event: &JournalEntry, clock: Clock) -> Canvas
                 // `control.add-widget`'s `from` — the shell auto-wired a
                 // connection from the named widget to the new one.
                 if let Some(from) = payload.get("from").and_then(Value::as_str) {
-                    if !from.is_empty()
-                        && from != widget.id
-                        && next.widgets.contains_key(from)
-                    {
+                    if !from.is_empty() && from != widget.id && next.widgets.contains_key(from) {
                         let pair_exists = next
                             .connections
                             .iter()

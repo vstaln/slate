@@ -8,6 +8,7 @@ pub mod engine;
 pub mod views_browser;
 pub mod views_calendar;
 pub mod views_code;
+pub mod views_commandbar;
 pub mod views_files;
 pub mod views_image;
 pub mod views_kanban;
@@ -17,7 +18,6 @@ pub mod views_orchestration;
 pub mod views_planner;
 pub mod views_settings;
 pub mod views_sidebar;
-pub mod views_commandbar;
 pub mod views_sysmon;
 pub mod views_terminal;
 pub mod views_timer;
@@ -46,8 +46,8 @@ fn main() -> Result<()> {
     let workspace_arg = workspace_dir_arg(&args);
     // The app only starts when the args are nothing but app flags or a
     // workspace path — any CLI verb still dispatches to cli_run.
-    let app_mode = args.iter().all(|arg| arg == "--gui" || arg == "--headless")
-        || workspace_arg.is_some();
+    let app_mode =
+        args.iter().all(|arg| arg == "--gui" || arg == "--headless") || workspace_arg.is_some();
     let headless = app_mode
         && (args.iter().any(|arg| arg == "--headless")
             || std::env::var_os("SLATE_HEADLESS").is_some());
@@ -255,79 +255,90 @@ fn main() -> Result<()> {
     gpui::Application::with_platform(platform)
         .with_assets(crate::assets::EmbeddedAssets)
         .run(|cx: &mut gpui::App| {
-        // Graysite brand faces, embedded so the build looks right on any
-        // machine without a fontconfig install: Plus Jakarta Sans is the UI
-        // family, Departure Mono the label/keycap face, Brygada 1918 the
-        // display face (splash wordmark). JetBrainsMono Nerd Font Mono is
-        // the terminal face — the ghostty font, mono-width icons so a Nerd
-        // glyph never pushes a cell run off the grid.
-        if let Err(error) = cx.text_system().add_fonts(vec![
-            std::borrow::Cow::Borrowed(&include_bytes!("../assets/fonts/PlusJakartaSans-Variable.ttf")[..]),
-            std::borrow::Cow::Borrowed(&include_bytes!("../assets/fonts/Brygada1918-Regular.ttf")[..]),
-            std::borrow::Cow::Borrowed(&include_bytes!("../assets/fonts/Brygada1918-Italic.ttf")[..]),
-            std::borrow::Cow::Borrowed(&include_bytes!("../assets/fonts/DepartureMono-Regular.ttf")[..]),
-            std::borrow::Cow::Borrowed(&include_bytes!("../assets/fonts/JetBrainsMonoNerdFontMono-Regular.ttf")[..]),
-            std::borrow::Cow::Borrowed(&include_bytes!("../assets/fonts/JetBrainsMonoNerdFontMono-Bold.ttf")[..]),
-            std::borrow::Cow::Borrowed(&include_bytes!("../assets/fonts/JetBrainsMonoNerdFontMono-Italic.ttf")[..]),
-            std::borrow::Cow::Borrowed(&include_bytes!("../assets/fonts/JetBrainsMonoNerdFontMono-BoldItalic.ttf")[..]),
-        ]) {
-            eprintln!("font registration failed: {error}");
-        }
-        // gpui's implicit placement fell back to a ~300px box under this
-        // WM; size the first window to most of the primary display
-        // instead. A resize still wins after the window exists.
-        let window_bounds = cx
-            .primary_display()
-            .map(|display| {
+            // Graysite brand faces, embedded so the build looks right on any
+            // machine without a fontconfig install: Plus Jakarta Sans is the UI
+            // family, Departure Mono the label/keycap face, Brygada 1918 the
+            // display face (splash wordmark). JetBrainsMono Nerd Font Mono is
+            // the terminal face — the ghostty font, mono-width icons so a Nerd
+            // glyph never pushes a cell run off the grid.
+            if let Err(error) = cx.text_system().add_fonts(vec![
+                std::borrow::Cow::Borrowed(
+                    &include_bytes!("../assets/fonts/PlusJakartaSans-Variable.ttf")[..],
+                ),
+                std::borrow::Cow::Borrowed(
+                    &include_bytes!("../assets/fonts/Brygada1918-Regular.ttf")[..],
+                ),
+                std::borrow::Cow::Borrowed(
+                    &include_bytes!("../assets/fonts/Brygada1918-Italic.ttf")[..],
+                ),
+                std::borrow::Cow::Borrowed(
+                    &include_bytes!("../assets/fonts/DepartureMono-Regular.ttf")[..],
+                ),
+                std::borrow::Cow::Borrowed(
+                    &include_bytes!("../assets/fonts/JetBrainsMonoNerdFontMono-Regular.ttf")[..],
+                ),
+                std::borrow::Cow::Borrowed(
+                    &include_bytes!("../assets/fonts/JetBrainsMonoNerdFontMono-Bold.ttf")[..],
+                ),
+                std::borrow::Cow::Borrowed(
+                    &include_bytes!("../assets/fonts/JetBrainsMonoNerdFontMono-Italic.ttf")[..],
+                ),
+                std::borrow::Cow::Borrowed(
+                    &include_bytes!("../assets/fonts/JetBrainsMonoNerdFontMono-BoldItalic.ttf")[..],
+                ),
+            ]) {
+                eprintln!("font registration failed: {error}");
+            }
+            // gpui's implicit placement fell back to a ~300px box under this
+            // WM; size the first window to most of the primary display
+            // instead. A resize still wins after the window exists.
+            let window_bounds = cx.primary_display().map(|display| {
                 let bounds = display.bounds();
-                let size = gpui::size(
-                    bounds.size.width * 0.8,
-                    bounds.size.height * 0.8,
-                );
+                let size = gpui::size(bounds.size.width * 0.8, bounds.size.height * 0.8);
                 let origin = gpui::point(
                     bounds.origin.x + (bounds.size.width - size.width) / 2.0,
                     bounds.origin.y + (bounds.size.height - size.height) / 2.0,
                 );
                 gpui::WindowBounds::Windowed(gpui::Bounds::new(origin, size))
             });
-        cx.open_window(
-            gpui::WindowOptions {
-                titlebar: Some(gpui::TitlebarOptions {
-                    title: Some("Slate".into()),
+            cx.open_window(
+                gpui::WindowOptions {
+                    titlebar: Some(gpui::TitlebarOptions {
+                        title: Some("Slate".into()),
+                        ..Default::default()
+                    }),
+                    window_bounds,
+                    // WM_CLASS on X11: rofi's window mode and desktop-file
+                    // matching both key off it, and an unset class is why the
+                    // window used to group as nothing.
+                    app_id: Some("slate".into()),
+                    window_background: gpui::WindowBackgroundAppearance::Opaque,
                     ..Default::default()
-                }),
-                window_bounds,
-                // WM_CLASS on X11: rofi's window mode and desktop-file
-                // matching both key off it, and an unset class is why the
-                // window used to group as nothing.
-                app_id: Some("slate".into()),
-                window_background: gpui::WindowBackgroundAppearance::Opaque,
-                ..Default::default()
-            },
-            move |window, cx| {
-                let view =
-                    cx.new(|cx| crate::canvas_view::CanvasView::new(root_manager.clone(), cx));
-                // Focus the root at open so keystrokes reach the terminal
-                // without a click first.
-                window.focus(&view.focus_handle(cx), cx);
-                view
-            },
-        )
-        .expect("open Slate window");
-        cx.activate(true);
-        cx.on_window_closed(move |_, _| {
-            // Final canvas flush first — the window is already gone at this
-            // point, but the canvas is event-sourced, so the fold rebuilt
-            // from the journal is the same state the view showed.
-            flush_canvas_snapshot();
-            quit_manager.save_terminal_states();
-            // The shell's before-quit killed the process trees too — without
-            // it, detached grandchildren outlive the app.
-            quit_manager.dispose_all();
-            slate_app::ipc::clear_runtime_presence();
-        })
-        .detach();
-    });
+                },
+                move |window, cx| {
+                    let view =
+                        cx.new(|cx| crate::canvas_view::CanvasView::new(root_manager.clone(), cx));
+                    // Focus the root at open so keystrokes reach the terminal
+                    // without a click first.
+                    window.focus(&view.focus_handle(cx), cx);
+                    view
+                },
+            )
+            .expect("open Slate window");
+            cx.activate(true);
+            cx.on_window_closed(move |_, _| {
+                // Final canvas flush first — the window is already gone at this
+                // point, but the canvas is event-sourced, so the fold rebuilt
+                // from the journal is the same state the view showed.
+                flush_canvas_snapshot();
+                quit_manager.save_terminal_states();
+                // The shell's before-quit killed the process trees too — without
+                // it, detached grandchildren outlive the app.
+                quit_manager.dispose_all();
+                slate_app::ipc::clear_runtime_presence();
+            })
+            .detach();
+        });
 
     Ok(())
 }

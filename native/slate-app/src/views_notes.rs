@@ -150,7 +150,11 @@ pub fn note_rows() -> (Vec<NoteRow>, Option<String>) {
                 .unwrap_or(0.0),
         });
     }
-    items.sort_by(|a, b| a.order.partial_cmp(&b.order).unwrap_or(std::cmp::Ordering::Equal));
+    items.sort_by(|a, b| {
+        a.order
+            .partial_cmp(&b.order)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     (items, None)
 }
 
@@ -232,10 +236,17 @@ fn note_card<'a>(
     let title_text: AnyElement = if editing_here("title") {
         field_buffer(buffer).into_any_element()
     } else if expanded {
-        field_chip(row.title.clone(), widget_id, &row.id, "title", row.title.clone(), cx)
-            .text_sm()
-            .text_color(rgb(theme::hex(theme::text::NORMAL)))
-            .into_any_element()
+        field_chip(
+            row.title.clone(),
+            widget_id,
+            &row.id,
+            "title",
+            row.title.clone(),
+            cx,
+        )
+        .text_sm()
+        .text_color(rgb(theme::hex(theme::text::NORMAL)))
+        .into_any_element()
     } else {
         row.title.clone().into_any_element()
     };
@@ -251,7 +262,9 @@ fn note_card<'a>(
     );
     if expanded {
         let (prev, next) = neighbours;
-        let swap = |other: Option<(String, f64)>, glyph: &'static str, cx: &mut Context<crate::canvas_view::CanvasView>| {
+        let swap = |other: Option<(String, f64)>,
+                    glyph: &'static str,
+                    cx: &mut Context<crate::canvas_view::CanvasView>| {
             let wid = widget_id.to_owned();
             let note_id = row.id.clone();
             let order = row.order;
@@ -337,12 +350,14 @@ fn note_card<'a>(
         } else {
             theme::hex(theme::text::DIM)
         };
-        body = body.child(
-            div()
-                .text_xs()
-                .text_color(rgb(colour))
-                .child(field_chip(shown, widget_id, &row.id, "body", row.body.clone(), cx)),
-        );
+        body = body.child(div().text_xs().text_color(rgb(colour)).child(field_chip(
+            shown,
+            widget_id,
+            &row.id,
+            "body",
+            row.body.clone(),
+            cx,
+        )));
     } else if !row.preview.is_empty() {
         body = body.child(
             div()
@@ -428,7 +443,8 @@ fn note_card<'a>(
                 .bg(rgb(color))
                 .cursor_pointer()
                 .when(color == row.color, |el| {
-                    el.border_1().border_color(rgb(theme::hex(theme::text::NORMAL)))
+                    el.border_1()
+                        .border_color(rgb(theme::hex(theme::text::NORMAL)))
                 })
                 .on_mouse_down(
                     MouseButton::Left,
@@ -454,7 +470,8 @@ fn note_card<'a>(
         body = body.child(swatches);
     }
 
-    card.child(body).on_mouse_down(MouseButton::Left, toggle_handler)
+    card.child(body)
+        .on_mouse_down(MouseButton::Left, toggle_handler)
 }
 
 /// The open editor's text with a caret — the DOM input stand-in.
@@ -515,11 +532,7 @@ pub fn notes_pane(
                         MouseButton::Left,
                         cx.listener(move |this, _event, _window, cx| {
                             let id = new_note_id();
-                            this.widget_command(
-                                &wid,
-                                json!({ "op": "note_create", "id": id }),
-                                cx,
-                            );
+                            this.widget_command(&wid, json!({ "op": "note_create", "id": id }), cx);
                         }),
                     )
             }),

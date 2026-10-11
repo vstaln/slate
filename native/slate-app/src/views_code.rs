@@ -531,7 +531,9 @@ fn selection_controls(
             .text_color(rgb(theme::hex(theme::text::FAINT)))
             .child(format!(
                 "for {}",
-                active.map(|id| agent_label(state, id)).unwrap_or_else(|| "CLI".to_owned())
+                active
+                    .map(|id| agent_label(state, id))
+                    .unwrap_or_else(|| "CLI".to_owned())
             )),
     );
     out.push(section_label("How many").into_any_element());
@@ -554,14 +556,7 @@ fn selection_controls(
                         .text_align(gpui::TextAlign::Right)
                         .text_size(px(13.0))
                         .text_color(rgb(theme::hex(theme::text::FAINT)))
-                        .child(
-                            state
-                                .agent_counts
-                                .get(id)
-                                .copied()
-                                .unwrap_or(1)
-                                .to_string(),
-                        ),
+                        .child(state.agent_counts.get(id).copied().unwrap_or(1).to_string()),
                 )
                 .child(crate::assets::icon(
                     agent_icon(id),
@@ -598,7 +593,10 @@ fn launch_button(
     let label = if state.selected_agents.is_empty() {
         "Choose an agent".to_owned()
     } else {
-        format!("Launch {total} session{}", if total == 1 { "" } else { "s" })
+        format!(
+            "Launch {total} session{}",
+            if total == 1 { "" } else { "s" }
+        )
     };
     let mut button = div()
         .id("slate-code-launch")
@@ -620,13 +618,16 @@ fn launch_button(
         ))
         .child(label);
     if enabled {
-        button = button.cursor_pointer().hover(|el| el.opacity(0.9)).on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _event, _window, cx| {
-                cx.stop_propagation();
-                this.code_command("launch_selected", json!({}), cx);
-            }),
-        );
+        button = button
+            .cursor_pointer()
+            .hover(|el| el.opacity(0.9))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _event, _window, cx| {
+                    cx.stop_propagation();
+                    this.code_command("launch_selected", json!({}), cx);
+                }),
+            );
     } else {
         button = button.opacity(0.3);
     }
@@ -751,11 +752,7 @@ fn session_card(
                                 let id = id.clone();
                                 move |this, _event, _window, cx| {
                                     cx.stop_propagation();
-                                    this.code_command(
-                                        "pin_session",
-                                        json!({ "id": id }),
-                                        cx,
-                                    );
+                                    this.code_command("pin_session", json!({ "id": id }), cx);
                                 }
                             }),
                         ),
@@ -782,11 +779,7 @@ fn session_card(
                                 let id = id.clone();
                                 move |this, _event, _window, cx| {
                                     cx.stop_propagation();
-                                    this.code_command(
-                                        "settle_session",
-                                        json!({ "id": id }),
-                                        cx,
-                                    );
+                                    this.code_command("settle_session", json!({ "id": id }), cx);
                                 }
                             }),
                         ),
@@ -814,11 +807,7 @@ fn session_card(
                             MouseButton::Left,
                             cx.listener(move |this, _event, _window, cx| {
                                 cx.stop_propagation();
-                                this.code_command(
-                                    "close_session",
-                                    json!({ "id": close_id }),
-                                    cx,
-                                );
+                                this.code_command("close_session", json!({ "id": close_id }), cx);
                             }),
                         ),
                 ),
@@ -1000,11 +989,7 @@ fn resume_row(
                             MouseButton::Left,
                             cx.listener(move |this, _event, _window, cx| {
                                 cx.stop_propagation();
-                                this.code_command(
-                                    "resume_toggle",
-                                    json!({ "key": key_pick }),
-                                    cx,
-                                );
+                                this.code_command("resume_toggle", json!({ "key": key_pick }), cx);
                             }),
                         ),
                 )
@@ -1028,10 +1013,7 @@ fn resume_row(
                         .flex_none()
                         .text_size(px(11.0))
                         .text_color(rgb(theme::hex(theme::text::FAINT)))
-                        .child(code_resume::relative_time(
-                            conversation.updated_at,
-                            now_ms,
-                        )),
+                        .child(code_resume::relative_time(conversation.updated_at, now_ms)),
                 )
                 .child(
                     div()
@@ -1304,38 +1286,37 @@ fn resume_section(
                 .text_color(rgb(theme::hex(theme::text::FAINT)))
                 .child(footer_text),
         );
-    let footer_button = |id: &'static str,
-                         label: String,
-                         cx: &mut Context<crate::canvas_view::CanvasView>| {
-        div()
-            .id(id)
-            .px_3()
-            .py(px(6.0))
-            .text_size(px(12.0))
-            .text_color(rgb(theme::hex(theme::text::DIM)))
-            .cursor_pointer()
-            .hover(|el| {
-                el.bg(rgb(theme::hex(theme::monochrome::RAISED)))
-                    .text_color(rgb(theme::hex(theme::text::NORMAL)))
-            })
-            .child(label)
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _event, _window, cx| {
-                    cx.stop_propagation();
-                    this.code_command(
-                        match id {
-                            "slate-resume-selall" => "resume_select_all",
-                            "slate-resume-showall" => "resume_expand",
-                            "slate-resume-dismissall" => "resume_dismiss_all",
-                            _ => "resume_all",
-                        },
-                        json!({}),
-                        cx,
-                    );
-                }),
-            )
-    };
+    let footer_button =
+        |id: &'static str, label: String, cx: &mut Context<crate::canvas_view::CanvasView>| {
+            div()
+                .id(id)
+                .px_3()
+                .py(px(6.0))
+                .text_size(px(12.0))
+                .text_color(rgb(theme::hex(theme::text::DIM)))
+                .cursor_pointer()
+                .hover(|el| {
+                    el.bg(rgb(theme::hex(theme::monochrome::RAISED)))
+                        .text_color(rgb(theme::hex(theme::text::NORMAL)))
+                })
+                .child(label)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _event, _window, cx| {
+                        cx.stop_propagation();
+                        this.code_command(
+                            match id {
+                                "slate-resume-selall" => "resume_select_all",
+                                "slate-resume-showall" => "resume_expand",
+                                "slate-resume-dismissall" => "resume_dismiss_all",
+                                _ => "resume_all",
+                            },
+                            json!({}),
+                            cx,
+                        );
+                    }),
+                )
+        };
     if visible.len() > 1 {
         footer = footer.child(footer_button(
             "slate-resume-selall",
@@ -1376,7 +1357,11 @@ fn resume_section(
                 el.bg(rgb(theme::hex(theme::monochrome::RAISED)))
                     .text_color(rgb(theme::hex(theme::text::NORMAL)))
             })
-            .child(crate::assets::icon("x", 12.0, theme::hex(theme::text::FAINT)))
+            .child(crate::assets::icon(
+                "x",
+                12.0,
+                theme::hex(theme::text::FAINT),
+            ))
             .child("Dismiss all")
             .on_mouse_down(
                 MouseButton::Left,
@@ -1400,7 +1385,11 @@ fn resume_section(
         .text_size(px(12.0))
         .font_weight(FontWeight::MEDIUM)
         .text_color(rgb(theme::hex(theme::text::NORMAL)))
-        .child(crate::assets::icon("play", 12.0, theme::hex(theme::text::NORMAL)))
+        .child(crate::assets::icon(
+            "play",
+            12.0,
+            theme::hex(theme::text::NORMAL),
+        ))
         .child(if selected_count > 0 {
             format!("Resume selected ({resumable})")
         } else {
@@ -1592,13 +1581,7 @@ fn empty_state(
 
     // The multi-select agent grid — `grid grid-cols-3 gap-2`.
     column = column.child(section_label("Agent"));
-    let mut grid = div()
-        .mb_8()
-        .w_full()
-        .flex()
-        .flex_row()
-        .flex_wrap()
-        .gap_2();
+    let mut grid = div().mb_8().w_full().flex().flex_row().flex_wrap().gap_2();
     for agent in inline_agents() {
         grid = grid.child(agent_chip(
             agent.id,
@@ -1788,11 +1771,7 @@ fn settled_or_empty(
                             MouseButton::Left,
                             cx.listener(move |this, _event, _window, cx| {
                                 cx.stop_propagation();
-                                this.code_command(
-                                    "close_session",
-                                    json!({ "id": close_id }),
-                                    cx,
-                                );
+                                this.code_command("close_session", json!({ "id": close_id }), cx);
                             }),
                         ),
                 ),
@@ -1926,11 +1905,7 @@ pub fn code_pane(
                             MouseButton::Left,
                             cx.listener(move |this, _event, _window, cx| {
                                 cx.stop_propagation();
-                                this.code_command(
-                                    "layout",
-                                    json!({ "mode": next_layout }),
-                                    cx,
-                                );
+                                this.code_command("layout", json!({ "mode": next_layout }), cx);
                             }),
                         ),
                 )
@@ -1953,10 +1928,11 @@ pub fn code_pane(
                                 .text_color(rgb(theme::hex(theme::text::NORMAL)))
                         })
                         .when(!state.launcher_open, |el| {
-                            el.text_color(rgb(theme::hex(theme::text::DIM))).hover(|el| {
-                                el.bg(rgb(theme::hex(theme::monochrome::RAISED)))
-                                    .text_color(rgb(theme::hex(theme::text::NORMAL)))
-                            })
+                            el.text_color(rgb(theme::hex(theme::text::DIM)))
+                                .hover(|el| {
+                                    el.bg(rgb(theme::hex(theme::monochrome::RAISED)))
+                                        .text_color(rgb(theme::hex(theme::text::NORMAL)))
+                                })
                         })
                         .child("+")
                         .on_mouse_down(
@@ -2112,11 +2088,7 @@ pub fn code_pane(
                             MouseButton::Left,
                             cx.listener(move |this, _event, _window, cx| {
                                 cx.stop_propagation();
-                                this.code_command(
-                                    "set_count",
-                                    json!({ "count": count }),
-                                    cx,
-                                );
+                                this.code_command("set_count", json!({ "count": count }), cx);
                             }),
                         ),
                 );
@@ -2126,7 +2098,12 @@ pub fn code_pane(
                     .ml_1()
                     .text_size(px(12.0))
                     .text_color(rgb(theme::hex(theme::text::FAINT)))
-                    .child(format!("for {}", active.map(|id| agent_label(state, id)).unwrap_or_else(|| "CLI".to_owned()))),
+                    .child(format!(
+                        "for {}",
+                        active
+                            .map(|id| agent_label(state, id))
+                            .unwrap_or_else(|| "CLI".to_owned())
+                    )),
             );
             // t3code's "New worktree" — each launched session gets its own
             // `git worktree` + `slate/<id>` branch under the workspace.
@@ -2227,10 +2204,9 @@ pub fn code_pane(
     } else {
         let width = f32::from(state.viewport.width);
         let chrome = HEADER_H + if state.launcher_open { LAUNCHER_H } else { 0.0 };
-        let height = (f32::from(state.viewport.height)
-            - slate_app::canvas::TITLE_BAR_HEIGHT
-            - chrome)
-        .max(0.0);
+        let height =
+            (f32::from(state.viewport.height) - slate_app::canvas::TITLE_BAR_HEIGHT - chrome)
+                .max(0.0);
         let focus_index = live
             .iter()
             .position(|s| Some(&s.id) == state.focused.as_ref())

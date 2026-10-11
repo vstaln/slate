@@ -265,9 +265,7 @@ pub trait RouteEnv: Send {
     fn target_version(&mut self, target: &str) -> u64;
     /// The server's cross-request idempotency cache — `submit` consults it
     /// before the gates so a retry is answered, not re-run.
-    fn idempotency(
-        &mut self,
-    ) -> std::sync::MutexGuard<'_, crate::idempotency::IdempotencyCache>;
+    fn idempotency(&mut self) -> std::sync::MutexGuard<'_, crate::idempotency::IdempotencyCache>;
     /// `rateLimiter.tryConsume(actorId)` — `submit()` throttled
     /// non-privileged actors after the idempotency check and before any gate.
     /// HTTP agents are never privileged (the original reserved `user` and
@@ -360,13 +358,22 @@ fn orchestration_target_version(
         return Some(0);
     }
     Some(match parsed.scheme.as_str() {
-        "run" => store.require_run(&parsed.id).map(|r| r.version).unwrap_or(0),
-        "orctask" => store.require_task(&parsed.id).map(|t| t.version).unwrap_or(0),
+        "run" => store
+            .require_run(&parsed.id)
+            .map(|r| r.version)
+            .unwrap_or(0),
+        "orctask" => store
+            .require_task(&parsed.id)
+            .map(|t| t.version)
+            .unwrap_or(0),
         "dispatch" => store
             .require_dispatch(&parsed.id)
             .map(|d| d.version)
             .unwrap_or(0),
-        "gate" => store.require_gate(&parsed.id).map(|g| g.version).unwrap_or(0),
+        "gate" => store
+            .require_gate(&parsed.id)
+            .map(|g| g.version)
+            .unwrap_or(0),
         _ => return None,
     })
 }
@@ -406,19 +413,21 @@ pub fn folded_target_version(
         .map(|widget| widget.version as u64)
         .unwrap_or(0),
         // Every `canvas:*` target seeds the one registry id — CANVAS_TARGET_ID.
-        "canvas" => crate::projection::fold(
-            entries,
-            crate::projection::CanvasState::default(),
-            crate::projection::Clock(deps_now_f64()),
-        )
-        .version as u64,
+        "canvas" => {
+            crate::projection::fold(
+                entries,
+                crate::projection::CanvasState::default(),
+                crate::projection::Clock(deps_now_f64()),
+            )
+            .version as u64
+        }
         "note" => notes_document(data_dir)
             .get("items")
             .and_then(Value::as_array)
             .and_then(|items| {
-                items.iter().find(|item| {
-                    item.get("id").and_then(Value::as_str) == Some(parsed.id.as_str())
-                })
+                items
+                    .iter()
+                    .find(|item| item.get("id").and_then(Value::as_str) == Some(parsed.id.as_str()))
             })
             .and_then(|item| item.get("version").and_then(Value::as_u64))
             .unwrap_or(0),
@@ -448,9 +457,10 @@ fn idempotent_replay(
 ) -> Result<(crate::journal::JournalEntry, Value), Response> {
     if cached.get("ok").and_then(Value::as_bool) == Some(false) {
         let status = cached.get("status").and_then(Value::as_u64).unwrap_or(400) as u16;
-        let body = cached.get("body").cloned().unwrap_or_else(|| {
-            json!({ "error": "command failed", "code": "failed" })
-        });
+        let body = cached
+            .get("body")
+            .cloned()
+            .unwrap_or_else(|| json!({ "error": "command failed", "code": "failed" }));
         return Err(Response::json(status, body));
     }
     Ok((
@@ -519,13 +529,7 @@ fn extra_lock_targets(entry_type: &str, payload: &Value) -> Vec<String> {
 
 /// `apply`'s `finally` lock release, as a function so the flag can move
 /// freely between borrow and assignment.
-fn release_implicit(
-    env: &mut dyn RouteEnv,
-    target: &str,
-    actor: &str,
-    now: i64,
-    took: bool,
-) {
+fn release_implicit(env: &mut dyn RouteEnv, target: &str, actor: &str, now: i64, took: bool) {
     if took {
         let _ = env.locks().release(target, actor, now);
     }
@@ -1254,7 +1258,10 @@ fn orchestration_route(
                 |deps, payload| {
                     deps.orchestration
                         .create_run(
-                            payload.get("objective").and_then(Value::as_str).unwrap_or(""),
+                            payload
+                                .get("objective")
+                                .and_then(Value::as_str)
+                                .unwrap_or(""),
                             &coordinator,
                             deps.now,
                         )
@@ -1310,14 +1317,20 @@ fn orchestration_route(
                         .get("deps")
                         .and_then(Value::as_array)
                         .map(|items| {
-                            items.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect()
+                            items
+                                .iter()
+                                .filter_map(|v| v.as_str().map(str::to_owned))
+                                .collect()
                         })
                         .unwrap_or_default();
                     let images_list: Vec<String> = payload
                         .get("images")
                         .and_then(Value::as_array)
                         .map(|items| {
-                            items.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect()
+                            items
+                                .iter()
+                                .filter_map(|v| v.as_str().map(str::to_owned))
+                                .collect()
                         })
                         .unwrap_or_default();
                     deps.orchestration
@@ -1344,11 +1357,26 @@ fn orchestration_route(
             "PATCH /orchestration/tasks/{id}",
             200,
             |deps, payload| {
-                let title = payload.get("title").and_then(Value::as_str).map(str::to_owned);
-                let spec = payload.get("spec").and_then(Value::as_str).map(str::to_owned);
-                let status = payload.get("status").and_then(Value::as_str).map(str::to_owned);
+                let title = payload
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                let spec = payload
+                    .get("spec")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                let status = payload
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
                 deps.orchestration
-                    .update_task(id, status.as_deref(), title.as_deref(), spec.as_deref(), deps.now)
+                    .update_task(
+                        id,
+                        status.as_deref(),
+                        title.as_deref(),
+                        spec.as_deref(),
+                        deps.now,
+                    )
                     .map(|task| task_json(&task))
                     .map_err(|error| Response::from_error(&error))
             },
@@ -1410,7 +1438,8 @@ fn orchestration_route(
                                 "dispatches open terminals",
                             ) {
                                 Ok(env) => {
-                                    match env.resolve_terminal(target, request.agent_id.as_deref()) {
+                                    match env.resolve_terminal(target, request.agent_id.as_deref())
+                                    {
                                         Ok(id) => id,
                                         Err(error) => return Err(Response::from_error(&error)),
                                     }
@@ -1624,69 +1653,71 @@ fn orchestration_route(
             let files = request
                 .field("filesModified")
                 .map(|_| request.strings("filesModified"));
-            Some(match submit_command(
-                deps,
-                request,
-                "dispatch.settle",
-                &format!("dispatch:{id}"),
-                request.body.clone(),
-                "POST /orchestration/dispatches/{id}/settle",
-                |deps, _| {
-                    if !OUTCOMES.contains(&outcome.as_str()) {
-                        return Err(invalid(format!(
-                            "outcome must be one of {}",
-                            OUTCOMES.join(", ")
-                        )));
-                    }
-                    deps.orchestration
-                        .settle_dispatch(id, &outcome, files.clone(), deps.now)
-                        .map(|(dispatch, task, promoted)| {
-                            json!({
-                                "dispatchId": dispatch.id,
-                                "taskId": task.id,
-                                "status": task.status,
-                                "promoted": promoted,
-                            })
-                        })
-                        .map_err(|error| Response::from_error(&error))
-                },
-            ) {
-                Ok((entry, data)) => {
-                    // The TypeScript mailed the coordinator its worker_done
-                    // *after* the submit answered ok — post-commit, not
-                    // inside apply.
-                    let actor = request.agent_id.as_deref().unwrap_or("api").to_owned();
-                    let to = request.text("to").unwrap_or("@coordinator").to_owned();
-                    let now = deps.now;
-                    if let Some(dispatch_id) = data.get("dispatchId").and_then(Value::as_str) {
-                        if let Ok(dispatch) = deps.orchestration.require_dispatch(dispatch_id) {
-                            let (run_id, task_id, dispatch_id) = (
-                                dispatch.run_id.clone(),
-                                dispatch.task_id.clone(),
-                                dispatch.id.clone(),
-                            );
-                            let _ = deps.orchestration.send(
-                                &run_id,
-                                "worker_done",
-                                &actor,
-                                &to,
-                                &format!("worker_done {task_id}"),
-                                &format!("dispatch {dispatch_id} settled as {outcome} via API"),
-                                Some(&task_id),
-                                Some(&dispatch_id),
-                                None,
-                                Some(&outcome),
-                                files.clone().unwrap_or_default(),
-                                Vec::new(),
-                                Vec::new(),
-                                now,
-                            );
+            Some(
+                match submit_command(
+                    deps,
+                    request,
+                    "dispatch.settle",
+                    &format!("dispatch:{id}"),
+                    request.body.clone(),
+                    "POST /orchestration/dispatches/{id}/settle",
+                    |deps, _| {
+                        if !OUTCOMES.contains(&outcome.as_str()) {
+                            return Err(invalid(format!(
+                                "outcome must be one of {}",
+                                OUTCOMES.join(", ")
+                            )));
                         }
+                        deps.orchestration
+                            .settle_dispatch(id, &outcome, files.clone(), deps.now)
+                            .map(|(dispatch, task, promoted)| {
+                                json!({
+                                    "dispatchId": dispatch.id,
+                                    "taskId": task.id,
+                                    "status": task.status,
+                                    "promoted": promoted,
+                                })
+                            })
+                            .map_err(|error| Response::from_error(&error))
+                    },
+                ) {
+                    Ok((entry, data)) => {
+                        // The TypeScript mailed the coordinator its worker_done
+                        // *after* the submit answered ok — post-commit, not
+                        // inside apply.
+                        let actor = request.agent_id.as_deref().unwrap_or("api").to_owned();
+                        let to = request.text("to").unwrap_or("@coordinator").to_owned();
+                        let now = deps.now;
+                        if let Some(dispatch_id) = data.get("dispatchId").and_then(Value::as_str) {
+                            if let Ok(dispatch) = deps.orchestration.require_dispatch(dispatch_id) {
+                                let (run_id, task_id, dispatch_id) = (
+                                    dispatch.run_id.clone(),
+                                    dispatch.task_id.clone(),
+                                    dispatch.id.clone(),
+                                );
+                                let _ = deps.orchestration.send(
+                                    &run_id,
+                                    "worker_done",
+                                    &actor,
+                                    &to,
+                                    &format!("worker_done {task_id}"),
+                                    &format!("dispatch {dispatch_id} settled as {outcome} via API"),
+                                    Some(&task_id),
+                                    Some(&dispatch_id),
+                                    None,
+                                    Some(&outcome),
+                                    files.clone().unwrap_or_default(),
+                                    Vec::new(),
+                                    Vec::new(),
+                                    now,
+                                );
+                            }
+                        }
+                        accepted(&entry, 200, data)
                     }
-                    accepted(&entry, 200, data)
-                }
-                Err(response) => response,
-            })
+                    Err(response) => response,
+                },
+            )
         }
         ("POST", Some("dispatches"), Some(id), Some("account")) => {
             // The original's apply validated `state` and — for a released
@@ -1734,9 +1765,7 @@ fn orchestration_route(
                         )
                         .ok()
                         .and_then(|env| folded_canvas(env).ok())
-                        .is_some_and(|canvas| {
-                            canvas.widgets.contains_key(&dispatch.terminal_id)
-                        });
+                        .is_some_and(|canvas| canvas.widgets.contains_key(&dispatch.terminal_id));
                         if known {
                             let terminal_id = dispatch.terminal_id.clone();
                             let _ = submit_command(
@@ -1770,7 +1799,10 @@ fn orchestration_route(
             payload["images"] = json!(images);
             // `runTarget` — absent runId targets `run:new`; a present one
             // must spell an id the resource grammar accepts.
-            let run_target = match request.text("runId").map(str::trim).filter(|s| !s.is_empty())
+            let run_target = match request
+                .text("runId")
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
             {
                 Some(id) => format!("run:{id}"),
                 None => "run:new".to_owned(),
@@ -1791,7 +1823,10 @@ fn orchestration_route(
                         .get("images")
                         .and_then(Value::as_array)
                         .map(|items| {
-                            items.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect()
+                            items
+                                .iter()
+                                .filter_map(|v| v.as_str().map(str::to_owned))
+                                .collect()
                         })
                         .unwrap_or_default();
                     let message_type = request.text("type").unwrap_or("note");
@@ -1846,7 +1881,9 @@ fn orchestration_route(
                     }
                     if let Some(reply_to) = request.text("replyTo") {
                         if deps.orchestration.message_by_id(reply_to).is_none() {
-                            return Err(not_found(format!("no message \"{reply_to}\" to reply to")));
+                            return Err(not_found(format!(
+                                "no message \"{reply_to}\" to reply to"
+                            )));
                         }
                     }
                     let settled = if message_type == "worker_done" {
@@ -1863,10 +1900,12 @@ fn orchestration_route(
                         let files = request
                             .field("filesModified")
                             .map(|_| request.strings("filesModified"));
-                        match deps
-                            .orchestration
-                            .settle_dispatch(&dispatch.id, outcome, files, deps.now)
-                        {
+                        match deps.orchestration.settle_dispatch(
+                            &dispatch.id,
+                            outcome,
+                            files,
+                            deps.now,
+                        ) {
                             Ok((dispatch, task, promoted)) => Some(json!({
                                 "dispatchId": dispatch.id,
                                 "taskId": task.id,
@@ -1887,8 +1926,7 @@ fn orchestration_route(
                         let raw = request.text("to").unwrap_or("").trim().to_owned();
                         let resolved = if raw.is_empty() {
                             Ok("@coordinator".to_owned())
-                        } else if matches!(raw.as_str(), "*" | "@all" | "@idle" | "@coordinator")
-                        {
+                        } else if matches!(raw.as_str(), "*" | "@all" | "@idle" | "@coordinator") {
                             Ok(raw)
                         } else if let Some(agent) = raw.strip_prefix('@') {
                             let agent = agent.to_owned();
@@ -1906,16 +1944,14 @@ fn orchestration_route(
                                 ))
                             }
                         } else {
-                            let looked_up = match environment(
-                                deps,
-                                "/orchestration/messages",
-                                "worker lookup",
-                            ) {
-                                Ok(env) => {
-                                    env.resolve_terminal(&raw, request.agent_id.as_deref()).ok()
-                                }
-                                Err(response) => return Err(response),
-                            };
+                            let looked_up =
+                                match environment(deps, "/orchestration/messages", "worker lookup")
+                                {
+                                    Ok(env) => {
+                                        env.resolve_terminal(&raw, request.agent_id.as_deref()).ok()
+                                    }
+                                    Err(response) => return Err(response),
+                                };
                             // A recipient that is not a terminal, a name, or a
                             // prefix still passes through as an actor id — the
                             // store accepts opaque ids (api, cli, …).
@@ -1955,7 +1991,10 @@ fn orchestration_route(
         }
         ("POST", Some("messages"), Some(id), Some("ack")) => {
             // `orc.ack` — payload `{messageId}` on the run's target.
-            let run_target = match request.text("runId").map(str::trim).filter(|s| !s.is_empty())
+            let run_target = match request
+                .text("runId")
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
             {
                 Some(run) => format!("run:{run}"),
                 None => "run:new".to_owned(),
@@ -2769,7 +2808,10 @@ pub fn widget_row(widget: &crate::projection::Widget) -> Value {
 /// stamps it on the commit payload (`p.id = id`), applies the registry
 /// defaults, and returns the stored widget — the row the fold produces.
 fn widget_create_apply(deps: &mut RouteDeps<'_>, payload: &mut Value) -> Result<Value, Response> {
-    let kind = payload.get("kind").and_then(Value::as_str).map(str::to_owned);
+    let kind = payload
+        .get("kind")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     let generated = format!(
         "{}-{}-{}",
         kind.as_deref().unwrap_or("widget"),
@@ -2791,7 +2833,11 @@ fn widget_create_apply(deps: &mut RouteDeps<'_>, payload: &mut Value) -> Result<
     {
         return Err(invalid("widget id must be 1–128 chars of [A-Za-z0-9._:-]"));
     }
-    let env = environment(deps, "POST /widgets", "creating a widget commits to the journal")?;
+    let env = environment(
+        deps,
+        "POST /widgets",
+        "creating a widget commits to the journal",
+    )?;
     let canvas = folded_canvas(env)?;
     if canvas.widgets.contains_key(&id) {
         return Err(Response::from_error(&CommandError::new(
@@ -2974,10 +3020,7 @@ fn widgets_route(request: &Request, segments: &[String], deps: &mut RouteDeps<'_
                             cwd.as_deref().unwrap_or(""),
                         )
                         .map_err(|error| {
-                            Response::from_error(&CommandError::new(
-                                ErrorCode::Failed,
-                                error,
-                            ))
+                            Response::from_error(&CommandError::new(ErrorCode::Failed, error))
                         })
                     })?;
                     // `waitUntilRunning(10_000)` — a shell that never reaches
@@ -3116,9 +3159,7 @@ fn widgets_route(request: &Request, segments: &[String], deps: &mut RouteDeps<'_
                         }
                     }
                     let mut merged = widget_row(existing);
-                    if let (Some(row), Some(patch)) =
-                        (merged.as_object_mut(), patch.as_object())
-                    {
+                    if let (Some(row), Some(patch)) = (merged.as_object_mut(), patch.as_object()) {
                         for (key, value) in patch {
                             row.insert(key.clone(), value.clone());
                         }
@@ -3185,9 +3226,12 @@ fn widgets_route(request: &Request, segments: &[String], deps: &mut RouteDeps<'_
                             .collect();
                         let now = deps.now;
                         for dispatch_id in live {
-                            let _ = deps
-                                .orchestration
-                                .settle_dispatch(&dispatch_id, "failed", None, now);
+                            let _ = deps.orchestration.settle_dispatch(
+                                &dispatch_id,
+                                "failed",
+                                None,
+                                now,
+                            );
                         }
                         Ok(json!({ "id": raw }))
                     },
@@ -3415,11 +3459,8 @@ fn canvas_route(request: &Request, segments: &[String], deps: &mut RouteDeps<'_>
             if image_widget && media_kind != crate::attachments::MediaKind::Image {
                 return invalid(format!("{source} is not an image"));
             }
-            let media_dir = match environment(
-                deps,
-                route,
-                "importing a file needs the media store",
-            ) {
+            let media_dir = match environment(deps, route, "importing a file needs the media store")
+            {
                 Ok(env) => env.data_dir().join("media"),
                 Err(response) => return response,
             };
@@ -3505,7 +3546,15 @@ fn canvas_route(request: &Request, segments: &[String], deps: &mut RouteDeps<'_>
                     }
                 });
             }
-            match submit_command(deps, request, "widget.create", "widget:new", payload, route, widget_create_apply) {
+            match submit_command(
+                deps,
+                request,
+                "widget.create",
+                "widget:new",
+                payload,
+                route,
+                widget_create_apply,
+            ) {
                 Ok((entry, widget)) => {
                     let id = widget
                         .get("id")
@@ -3554,9 +3603,7 @@ fn planner_route(request: &Request, segments: &[String], deps: &mut RouteDeps<'_
             crate::planner::PlannerState::default(),
             &crate::planner::today_local(),
         )
-        .map_err(|invalid| {
-            Response::from_error(&CommandError::new(ErrorCode::Failed, invalid.0))
-        })
+        .map_err(|invalid| Response::from_error(&CommandError::new(ErrorCode::Failed, invalid.0)))
     }
 
     fn plan_items<'e>(
@@ -3679,15 +3726,8 @@ fn planner_route(request: &Request, segments: &[String], deps: &mut RouteDeps<'_
                     );
                     payload["order"] =
                         json!(crate::planner::next_order(state.values(), day.as_deref()));
-                    let state = preview_plan(
-                        env,
-                        "plan.create",
-                        "plan:new",
-                        payload,
-                        &actor,
-                        1,
-                        now,
-                    )?;
+                    let state =
+                        preview_plan(env, "plan.create", "plan:new", payload, &actor, 1, now)?;
                     let id = payload["id"].as_str().unwrap_or_default().to_owned();
                     Ok(state
                         .get(&id)
@@ -3721,9 +3761,10 @@ fn planner_route(request: &Request, segments: &[String], deps: &mut RouteDeps<'_
                         "POST /planner/{id}/toggle",
                         "the planner folds the journal",
                     )?;
-                    let existing = plan_state(env)?.get(raw).cloned().ok_or_else(|| {
-                        not_found("plan item not found")
-                    })?;
+                    let existing = plan_state(env)?
+                        .get(raw)
+                        .cloned()
+                        .ok_or_else(|| not_found("plan item not found"))?;
                     let version = (existing.version as i64) + 1;
                     let state = preview_plan(
                         env,
@@ -3763,14 +3804,12 @@ fn planner_route(request: &Request, segments: &[String], deps: &mut RouteDeps<'_
                     // `updateItem` looks the item up first — a stale id is
                     // not_found even when the day is malformed.
                     let now = deps.now;
-                    let env = environment(
-                        deps,
-                        "PATCH /planner/{id}",
-                        "the planner folds the journal",
-                    )?;
-                    let existing = plan_state(env)?.get(raw).cloned().ok_or_else(|| {
-                        not_found("plan item not found")
-                    })?;
+                    let env =
+                        environment(deps, "PATCH /planner/{id}", "the planner folds the journal")?;
+                    let existing = plan_state(env)?
+                        .get(raw)
+                        .cloned()
+                        .ok_or_else(|| not_found("plan item not found"))?;
                     if let Some(day) = payload.get("day") {
                         if !day.is_null() {
                             if let Err(invalid_day) = crate::planner::normalize_day(
@@ -4090,8 +4129,7 @@ fn notes_route(request: &Request, segments: &[String], deps: &mut RouteDeps<'_>)
                     let mut items = items;
                     items.push(item.clone());
                     document["items"] = Value::Array(items);
-                    notes_write(&dir, &document)
-                        .map_err(|error| Response::from_error(&error))?;
+                    notes_write(&dir, &document).map_err(|error| Response::from_error(&error))?;
                     Ok(item)
                 },
             ) {
@@ -4125,9 +4163,7 @@ fn notes_route(request: &Request, segments: &[String], deps: &mut RouteDeps<'_>)
                     }
                     let mut items = notes_items(&document);
                     for item in &mut items {
-                        if item.get("category").and_then(Value::as_str)
-                            == Some(category.as_str())
-                        {
+                        if item.get("category").and_then(Value::as_str) == Some(category.as_str()) {
                             item["color"] = json!(&color);
                             item["updatedAt"] = json!(now);
                             item["version"] = json!(
@@ -4136,8 +4172,7 @@ fn notes_route(request: &Request, segments: &[String], deps: &mut RouteDeps<'_>)
                         }
                     }
                     document["items"] = Value::Array(items);
-                    notes_write(&dir, &document)
-                        .map_err(|error| Response::from_error(&error))?;
+                    notes_write(&dir, &document).map_err(|error| Response::from_error(&error))?;
                     Ok(json!({ "ok": true }))
                 },
             ) {
@@ -4175,8 +4210,7 @@ fn notes_route(request: &Request, segments: &[String], deps: &mut RouteDeps<'_>)
                             }
                         }
                         if let Some(text) = body.get("body").and_then(Value::as_str) {
-                            item["body"] =
-                                json!(text.chars().take(20_000).collect::<String>());
+                            item["body"] = json!(text.chars().take(20_000).collect::<String>());
                         }
                         if body.get("tags").is_some() {
                             item["tags"] = json!(normalize_tags(body.get("tags")));
@@ -4887,9 +4921,7 @@ fn browser_open(request: &Request, deps: &mut RouteDeps<'_>) -> Response {
             .and_then(crate::browser::browser_navigation_url)
         {
             Some(url) => Some(url),
-            None => {
-                return invalid("url must be a valid http(s) address; localhost is supported")
-            }
+            None => return invalid("url must be a valid http(s) address; localhost is supported"),
         },
     };
     if target_url
@@ -4977,7 +5009,9 @@ fn browser_open(request: &Request, deps: &mut RouteDeps<'_>) -> Response {
         "widget.create",
         "widget:new",
         payload,
-        "POST /browser/open", widget_create_apply) {
+        "POST /browser/open",
+        widget_create_apply,
+    ) {
         return response;
     }
     let Some(url) = target_url else {
@@ -4989,9 +5023,7 @@ fn browser_open(request: &Request, deps: &mut RouteDeps<'_>) -> Response {
     // `requestBrowserAgentAction(navigate)` — journal `state.url` first so a
     // not-yet-mounted webview loads the target on first paint, then drive
     // the real page load and await it like the original's 45s promise.
-    if let Err(response) =
-        journal_browser_state(deps, request, &id, json!({ "url": url }))
-    {
+    if let Err(response) = journal_browser_state(deps, request, &id, json!({ "url": url })) {
         return response;
     }
     let action = crate::browser::BrowserAgentAction::Navigate { url: url.clone() };
@@ -5083,9 +5115,7 @@ fn browser_widget_action(
                     .text("url")
                     .and_then(crate::browser::browser_navigation_url)
                 else {
-                    return invalid(
-                        "url must be a valid http(s) address; localhost is supported",
-                    );
+                    return invalid("url must be a valid http(s) address; localhost is supported");
                 };
                 if crate::browser::is_protected_checkout_url(&url) {
                     return invalid("checkout navigation is disabled");
@@ -5093,8 +5123,7 @@ fn browser_widget_action(
                 Action::Navigate { url }
             }
             "click" | "fill" | "select" => {
-                let Some(ref_index) = parse_ref(&js_coerced_string(request.body.get("ref")))
-                else {
+                let Some(ref_index) = parse_ref(&js_coerced_string(request.body.get("ref"))) else {
                     return invalid("ref must be a number from 1 to 100");
                 };
                 if segments[2] == "click" {
@@ -5145,9 +5174,7 @@ fn browser_widget_action(
                             0.0
                         }
                     }
-                    Some(Value::String(s)) => {
-                        s.trim().parse::<f64>().unwrap_or(f64::NAN)
-                    }
+                    Some(Value::String(s)) => s.trim().parse::<f64>().unwrap_or(f64::NAN),
                     Some(_) => f64::NAN,
                 };
                 if !pixels.is_finite() {
@@ -5180,9 +5207,7 @@ fn browser_widget_action(
 
     match crate::webview::agent_action(raw_id, &action) {
         Ok(result) => Response::json(200, json!({ "ok": true, "data": result })),
-        Err(error) => {
-            Response::json(502, json!({ "error": error, "code": "failed" }))
-        }
+        Err(error) => Response::json(502, json!({ "error": error, "code": "failed" })),
     }
 }
 

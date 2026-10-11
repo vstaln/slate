@@ -71,13 +71,7 @@ fn url_shape_ok(raw: &str, allow_empty_host: bool) -> bool {
     if authority.contains('@') {
         return false;
     }
-    if !allow_empty_host
-        && authority
-            .split(':')
-            .next()
-            .unwrap_or_default()
-            .is_empty()
-    {
+    if !allow_empty_host && authority.split(':').next().unwrap_or_default().is_empty() {
         return false;
     }
     true
@@ -106,8 +100,7 @@ fn local_path_to_file_url(raw: &str) -> Option<String> {
         && bytes[0].is_ascii_alphabetic()
         && bytes[1] == b':'
         && (bytes[2] == b'\\' || bytes[2] == b'/');
-    let is_unc =
-        raw.starts_with("\\\\") && bytes.get(2).is_some_and(|b| *b != b'\\' && *b != b'/');
+    let is_unc = raw.starts_with("\\\\") && bytes.get(2).is_some_and(|b| *b != b'\\' && *b != b'/');
     // POSIX absolute paths only resolve where POSIX paths exist. Mirrors the
     // original's `!IS_WINDOWS && /^\/[^\s]*[/.][^\s]*$/` — a `/` or `.` must
     // appear after the leading slash so `/word` stays a search.
@@ -118,7 +111,10 @@ fn local_path_to_file_url(raw: &str) -> Option<String> {
     if !is_drive && !is_unc && !is_posix {
         return None;
     }
-    let slashed: String = raw.chars().map(|c| if c == '\\' { '/' } else { c }).collect();
+    let slashed: String = raw
+        .chars()
+        .map(|c| if c == '\\' { '/' } else { c })
+        .collect();
     let mut out = String::with_capacity(slashed.len() + 8);
     if is_unc {
         // `//server/share/…` keeps its authority: file://server/share/…
@@ -256,9 +252,7 @@ pub fn browser_navigation_url(value: &str) -> Option<String> {
 pub fn host_of(url: &str) -> String {
     let after_scheme = match url.split_once("://") {
         Some(("file", rest)) | Some(("FILE", rest)) => {
-            let last = rest
-                .split('/').rfind(|s| !s.is_empty())
-                .unwrap_or_default();
+            let last = rest.split('/').rfind(|s| !s.is_empty()).unwrap_or_default();
             return percent_decode(last);
         }
         Some((_, rest)) => rest,
@@ -340,7 +334,8 @@ fn checkout_segment(segment: &str) -> bool {
     {
         return matches!(
             rest,
-            "now" | "start"
+            "now"
+                | "start"
                 | "review"
                 | "payment"
                 | "confirm"
@@ -350,8 +345,14 @@ fn checkout_segment(segment: &str) -> bool {
         );
     }
     // `order[-_](review|confirm(ation)?|complete|finish)`
-    if let Some(rest) = seg.strip_prefix("order-").or_else(|| seg.strip_prefix("order_")) {
-        return matches!(rest, "review" | "confirm" | "confirmation" | "complete" | "finish");
+    if let Some(rest) = seg
+        .strip_prefix("order-")
+        .or_else(|| seg.strip_prefix("order_"))
+    {
+        return matches!(
+            rest,
+            "review" | "confirm" | "confirmation" | "complete" | "finish"
+        );
     }
     false
 }
@@ -463,7 +464,8 @@ const PROTECTED_ORDER_WORDS: &str = r"\b(?:check\s?out|place\s+(?:an?\s+)?order|
 const PROTECTED_CHECKOUT_PATH: &str = r"(?:^|/)(?:checkouts?(?:[-_](?:now|start|review|payment|confirm(?:ation)?|complete|finish))?|check-out|payments?|billing|place[-_]order|order[-_](?:review|confirm(?:ation)?|complete|finish)|complete[-_]order|confirm[-_]order|finish[-_]order|buy[-_]now|purchase)(?:\.[a-z]+)?(?:/|$)";
 const PROTECTED_PAYMENT_FIELDS: &str = r"password|passwd|secret|token|credit.?card|card.?holder|card.?name|card.?number|card.?exp|expir(?:y|ation)|valid.?through|cc[-_ ]?(?:number|name|exp|csc|cvv|cvc)|payment.?method|one-time-code|\botp\b|\bcvv\b|\bcvc\b|security.?code|iban|routing.?number|ssn";
 const PROTECTED_PAYMENT_FORM_FIELDS: &str = r"password|passwd|secret|credit.?card|card.?holder|card.?name|card.?number|card.?exp|expir(?:y|ation)|valid.?through|cc[-_ ]?(?:number|name|exp|csc|cvv|cvc)|payment.?(?:token|method)|one-time-code|\botp\b|\bcvv\b|\bcvc\b|security.?code|iban|routing.?number|ssn";
-const SAFE_CHECKOUT_EXIT: &str = r"\b(?:back|return)\s+to\s+(?:cart|bag)|continue\s+shopping|edit\s+(?:cart|bag)\b";
+const SAFE_CHECKOUT_EXIT: &str =
+    r"\b(?:back|return)\s+to\s+(?:cart|bag)|continue\s+shopping|edit\s+(?:cart|bag)\b";
 
 /// `JSON.stringify` for a script embed — a double-quoted, JS-escaped literal.
 fn js_string(value: &str) -> String {
@@ -606,8 +608,7 @@ const PRESS_KEY_SCRIPT: &str = r#"(() => {
   })()"#;
 
 /// `scrollScript(pixels)` — instant scroll by the clamped delta.
-const SCROLL_SCRIPT: &str =
-    r#"(() => { window.scrollBy({ top: __PIXELS__, behavior: 'instant' }); return { scrolled: __PIXELS__ } })()"#;
+const SCROLL_SCRIPT: &str = r#"(() => { window.scrollBy({ top: __PIXELS__, behavior: 'instant' }); return { scrolled: __PIXELS__ } })()"#;
 
 /// Fill the shared placeholders: the ref index and the protected regexes.
 fn fill_guard_placeholders(script: &str, ref_index: u32) -> String {
@@ -643,14 +644,10 @@ impl BrowserAgentAction {
             Self::Navigate { .. } => return None,
             Self::Snapshot => SNAPSHOT_SCRIPT.to_owned(),
             Self::Click { ref_index } => fill_guard_placeholders(CLICK_SCRIPT, *ref_index),
-            Self::Select { ref_index, value } => {
-                fill_guard_placeholders(SELECT_SCRIPT, *ref_index)
-                    .replace("__VALUE__", &js_string(value))
-            }
-            Self::Fill { ref_index, value } => {
-                fill_guard_placeholders(FILL_SCRIPT, *ref_index)
-                    .replace("__VALUE__", &js_string(value))
-            }
+            Self::Select { ref_index, value } => fill_guard_placeholders(SELECT_SCRIPT, *ref_index)
+                .replace("__VALUE__", &js_string(value)),
+            Self::Fill { ref_index, value } => fill_guard_placeholders(FILL_SCRIPT, *ref_index)
+                .replace("__VALUE__", &js_string(value)),
             Self::Press { key, ref_index } => {
                 let key_script = fill_guard_placeholders(PRESS_KEY_SCRIPT, 1)
                     .replace("__KEY__", &js_string(key));
@@ -720,7 +717,9 @@ mod tests {
 
     #[test]
     fn checkout_guard() {
-        assert!(is_protected_checkout_url("https://shop.example.com/checkout"));
+        assert!(is_protected_checkout_url(
+            "https://shop.example.com/checkout"
+        ));
         assert!(is_protected_checkout_url(
             "https://shop.example.com/cart/order-review/"
         ));
@@ -730,7 +729,9 @@ mod tests {
             "https://checkout.example.evil.org/"
         ));
         assert!(!is_protected_checkout_url("https://example.com/about"));
-        assert!(!is_protected_checkout_url("https://example.com/checkoutting"));
+        assert!(!is_protected_checkout_url(
+            "https://example.com/checkoutting"
+        ));
         assert!(!is_protected_checkout_url("not a url"));
     }
 

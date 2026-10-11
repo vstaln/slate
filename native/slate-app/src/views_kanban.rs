@@ -141,7 +141,8 @@ fn card_view<'a>(
     // fold to the same column. fix-panes2: via `kanban_move`, the REST route.
     let widget_id = widget_id.to_owned();
     let card_id = card.id.clone();
-    let move_action = json!({ "op": "kanban_move", "id": card_id, "status": card.column.next().key() });
+    let move_action =
+        json!({ "op": "kanban_move", "id": card_id, "status": card.column.next().key() });
     el.on_mouse_down(
         MouseButton::Left,
         cx.listener(move |this, _event, _window, cx| {

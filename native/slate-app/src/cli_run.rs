@@ -228,7 +228,10 @@ pub fn run() -> Result<(), String> {
     if command == "journal" {
         return run_journal(&parsed);
     }
-    if matches!(command.as_str(), "canvas" | "pane" | "panes" | "widget" | "widgets") {
+    if matches!(
+        command.as_str(),
+        "canvas" | "pane" | "panes" | "widget" | "widgets"
+    ) {
         return run_canvas(&parsed);
     }
     if command == "git" {
@@ -282,8 +285,7 @@ pub fn run() -> Result<(), String> {
                 ) {
                     Err(error)
                         if error.contains("is locked by")
-                            && locked_deadline
-                                .is_some_and(|d| std::time::Instant::now() < d) =>
+                            && locked_deadline.is_some_and(|d| std::time::Instant::now() < d) =>
                     {
                         std::thread::sleep(std::time::Duration::from_millis(300));
                     }
@@ -298,8 +300,7 @@ pub fn run() -> Result<(), String> {
             if parsed.flag("json") {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(data_of(&response))
-                        .map_err(|e| e.to_string())?
+                    serde_json::to_string_pretty(data_of(&response)).map_err(|e| e.to_string())?
                 );
             } else {
                 // The trailing hint is from slate.mjs: the answer to a tell
@@ -342,9 +343,7 @@ pub fn run() -> Result<(), String> {
                     workers
                         .iter()
                         .filter(|w| w.get("alive").and_then(Value::as_bool) == Some(false))
-                        .filter_map(|w| {
-                            w.get("id").and_then(Value::as_str).map(str::to_owned)
-                        })
+                        .filter_map(|w| w.get("id").and_then(Value::as_str).map(str::to_owned))
                         .collect()
                 })
                 .unwrap_or_default();
@@ -360,16 +359,16 @@ pub fn run() -> Result<(), String> {
             // `slate wait <terminal|name> [--for working|blocked|idle]
             // [--timeout <s>]` — herdr's "wait until another agent is
             // genuinely blocked" gate for agent-on-agent orchestration.
-            let target = parsed
-                .positionals()
-                .get(1)
-                .cloned()
-                .ok_or_else(|| "usage: slate wait <terminal|name> [--for <state>] [--timeout <s>]".to_owned())?;
+            let target = parsed.positionals().get(1).cloned().ok_or_else(|| {
+                "usage: slate wait <terminal|name> [--for <state>] [--timeout <s>]".to_owned()
+            })?;
             let want = parsed
                 .pick(&["for", "state"])
                 .unwrap_or_else(|| "blocked".to_owned());
             if slate_app::agent_state::AgentState::parse(&want).is_none() {
-                return Err(format!("unknown state \"{want}\" — working|blocked|idle|unknown"));
+                return Err(format!(
+                    "unknown state \"{want}\" — working|blocked|idle|unknown"
+                ));
             }
             let timeout = parsed
                 .pick(&["timeout", "timeoutMs"])
@@ -397,7 +396,10 @@ pub fn run() -> Result<(), String> {
                 let Some(row) = row else {
                     return Err(format!("no terminal called \"{target}\""));
                 };
-                let state = row.get("state").and_then(Value::as_str).unwrap_or("unknown");
+                let state = row
+                    .get("state")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
                 if parsed.flag("json") {
                     println!("{}", serde_json::to_string(row).unwrap_or_default());
                 }
@@ -467,8 +469,7 @@ pub fn run() -> Result<(), String> {
             // other error rethrows.
             let response = match response {
                 Err(error)
-                    if (error.starts_with("not_found:")
-                        || error.starts_with("http_404"))
+                    if (error.starts_with("not_found:") || error.starts_with("http_404"))
                         && matches!(other, "task-show" | "task" | "worker-show") =>
                 {
                     let (list_path, key) = match other {
@@ -1649,10 +1650,7 @@ fn run_browser_action(parsed: &slate_app::cli::Args, sub: &str) -> Result<(), St
             .cloned()
             .ok_or_else(|| format!("invalid: {what}"))
     };
-    let pick = |names: &[&str], at: usize| pos
-        .get(at)
-        .cloned()
-        .or_else(|| parsed.pick(names));
+    let pick = |names: &[&str], at: usize| pos.get(at).cloned().or_else(|| parsed.pick(names));
     let mut body = serde_json::Map::new();
     let (method, path) = match sub {
         "open" => {
@@ -1662,8 +1660,7 @@ fn run_browser_action(parsed: &slate_app::cli::Args, sub: &str) -> Result<(), St
         }
         "navigate" | "goto" => {
             let id = id("browser navigate needs <id> <url>")?;
-            let url = pick(&["url"], 3)
-                .ok_or("invalid: browser navigate needs <id> <url>")?;
+            let url = pick(&["url"], 3).ok_or("invalid: browser navigate needs <id> <url>")?;
             put(&mut body, "url", Some(url));
             ("POST", format!("/browser/{id}/navigate"))
         }
@@ -1679,30 +1676,51 @@ fn run_browser_action(parsed: &slate_app::cli::Args, sub: &str) -> Result<(), St
         }
         "click" => {
             let id = id("browser click needs <id> <ref>")?;
-            put(&mut body, "ref", Some(pick(&["ref"], 3)
-                .ok_or("invalid: browser click needs <id> <ref>")?));
+            put(
+                &mut body,
+                "ref",
+                Some(pick(&["ref"], 3).ok_or("invalid: browser click needs <id> <ref>")?),
+            );
             ("POST", format!("/browser/{id}/click"))
         }
         "fill" => {
             let id = id("browser fill needs <id> <ref>")?;
-            put(&mut body, "ref", Some(pick(&["ref"], 3)
-                .ok_or("invalid: browser fill needs <id> <ref>")?));
-            put(&mut body, "value", Some(pick(&["value", "text"], 4)
-                .ok_or("invalid: browser fill needs --value \"...\"")?));
+            put(
+                &mut body,
+                "ref",
+                Some(pick(&["ref"], 3).ok_or("invalid: browser fill needs <id> <ref>")?),
+            );
+            put(
+                &mut body,
+                "value",
+                Some(
+                    pick(&["value", "text"], 4)
+                        .ok_or("invalid: browser fill needs --value \"...\"")?,
+                ),
+            );
             ("POST", format!("/browser/{id}/fill"))
         }
         "select" => {
             let id = id("browser select needs <id> <ref>")?;
-            put(&mut body, "ref", Some(pick(&["ref"], 3)
-                .ok_or("invalid: browser select needs <id> <ref>")?));
-            put(&mut body, "value", Some(pick(&["value"], 4)
-                .ok_or("invalid: browser select needs --value \"...\"")?));
+            put(
+                &mut body,
+                "ref",
+                Some(pick(&["ref"], 3).ok_or("invalid: browser select needs <id> <ref>")?),
+            );
+            put(
+                &mut body,
+                "value",
+                Some(pick(&["value"], 4).ok_or("invalid: browser select needs --value \"...\"")?),
+            );
             ("POST", format!("/browser/{id}/select"))
         }
         "press" => {
             let id = id("browser press needs <id> <key>")?;
-            put(&mut body, "key", Some(pick(&["key"], 3)
-                .ok_or("invalid: browser press needs <id> <key>")?));
+            put(
+                &mut body,
+                "key",
+                Some(pick(&["key"], 3).ok_or("invalid: browser press needs <id> <key>")?),
+            );
             put(&mut body, "ref", parsed.pick(&["ref"]));
             ("POST", format!("/browser/{id}/press"))
         }
@@ -1711,7 +1729,10 @@ fn run_browser_action(parsed: &slate_app::cli::Args, sub: &str) -> Result<(), St
             if let Some(pixels) = pick(&["pixels"], 3) {
                 body.insert(
                     "pixels".to_owned(),
-                    pixels.parse::<f64>().map(Value::from).unwrap_or(json!(pixels)),
+                    pixels
+                        .parse::<f64>()
+                        .map(Value::from)
+                        .unwrap_or(json!(pixels)),
                 );
             }
             ("POST", format!("/browser/{id}/scroll"))
@@ -1723,7 +1744,13 @@ fn run_browser_action(parsed: &slate_app::cli::Args, sub: &str) -> Result<(), St
             ))
         }
     };
-    browser_print(request(&url, &token, method, &path, Some(Value::Object(body)))?)
+    browser_print(request(
+        &url,
+        &token,
+        method,
+        &path,
+        Some(Value::Object(body)),
+    )?)
 }
 
 fn put(body: &mut serde_json::Map<String, Value>, key: &str, value: Option<String>) {
@@ -2353,9 +2380,7 @@ fn run_worker_read(url: &str, token: &str, parsed: &slate_app::cli::Args) -> Res
                 .and_then(Value::as_str)
                 .map(str::to_owned),
             // orc rethrows anything that isn't a 404, then lists.
-            Err(error)
-                if error.starts_with("not_found:") || error.starts_with("http_404") =>
-            {
+            Err(error) if error.starts_with("not_found:") || error.starts_with("http_404") => {
                 let list = request(url, token, "GET", "/orchestration/dispatches", None)?;
                 data_of(&list)
                     .get("dispatches")
@@ -2363,9 +2388,7 @@ fn run_worker_read(url: &str, token: &str, parsed: &slate_app::cli::Args) -> Res
                     .and_then(|dispatches| {
                         dispatches
                             .iter()
-                            .find(|d| {
-                                d.get("id").and_then(Value::as_str) == Some(target.as_str())
-                            })
+                            .find(|d| d.get("id").and_then(Value::as_str) == Some(target.as_str()))
                             .and_then(|d| d.get("terminalId"))
                             .and_then(Value::as_str)
                             .map(str::to_owned)
@@ -2377,7 +2400,9 @@ fn run_worker_read(url: &str, token: &str, parsed: &slate_app::cli::Args) -> Res
             Some(id) => terminal_id = id,
             // An id-shaped target that resolves to nothing is still tried as
             // a terminal id, as slate.mjs does.
-            None if !is_id_like(&target) => return Err(format!("not_found: no dispatch \"{target}\"")),
+            None if !is_id_like(&target) => {
+                return Err(format!("not_found: no dispatch \"{target}\""))
+            }
             None => {}
         }
     }
@@ -2732,7 +2757,10 @@ fn wait_for_agent_state(
         let Some(row) = row else {
             return Err(format!("no terminal called \"{target}\""));
         };
-        let state = row.get("state").and_then(Value::as_str).unwrap_or("unknown");
+        let state = row
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
         let name = row
             .get("name")
             .and_then(Value::as_str)
@@ -2805,7 +2833,10 @@ fn format_agents(response: &Value) -> String {
     }
     rows.iter()
         .map(|row| {
-            let state = row.get("state").and_then(Value::as_str).unwrap_or("unknown");
+            let state = row
+                .get("state")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
             let agent = row.get("agent").and_then(Value::as_str).unwrap_or("-");
             let name = row.get("name").and_then(Value::as_str).unwrap_or("-");
             let id = row.get("id").and_then(Value::as_str).unwrap_or("-");
@@ -2869,10 +2900,7 @@ fn format_workers(response: &Value) -> String {
                         // The manifest detector's state wins over raw
                         // liveness when the terminal carries one — herdr's
                         // roster reads `working`/`blocked`, not `busy`.
-                        let detected = worker
-                            .get("state")
-                            .and_then(Value::as_str)
-                            .unwrap_or("");
+                        let detected = worker.get("state").and_then(Value::as_str).unwrap_or("");
                         if detected.is_empty() || detected == "unknown" {
                             line.push_str(if busy { "  busy" } else { "  idle" });
                         } else {

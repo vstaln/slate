@@ -31,9 +31,7 @@ const WARN_AMBER: u32 = 0xe6c07b;
 /// other's delta.
 static LAST_CPU: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<std::string::String, (u64, u64)>>,
-> = std::sync::LazyLock::new(|| {
-    std::sync::Mutex::new(std::collections::HashMap::new())
-});
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 #[derive(Default)]
 pub struct Snapshot {
@@ -70,11 +68,7 @@ fn read_cpu_ticks() -> Option<(u64, u64)> {
     Some((idle, total))
 }
 
-fn sample_cpu_percent(
-    key: &str,
-    load: Option<[f64; 3]>,
-    cores: usize,
-) -> Option<f32> {
+fn sample_cpu_percent(key: &str, load: Option<[f64; 3]>, cores: usize) -> Option<f32> {
     let now = read_cpu_ticks();
     let mut map = LAST_CPU.lock().ok()?;
     let last = map.get(key).copied();
