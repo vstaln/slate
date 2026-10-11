@@ -244,11 +244,10 @@ fn read_chunk(file: &Path, bytes: u64, from_end: bool) -> String {
     }
     let length = size.min(bytes);
     let mut buffer = vec![0u8; length as usize];
-    if from_end {
-        if handle.seek(SeekFrom::End(-(length as i64))).is_err() {
+    if from_end
+        && handle.seek(SeekFrom::End(-(length as i64))).is_err() {
             return String::new();
         }
-    }
     let mut filled = 0usize;
     while filled < buffer.len() {
         match handle.read(&mut buffer[filled..]) {
@@ -540,7 +539,7 @@ fn stat_files(paths: Vec<PathBuf>, max: usize) -> Vec<Candidate> {
         .into_iter()
         .filter_map(|path| file_mtime_ms(&path).map(|mtime| Candidate { path, mtime }))
         .collect();
-    out.sort_by(|a, b| b.mtime.cmp(&a.mtime));
+    out.sort_by_key(|c| std::cmp::Reverse(c.mtime));
     out.truncate(max);
     out
 }
@@ -809,7 +808,7 @@ pub fn list(dir: &str, home: Option<&Path>, limit: Option<usize>) -> Vec<AgentCo
 
     let mut seen = HashSet::new();
     all.retain(|c| seen.insert(conversation_key(c.agent_id, c.id.as_str())));
-    all.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    all.sort_by_key(|c| std::cmp::Reverse(c.updated_at));
 
     // Recency alone lets one busy agent fill the whole list, hiding that the
     // folder also has conversations in the others. So the room is dealt out
@@ -835,7 +834,7 @@ pub fn list(dir: &str, home: Option<&Path>, limit: Option<usize>) -> Vec<AgentCo
             break;
         }
     }
-    picked.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    picked.sort_by_key(|c| std::cmp::Reverse(c.updated_at));
     picked
 }
 

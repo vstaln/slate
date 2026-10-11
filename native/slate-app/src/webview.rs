@@ -317,9 +317,10 @@ static BUSY_WIDGETS: std::sync::LazyLock<Mutex<std::collections::HashSet<String>
 
 /// requestId → responder, the `pending` map the GTK-thread eval callback
 /// resolves. Values are the eval's raw JSON string or a ready-made error.
-static EVAL_PENDING: std::sync::LazyLock<
-    Mutex<HashMap<u64, std::sync::mpsc::Sender<Result<String, String>>>>,
-> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+type EvalResponder = std::sync::mpsc::Sender<Result<String, String>>;
+
+static EVAL_PENDING: std::sync::LazyLock<Mutex<HashMap<u64, EvalResponder>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 static NEXT_EVAL_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// `MAX_RESPONSE_BYTES` — a page bigger than this answers with the same

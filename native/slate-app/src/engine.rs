@@ -2916,6 +2916,7 @@ fn route_deps<'a>(
 /// held over the await. `work` answers `Result<Value, Response>` like the
 /// router's closures: the value is the response's `data`, the commit's id,
 /// and the idempotent record's replay.
+#[allow(clippy::too_many_arguments)]
 async fn submit_engine<F, Fut>(
     state: &HttpState,
     actor: &str,

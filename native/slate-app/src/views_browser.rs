@@ -188,6 +188,7 @@ fn chrome_button<'a>(
     button.child(label)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn browser_pane(
     widget: &Widget,
     zoom: f32,

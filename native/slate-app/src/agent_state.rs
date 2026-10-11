@@ -168,7 +168,7 @@ fn load() -> Vec<CompiledManifest> {
                 matcher: compile(&r.matcher),
             })
             .collect();
-        rules.sort_by(|a, b| b.priority.cmp(&a.priority));
+        rules.sort_by_key(|rule| std::cmp::Reverse(rule.priority));
         out.push(CompiledManifest {
             id: manifest.id,
             names: manifest.names,

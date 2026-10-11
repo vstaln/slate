@@ -385,6 +385,7 @@ pub fn planner_items() -> (Vec<PlannerRow>, Option<String>) {
 /// fix-planner: one inline field. At rest it shows `rest` (or `placeholder`
 /// when empty); click focuses it (`planner_begin`) with `seed` as the buffer.
 /// While it owns the keyboard the buffer shows with a caret at `cursor`.
+#[allow(clippy::too_many_arguments)]
 fn planner_text(
     base: Div,
     field: PlannerField,
@@ -514,6 +515,7 @@ fn row_button<'a>(
         )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn planner_row<'a>(
     index: usize,
     row: &'a PlannerRow,

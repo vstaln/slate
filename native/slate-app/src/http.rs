@@ -536,6 +536,7 @@ fn release_implicit(
 /// run under one environment borrow. Returns `(current_version,
 /// took_implicit_lock, implicit_extra_locks)`; on failure every acquired
 /// lock is already released, as `apply`'s `finally` did.
+#[allow(clippy::too_many_arguments)]
 fn submit_gate(
     env: &mut dyn RouteEnv,
     entry_type: &str,
@@ -699,6 +700,7 @@ pub enum Submit {
 /// `actor`, `base_version`, and `idempotency_key` are explicit rather than
 /// pulled from a `Request` — the engine's typed axum handlers call this
 /// without dressing their request up as one first.
+#[allow(clippy::too_many_arguments)]
 pub fn submit_begin(
     deps: &mut RouteDeps<'_>,
     actor: &str,
@@ -937,6 +939,7 @@ fn submit_command(
 
 /// One journaled route arm: submit through the gates, run `work`, answer
 /// `accepted` — the `reply(await submit(…), status)` shape, collapsed.
+#[allow(clippy::too_many_arguments)]
 fn submitted(
     deps: &mut RouteDeps<'_>,
     request: &Request,
@@ -2942,7 +2945,7 @@ fn widgets_route(request: &Request, segments: &[String], deps: &mut RouteDeps<'_
             }
             // `{id, title, cwd, ready}` — the original handler's return is
             // the response's `data`, so `work` hands it back.
-            return match submit_command(
+            match submit_command(
                 deps,
                 request,
                 "terminal.create",
@@ -3015,7 +3018,7 @@ fn widgets_route(request: &Request, segments: &[String], deps: &mut RouteDeps<'_
             ) {
                 Ok((entry, data)) => accepted(&entry, 200, data),
                 Err(response) => response,
-            };
+            }
         }
         // `widget.update` — the title-trimming and terminal-setTitle the
         // original's apply() ran.
@@ -3072,7 +3075,7 @@ fn widgets_route(request: &Request, segments: &[String], deps: &mut RouteDeps<'_
             // returns the merged row `patchWidget` answered with: the commit
             // hasn't landed yet, so it's built from the existing widget the
             // same way the fold will rebuild it.
-            return match submit_command(
+            match submit_command(
                 deps,
                 request,
                 "widget.update",
@@ -3091,7 +3094,7 @@ fn widgets_route(request: &Request, segments: &[String], deps: &mut RouteDeps<'_
                     };
                     // `updated.kind === 'terminal' || !updated.kind` — the
                     // setTitle condition in the original's apply.
-                    if existing.kind.as_deref().map_or(true, |k| k == "terminal") {
+                    if existing.kind.as_deref().is_none_or(|k| k == "terminal") {
                         if let (Some(title), Some(env)) =
                             (clean_title.as_ref(), deps.env.as_deref_mut())
                         {
@@ -3126,7 +3129,7 @@ fn widgets_route(request: &Request, segments: &[String], deps: &mut RouteDeps<'_
             ) {
                 Ok((entry, widget)) => accepted(&entry, 200, widget),
                 Err(response) => response,
-            };
+            }
         }
         // `widget.remove` for widgets, `terminal.dispose` for shells — the
         // original chose by `terminals.has(id)`, so a name that only resolves

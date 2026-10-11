@@ -139,8 +139,8 @@ fn paint_splash_particles(window: &mut Window, points: &[SplashPoint], t: f32) {
         // moveCloudPoint(cloud, t * .3) — the tiny idle drift on the
         // scattered start position.
         let drift_t = t * 0.3;
-        let cloud_x = p.cloud[0] + (drift_t * r[2] + 6.28 * r[3]).sin() * (0.015 + 0.06 * r[0]);
-        let cloud_y = p.cloud[1] + (drift_t * r[1] + 6.28 * r[0]).sin() * (0.015 + 0.06 * r[3]);
+        let cloud_x = p.cloud[0] + (drift_t * r[2] + std::f32::consts::TAU * r[3]).sin() * (0.015 + 0.06 * r[0]);
+        let cloud_y = p.cloud[1] + (drift_t * r[1] + std::f32::consts::TAU * r[0]).sin() * (0.015 + 0.06 * r[3]);
         let sx = r[0] * width + cloud_x * 12.0;
         let sy = r[1] * height + cloud_y * 12.0;
         let angle = (sy - cy).atan2(sx - cx) + pull * (2.5 + r[3] * 2.0);
@@ -866,6 +866,7 @@ fn command_failed(
 /// The submit chain without a `CanvasView` — the intent→work→commit halves
 /// `commit_work` wraps, callable where `self` cannot reach (the boot
 /// relaunch runs inside `new`, the mtime watcher inside its closure).
+#[allow(clippy::too_many_arguments)]
 fn gui_submit(
     manager: &TerminalManager,
     workspace_dir: Option<&str>,
@@ -2057,11 +2058,6 @@ impl CanvasView {
         }
     }
 
-    /// The TitleBar arrange pick — `orcspace:canvas-arrange`. Non-free
-    /// modes snapshot every widget once (`orcspace-arrange-free-layout`),
-    /// tile them into the visible area and journal each move; Free replays
-    /// the snapshot once and clears it.
-
     /// Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y — the shell's `orcspace:canvas-undo`
     /// and `-redo` events. The popped state journals as `canvas.restore` so
     /// the fold replays the undo exactly like it replays everything else.
@@ -2972,7 +2968,7 @@ impl CanvasView {
         if let Some(target) = self
             .command_target
             .as_deref()
-            .filter(|id| self.snapshots.iter().any(|s| &s.id == *id))
+            .filter(|id| self.snapshots.iter().any(|s| s.id == *id))
         {
             return Some(target.to_owned());
         }
@@ -3024,7 +3020,7 @@ impl CanvasView {
     /// `agent rm <name>` drops one, a bare `agent` prints usage. T3 Code's
     /// "Other" provider slot, kept at PTY fidelity.
     fn add_agent_line(&mut self, buffer: &str) {
-        let mut parts = buffer.trim_start().split_whitespace();
+        let mut parts = buffer.split_whitespace();
         let _verb = parts.next();
         let rest: Vec<&str> = parts.collect();
         match rest.as_slice() {
@@ -3102,8 +3098,7 @@ impl CanvasView {
             .command_bar
             .as_deref()
             .and_then(|b| {
-                b.trim_start()
-                    .split_whitespace()
+                b.split_whitespace()
                     .next()
                     // The shell's `first.slice(1)` — exactly one sigil
                     // strips; `//term` stays `/term` and misses.
@@ -3135,7 +3130,6 @@ impl CanvasView {
         // in command mode only; message mode keeps treating it as text.
         if !self.command_message {
             let first = buffer
-                .trim_start()
                 .split_whitespace()
                 .next()
                 .unwrap_or("");
@@ -4164,7 +4158,7 @@ impl CanvasView {
         let gy = pointer.y - offset.y;
         rects.iter().enumerate().find_map(|(index, rect)| {
             (gx >= rect.left() && gx <= rect.right() && gy >= rect.top() && gy <= rect.bottom())
-                .then(|| (index, *rect))
+                .then_some((index, *rect))
         })
     }
 
@@ -4230,7 +4224,7 @@ impl CanvasView {
         };
         match button {
             MouseButton::Left => {
-                let _ = self.manager.selection_clear(&terminal_id);
+                self.manager.selection_clear(&terminal_id);
                 if reporting && !modifiers.shift {
                     let _ = self.manager.mouse_input(
                         &terminal_id,
@@ -5011,6 +5005,7 @@ fn blur_wallpaper(url: &str, blur: u64, viewport: Vec2) -> Option<Vec<u8>> {
     Some(out)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn widget_body(
     widget: &Widget,
     snapshots: &[TerminalSnapshot],
@@ -5482,7 +5477,6 @@ impl Render for CanvasView {
                             cx.notify();
                         }
                     }
-                    return;
                 }
             }))
             .on_mouse_up(
@@ -8043,7 +8037,6 @@ impl CanvasView {
             }
             cx.notify();
             cx.stop_propagation();
-            return;
 
     }
 

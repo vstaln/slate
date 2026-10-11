@@ -196,6 +196,7 @@ fn field_chip(
 /// lives on `CanvasView::notes_editing`), ▲/▼ swap `order` with the neighbour,
 /// the swatch row recolors the note's category (or the note alone when it has
 /// none), and × drops the note through `note_delete`.
+#[allow(clippy::type_complexity)]
 fn note_card<'a>(
     row: &'a NoteRow,
     expanded: bool,

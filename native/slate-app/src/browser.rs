@@ -257,9 +257,7 @@ pub fn host_of(url: &str) -> String {
     let after_scheme = match url.split_once("://") {
         Some(("file", rest)) | Some(("FILE", rest)) => {
             let last = rest
-                .split('/')
-                .filter(|s| !s.is_empty())
-                .next_back()
+                .split('/').rfind(|s| !s.is_empty())
                 .unwrap_or_default();
             return percent_decode(last);
         }
