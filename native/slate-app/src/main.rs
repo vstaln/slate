@@ -14,15 +14,14 @@ pub mod views_kanban;
 pub mod views_links;
 pub mod views_notes;
 pub mod views_orchestration;
-pub mod views_overview;
 pub mod views_planner;
 pub mod views_settings;
 pub mod views_sidebar;
+pub mod views_commandbar;
 pub mod views_sysmon;
 pub mod views_terminal;
 pub mod views_timer;
 pub mod views_titlebar;
-pub mod views_toolbar;
 
 use crate::engine::{ControlServer, TerminalEvent, TerminalManager};
 use anyhow::Result;
@@ -258,13 +257,19 @@ fn main() -> Result<()> {
         .run(|cx: &mut gpui::App| {
         // Graysite brand faces, embedded so the build looks right on any
         // machine without a fontconfig install: Plus Jakarta Sans is the UI
-        // family, Departure Mono the terminal/code face, Brygada 1918 the
-        // display face (splash wordmark).
+        // family, Departure Mono the label/keycap face, Brygada 1918 the
+        // display face (splash wordmark). JetBrainsMono Nerd Font Mono is
+        // the terminal face — the ghostty font, mono-width icons so a Nerd
+        // glyph never pushes a cell run off the grid.
         if let Err(error) = cx.text_system().add_fonts(vec![
             std::borrow::Cow::Borrowed(&include_bytes!("../assets/fonts/PlusJakartaSans-Variable.ttf")[..]),
             std::borrow::Cow::Borrowed(&include_bytes!("../assets/fonts/Brygada1918-Regular.ttf")[..]),
             std::borrow::Cow::Borrowed(&include_bytes!("../assets/fonts/Brygada1918-Italic.ttf")[..]),
             std::borrow::Cow::Borrowed(&include_bytes!("../assets/fonts/DepartureMono-Regular.ttf")[..]),
+            std::borrow::Cow::Borrowed(&include_bytes!("../assets/fonts/JetBrainsMonoNerdFontMono-Regular.ttf")[..]),
+            std::borrow::Cow::Borrowed(&include_bytes!("../assets/fonts/JetBrainsMonoNerdFontMono-Bold.ttf")[..]),
+            std::borrow::Cow::Borrowed(&include_bytes!("../assets/fonts/JetBrainsMonoNerdFontMono-Italic.ttf")[..]),
+            std::borrow::Cow::Borrowed(&include_bytes!("../assets/fonts/JetBrainsMonoNerdFontMono-BoldItalic.ttf")[..]),
         ]) {
             eprintln!("font registration failed: {error}");
         }

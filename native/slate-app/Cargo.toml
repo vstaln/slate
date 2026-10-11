@@ -48,9 +48,14 @@ base64 = "0.22"
 image = "=0.25.10"
 log = "0.4"
 env_logger = "0.11"
+regex = "1.13.1"
 
 [features]
-default = []
+default = ["browser"]
+# `browser` = the embedded wry/webkit webview. `--no-default-features`
+# builds a terminal+orchestration-only binary that needs no GTK/WebKitGTK
+# on the system — the headless/server profile.
+browser = ["dep:wry", "dep:gtk"]
 
 # Unix only: kill(2) on a negative pid is what reaps a terminal's whole
 # process group. Already in the dependency graph via portable-pty, so this
@@ -64,8 +69,8 @@ libc = "0.2"
 # element used at 2cf4566. Kept target-gated so other platforms neither
 # build it nor see it; the element falls back to empty bounds there.
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
-wry = "0.57"
-gtk = "0.18"
+wry = { version = "0.57", optional = true }
+gtk = { version = "0.18", optional = true }
 
 # Windows only: listing a shell's children is what lets a terminal that has
 # stopped reading its input be interrupted without killing the shell along

@@ -1,0 +1,34 @@
+{
+  "id": "gray",
+  "names": ["gray"],
+  "rules": [
+    {
+      "id": "ask_modal_blocked",
+      "state": "blocked",
+      "priority": 980,
+      "region": "bottom_non_empty_lines(12)",
+      "contains": ["Enter submit", "Esc skip"]
+    },
+    {
+      "id": "live_turn_working",
+      "state": "working",
+      "priority": 970,
+      "region": "bottom_non_empty_lines(12)",
+      "contains": ["esc to interrupt"]
+    },
+    {
+      "id": "interrupted_idle",
+      "state": "idle",
+      "priority": 960,
+      "region": "bottom_non_empty_lines(6)",
+      "contains": ["■ Conversation interrupted"]
+    },
+    {
+      "id": "composer_idle",
+      "state": "idle",
+      "priority": 950,
+      "region": "bottom_non_empty_lines(3)",
+      "line_regex": ["^\\s*❯\\s*$"]
+    }
+  ]
+}

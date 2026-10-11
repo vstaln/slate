@@ -295,8 +295,8 @@ fn stepper_row(
 /// - `"close"`      `{}` — backdrop, ×, Close button (Escape is handled in
 ///   `on_key` already).
 /// - `"toggle_pref"`/`"set_pref"` `{"key": ...}` with snake_case keys:
-///   `sidebar_open`, `auto_names`, `arrange_mode` (value `"grid"|"tiny"|
-///   "focus"|"free"`), `auto_approve_permissions`, `image_insert_shortcut`
+///   `sidebar_open`, `auto_names`, `auto_approve_permissions`,
+///   `image_insert_shortcut`
 ///   (Reset → `"Mod+Shift+I"`), `background_dim`/`background_blur`
 ///   (value 0–100), `background` (Remove → `null`).
 /// - `"toggle_fav"` `{"kind": <widget kind>}` — the favorites checklist.
@@ -329,10 +329,10 @@ pub fn settings_modal(
         .overflow_y_scroll()
         .py_1();
 
-    // — Canvas (native-ui.json prefs) —
+    // — Panes (native-ui.json prefs) —
     body = body.child(section(
-        "Canvas",
-        "Startup state and the TitleBar arrange default.",
+        "Panes",
+        "Startup state for the workspace shell.",
     ));
     body = body.child(toggle_row(
         "slate-settings-sidebar",
@@ -352,67 +352,6 @@ pub fn settings_modal(
         json!({"key": "auto_names"}),
         cx,
     ));
-    {
-        let mut chips = div()
-            .w_full()
-            .px_2()
-            .py(px(6.0))
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_2()
-            .child(
-                div()
-                    .flex_1()
-                    .text_xs()
-                    .text_color(rgb(theme::hex(theme::text::DIM)))
-                    .child("Arrange mode"),
-            );
-        for mode in slate_app::arrange::ArrangeMode::ALL {
-            let selected = prefs.arrange_mode == mode;
-            // serde-lowercase name — what `serde_json::from_value::<
-            // ArrangeMode>` reads back in the `set_pref` handler.
-            let value = serde_json::to_value(mode).unwrap_or(Value::Null);
-            let name = value.as_str().unwrap_or("free").to_owned();
-            chips = chips.child(
-                div()
-                    .id(format!("slate-settings-arrange-{name}"))
-                    .px_2()
-                    .py(px(2.0))
-                    .flex_none()
-                    .border_1()
-                    .border_color(rgb(theme::hex(if selected {
-                        theme::text::DIM
-                    } else {
-                        theme::hairline::FAINT
-                    })))
-                    .cursor_pointer()
-                    .text_xs()
-                    .text_color(rgb(theme::hex(if selected {
-                        theme::text::NORMAL
-                    } else {
-                        theme::text::FAINT
-                    })))
-                    .when(selected, |el| {
-                        el.bg(rgb(theme::hex(theme::monochrome::ELEVATED)))
-                    })
-                    .hover(|el| el.bg(rgb(theme::hex(theme::monochrome::RAISED))))
-                    .child(mode.label())
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _event, _window, cx| {
-                            cx.stop_propagation();
-                            this.settings_command(
-                                "set_pref",
-                                json!({"key": "arrange_mode", "value": value}),
-                                cx,
-                            );
-                        }),
-                    ),
-            );
-        }
-        body = body.child(chips);
-    }
 
     // — Agent permissions (settings.json autoApprovePermissions) —
     body = body.child(section(
@@ -432,7 +371,7 @@ pub fn settings_modal(
     // — Right-click menu (settings.json favoriteWidgets) —
     body = body.child(section(
         "Right-click menu",
-        "Which widgets appear when you right-click the canvas.",
+        "Which widgets appear in the pane strip's + menu (and on right-click).",
     ));
     {
         let mut list = div().flex().flex_col();
@@ -455,7 +394,7 @@ pub fn settings_modal(
     // — Image widget hotkey (settings.json imageInsertShortcut) —
     body = body.child(section(
         "Image widget hotkey",
-        "Copy an image, then press this shortcut anywhere on the canvas to pin it for your agent.",
+        "Copy an image, then press this shortcut anywhere in the workspace to pin it for your agent.",
     ));
     body = body.child(
         div()
@@ -508,7 +447,7 @@ pub fn settings_modal(
     // — Background (theme wallpaper + dim/blur) —
     body = body.child(section(
         "Background",
-        "Wallpaper behind the canvas, with dim and blur.",
+        "Wallpaper behind the work area, with dim and blur.",
     ));
     body = body.child(
         div()

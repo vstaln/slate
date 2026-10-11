@@ -76,6 +76,16 @@ pub struct AcquireInput<'a> {
     pub implicit: bool,
 }
 
+/// `core.locks` in the TypeScript — one lock manager per process, shared by
+/// the control server and the GUI. The canvas's own submits gate against the
+/// same table the `/locks` routes administer, so a `user` drag and an `api`
+/// command cannot both think they own `widget:x`.
+pub fn shared() -> &'static std::sync::Mutex<LockManager> {
+    static SHARED: std::sync::LazyLock<std::sync::Mutex<LockManager>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(LockManager::new(None)));
+    &SHARED
+}
+
 impl LockManager {
     pub fn new(default_ttl_ms: Option<i64>) -> Self {
         Self {

@@ -5945,6 +5945,7 @@ dependencies = [
  "log",
  "portable-pty",
  "raw-window-handle",
+ "regex",
  "serde",
  "serde_json",
  "sha2",

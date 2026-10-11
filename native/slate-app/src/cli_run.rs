@@ -108,12 +108,19 @@ fn command_help(name: &str) -> Option<&'static str> {
             "slate worker-release [<dispatchId>] [--close] — release a worker, optionally closing its terminal."
         }
         "worker-retain" => "slate worker-retain [<dispatchId>] — keep a worker for subsequent tasks.",
+        "agents" => {
+            "slate agents — detected agent per terminal and its state (working/blocked/idle/unknown)."
+        }
+        "wait" => {
+            "slate wait <terminal|name> [--for <state>] [--timeout <s>] — block until an agent reaches a state (default blocked)."
+        }
         "worker-read" => {
             "slate worker-read [<dispatchId|terminalId|name>] [--limit N] | slate logs [<id>] [limit] — tail worker output."
         }
         "tell" => {
-            "slate tell <worker> \"run the tests\" [--image <file>] — deliver text; use `slate worker-read <worker>` for the answer."
+            "slate tell <worker> \"run the tests\" [--when <state>] [--image <file>] — deliver text (optionally only once the worker reaches a state); use `slate worker-read <worker>` for the answer."
         }
+        "prune" => "slate prune — dispose exited terminals still holding slots.",
         "rename" => "slate rename [<worker>] [--name <name>] — rename a terminal.",
         "check" => {
             "slate check | slate inbox [--wait] [--types ...] [--ack <msgId>] [--all] — read coordinator mail."
@@ -141,8 +148,8 @@ fn command_help(name: &str) -> Option<&'static str> {
         "terminal" => {
             "slate terminal list|open|send <id> <text>|read <id>|rename <id> <name>|close <id> --yes — direct terminal management."
         }
-        "canvas" => {
-            "slate canvas list | place <kind> | image <path> | move | rename | focus | close — canvas widgets & viewport."
+        "canvas" | "pane" | "panes" | "widget" | "widgets" => {
+            "slate canvas list | place <kind> | image <path> | move | rename | close — pane widgets (alias: pane)."
         }
         "browser" => "slate browser open [url] | list | navigate <id> <url> | snapshot <id> | click <id> <ref> | fill <id> <ref> --value \"...\" | select <id> <ref> --value \"...\" | press <id> <key> [--ref N] | scroll <id> [--pixels N]. Detected checkout and purchase flows are blocked, along with password and payment fields.",
         "plan" => {
@@ -221,7 +228,7 @@ pub fn run() -> Result<(), String> {
     if command == "journal" {
         return run_journal(&parsed);
     }
-    if command == "canvas" {
+    if matches!(command.as_str(), "canvas" | "pane" | "panes" | "widget" | "widgets") {
         return run_canvas(&parsed);
     }
     if command == "git" {
@@ -245,13 +252,44 @@ pub fn run() -> Result<(), String> {
         "tell" => {
             let body = tell_body(&parsed)?;
             let to = body["to"].as_str().unwrap();
-            let response = request(
-                &url,
-                &token,
-                "POST",
-                "/orchestration/workers/tell",
-                Some(body.clone()),
-            )?;
+            // `--when <state>` — don't interrupt a working agent: poll until
+            // the target's detected state matches, then deliver. herdr's
+            // "send only once it is genuinely blocked" discipline.
+            // A `--when` delivery waits out a transient lock too: the gate
+            // refuses `terminal:{id}` while another actor's write apply is
+            // still in flight (~200ms), and a "deliver once ready" tell
+            // should not flake on that window.
+            let locked_deadline = parsed
+                .pick(&["when", "for"])
+                .map(|_| std::time::Instant::now() + std::time::Duration::from_secs(5));
+            if let Some(when) = parsed.pick(&["when", "for"]) {
+                if slate_app::agent_state::AgentState::parse(&when).is_none() {
+                    return Err(format!(
+                        "unknown state \"{when}\" — working|blocked|idle|unknown"
+                    ));
+                }
+                let timeout = parsed_timeout_secs(&parsed).unwrap_or(300);
+                let verdict = wait_for_agent_state(&url, &token, to, &when, timeout)?;
+                eprintln!("{verdict} — delivering");
+            }
+            let response = loop {
+                match request(
+                    &url,
+                    &token,
+                    "POST",
+                    "/orchestration/workers/tell",
+                    Some(body.clone()),
+                ) {
+                    Err(error)
+                        if error.contains("is locked by")
+                            && locked_deadline
+                                .is_some_and(|d| std::time::Instant::now() < d) =>
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(300));
+                    }
+                    result => break result?,
+                }
+            };
             let delivery_id = data_of(&response)
                 .get("delivery")
                 .and_then(|delivery| delivery.get("id"))
@@ -277,6 +315,102 @@ pub fn run() -> Result<(), String> {
                     None => println!("delivered to {to} ({delivery_id})"),
                 }
                 println!("read the answer with: {} worker-read {to}", prog_name());
+            }
+        }
+        "agents" => {
+            // `herdr agent list` — the manifest detector's fleet roster.
+            let response = request(&url, &token, "GET", "/orchestration/agents", None)?;
+            if parsed.flag("json") {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(data_of(&response))
+                        .unwrap_or_else(|_| response.to_string())
+                );
+            } else {
+                println!("{}", format_agents(&response));
+            }
+        }
+        "prune" => {
+            // `slate prune` — dispose terminals whose child exited but whose
+            // record still holds a slot against MAX_TERMINALS. The spawn path
+            // reclaims one when it must; this sweeps them all on demand.
+            let response = request(&url, &token, "GET", "/orchestration/workers", None)?;
+            let dead: Vec<String> = data_of(&response)
+                .get("workers")
+                .and_then(Value::as_array)
+                .map(|workers| {
+                    workers
+                        .iter()
+                        .filter(|w| w.get("alive").and_then(Value::as_bool) == Some(false))
+                        .filter_map(|w| {
+                            w.get("id").and_then(Value::as_str).map(str::to_owned)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut pruned = 0usize;
+            for id in &dead {
+                if request(&url, &token, "DELETE", &format!("/terminal/{id}"), None).is_ok() {
+                    pruned += 1;
+                }
+            }
+            println!("pruned {pruned} terminal(s)");
+        }
+        "wait" => {
+            // `slate wait <terminal|name> [--for working|blocked|idle]
+            // [--timeout <s>]` — herdr's "wait until another agent is
+            // genuinely blocked" gate for agent-on-agent orchestration.
+            let target = parsed
+                .positionals()
+                .get(1)
+                .cloned()
+                .ok_or_else(|| "usage: slate wait <terminal|name> [--for <state>] [--timeout <s>]".to_owned())?;
+            let want = parsed
+                .pick(&["for", "state"])
+                .unwrap_or_else(|| "blocked".to_owned());
+            if slate_app::agent_state::AgentState::parse(&want).is_none() {
+                return Err(format!("unknown state \"{want}\" — working|blocked|idle|unknown"));
+            }
+            let timeout = parsed
+                .pick(&["timeout", "timeoutMs"])
+                .map(|v| {
+                    // --timeoutMs is milliseconds; --timeout seconds.
+                    if parsed.pick(&["timeoutMs"]).is_some() {
+                        (v.parse::<f64>().unwrap_or(300_000.0) / 1000.0) as u64
+                    } else {
+                        v.parse::<u64>().unwrap_or(300)
+                    }
+                })
+                .unwrap_or(300);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
+            loop {
+                let response = request(&url, &token, "GET", "/orchestration/agents", None)?;
+                let agents = data_of(&response)
+                    .get("agents")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let row = agents.iter().find(|a| {
+                    a.get("id").and_then(Value::as_str) == Some(target.as_str())
+                        || a.get("name").and_then(Value::as_str) == Some(target.as_str())
+                });
+                let Some(row) = row else {
+                    return Err(format!("no terminal called \"{target}\""));
+                };
+                let state = row.get("state").and_then(Value::as_str).unwrap_or("unknown");
+                if parsed.flag("json") {
+                    println!("{}", serde_json::to_string(row).unwrap_or_default());
+                }
+                if state == want {
+                    let name = row.get("name").and_then(Value::as_str).unwrap_or(&target);
+                    println!("{name} is {state}");
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    let name = row.get("name").and_then(Value::as_str).unwrap_or(&target);
+                    return Err(format!("timed out waiting for {name} — still {state}"));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(700));
             }
         }
         "worker-read" | "logs" | "tail" => run_worker_read(&url, &token, &parsed)?,
@@ -1062,10 +1196,10 @@ fn num_flag(parsed: &slate_app::cli::Args, name: &str) -> Option<f64> {
         .filter(|value| value.is_finite())
 }
 
-/// `slate canvas …` — widgets live in the command journal, so list/move/
-/// rename/close fold it or append to it locally, exactly the events
-/// `canvas_view` writes. `focus` is the exception: moving the live camera is
-/// the running app's business, so it goes over the socket.
+/// `slate canvas|pane …` — widgets (the panes) live in the command journal,
+/// so list/move/rename/close fold it or append to it locally, exactly the
+/// events `canvas_view` writes. `focus` is the exception: it rides the socket
+/// to the running app.
 fn run_canvas(parsed: &slate_app::cli::Args) -> Result<(), String> {
     use slate_app::journal_log::JournalLog;
     use slate_app::projection::{self, CanvasState};
@@ -2561,6 +2695,59 @@ fn object_body(pairs: Vec<(&str, Option<Value>)>) -> Value {
     Value::Object(map)
 }
 
+/// `--timeout <s>` / `--timeoutMs <ms>` parse shared by `wait` and
+/// `tell --when`; seconds by default, milliseconds under the long name.
+fn parsed_timeout_secs(parsed: &slate_app::cli::Args) -> Option<u64> {
+    parsed.pick(&["timeout", "timeoutMs"]).map(|v| {
+        if parsed.pick(&["timeoutMs"]).is_some() {
+            (v.parse::<f64>().unwrap_or(300_000.0) / 1000.0) as u64
+        } else {
+            v.parse::<u64>().unwrap_or(300)
+        }
+    })
+}
+
+/// `slate wait`'s poll loop, shared with `tell --when`: GET
+/// /orchestration/agents until `target` reports `want`, the deadline passes,
+/// or the target vanishes. Returns the "<name> is <state>" verdict line.
+fn wait_for_agent_state(
+    url: &str,
+    token: &str,
+    target: &str,
+    want: &str,
+    timeout_secs: u64,
+) -> Result<String, String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    loop {
+        let response = request(url, token, "GET", "/orchestration/agents", None)?;
+        let agents = data_of(&response)
+            .get("agents")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let row = agents.iter().find(|a| {
+            a.get("id").and_then(Value::as_str) == Some(target)
+                || a.get("name").and_then(Value::as_str) == Some(target)
+        });
+        let Some(row) = row else {
+            return Err(format!("no terminal called \"{target}\""));
+        };
+        let state = row.get("state").and_then(Value::as_str).unwrap_or("unknown");
+        let name = row
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or(target)
+            .to_owned();
+        if state == want {
+            return Ok(format!("{name} is {state}"));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!("timed out waiting for {name} — still {state}"));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(700));
+    }
+}
+
 fn tell_body(parsed: &slate_app::cli::Args) -> Result<Value, String> {
     let mut positional = parsed.positionals().iter().skip(1);
     let to = parsed
@@ -2598,6 +2785,38 @@ fn tell_body(parsed: &slate_app::cli::Args) -> Result<Value, String> {
 /// The roster line slate.mjs prints: `* ` marks your own terminal, then
 /// name (id when it differs), busy/idle (+exited), agent, task and cwd —
 /// whichever of those the worker record carries.
+/// `slate agents` — one `state agent name (id)` row per terminal, herdr's
+/// sidebar ordering: blocked first, then working, then idle.
+fn format_agents(response: &Value) -> String {
+    let mut rows: Vec<&Value> = data_of(response)
+        .get("agents")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().collect())
+        .unwrap_or_default();
+    let rank = |row: &Value| match row.get("state").and_then(Value::as_str) {
+        Some("blocked") => 0,
+        Some("working") => 1,
+        Some("idle") => 2,
+        _ => 3,
+    };
+    rows.sort_by_key(|r| rank(r));
+    if rows.is_empty() {
+        return "no terminals".to_owned();
+    }
+    rows.iter()
+        .map(|row| {
+            let state = row.get("state").and_then(Value::as_str).unwrap_or("unknown");
+            let agent = row.get("agent").and_then(Value::as_str).unwrap_or("-");
+            let name = row.get("name").and_then(Value::as_str).unwrap_or("-");
+            let id = row.get("id").and_then(Value::as_str).unwrap_or("-");
+            let alive = row.get("alive").and_then(Value::as_bool).unwrap_or(true);
+            let dead = if alive { "" } else { " (+exited)" };
+            format!("{state:<8} {agent:<12} {name} ({id}){dead}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn format_workers(response: &Value) -> String {
     let self_id = env::var("SLATE_TERMINAL_ID").ok();
     let age = |ms: f64| -> String {
@@ -2647,7 +2866,18 @@ fn format_workers(response: &Value) -> String {
                         if name != id {
                             line.push_str(&format!(" ({id})"));
                         }
-                        line.push_str(if busy { "  busy" } else { "  idle" });
+                        // The manifest detector's state wins over raw
+                        // liveness when the terminal carries one — herdr's
+                        // roster reads `working`/`blocked`, not `busy`.
+                        let detected = worker
+                            .get("state")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        if detected.is_empty() || detected == "unknown" {
+                            line.push_str(if busy { "  busy" } else { "  idle" });
+                        } else {
+                            line.push_str(&format!("  {detected}"));
+                        }
                         if !alive {
                             line.push_str(" (exited)");
                         }

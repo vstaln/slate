@@ -42,7 +42,6 @@ use gpui::{
 };
 use gpui::Refineable;
 use std::collections::HashMap;
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use std::sync::Mutex;
 
 static NEXT_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
@@ -153,7 +152,7 @@ fn update_status(id: usize, f: impl FnOnce(&mut WebViewStatus)) {
 
 /// Record `url` as the URL the GTK side has (or will) load for `id`, then
 /// hand the message off — no-op outside Linux.
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(slate_browser)]
 fn send_navigate(id: usize, url: &str) {
     lock(&SENT_URL).insert(id, url.to_owned());
     update_status(id, |status| {
@@ -176,15 +175,15 @@ fn send_navigate(id: usize, url: &str) {
 /// `view.loadURL(url)` — user/CLI driven navigation to a webview. Normalizes
 /// nothing: callers pass the already-validated target.
 pub fn navigate(widget: &str, url: &str) {
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[cfg(slate_browser)]
     send_navigate(key_for(widget), url);
-    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+    #[cfg(not(slate_browser))]
     let _ = (widget, url);
 }
 
 /// `view.reload()` / the reload half of the stop-or-reload button.
 pub fn reload(widget: &str) {
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[cfg(slate_browser)]
     {
         let id = key_for(widget);
         update_status(id, |status| {
@@ -197,14 +196,14 @@ pub fn reload(widget: &str) {
             x11_child_thread::send(x11_child_thread::ChildMessage::Reload { id });
         }
     }
-    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+    #[cfg(not(slate_browser))]
     let _ = widget;
 }
 
 /// `view.stop()` — wry exposes no stop; `window.stop()` in-page is the same
 /// brake the DOM API applies.
 pub fn stop(widget: &str) {
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[cfg(slate_browser)]
     {
         let id = key_for(widget);
         update_status(id, |status| status.loading = false);
@@ -214,13 +213,13 @@ pub fn stop(widget: &str) {
             x11_child_thread::send(x11_child_thread::ChildMessage::Stop { id });
         }
     }
-    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+    #[cfg(not(slate_browser))]
     let _ = widget;
 }
 
 /// `view.goBack()` — a no-op when history is empty, same as Electron's.
 pub fn go_back(widget: &str) {
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[cfg(slate_browser)]
     {
         let id = key_for(widget);
         if is_wayland() {
@@ -229,13 +228,13 @@ pub fn go_back(widget: &str) {
             x11_child_thread::send(x11_child_thread::ChildMessage::Back { id });
         }
     }
-    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+    #[cfg(not(slate_browser))]
     let _ = widget;
 }
 
 /// `view.goForward()`.
 pub fn go_forward(widget: &str) {
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[cfg(slate_browser)]
     {
         let id = key_for(widget);
         if is_wayland() {
@@ -244,7 +243,7 @@ pub fn go_forward(widget: &str) {
             x11_child_thread::send(x11_child_thread::ChildMessage::Forward { id });
         }
     }
-    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+    #[cfg(not(slate_browser))]
     let _ = widget;
 }
 
@@ -253,7 +252,7 @@ pub fn go_forward(widget: &str) {
 /// child would otherwise stay visible at its last bounds after a jump-cut
 /// (focus jump, arrange, zoom-fit). No-op when no webview exists yet.
 pub fn hide(widget: &str) {
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[cfg(slate_browser)]
     if !is_wayland() {
         // Lookup only — `key_for` would mint an id for a widget that never
         // had a webview.
@@ -261,7 +260,7 @@ pub fn hide(widget: &str) {
             x11_child_thread::request_set_visible(id, false);
         }
     }
-    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+    #[cfg(not(slate_browser))]
     let _ = widget;
 }
 
@@ -276,7 +275,7 @@ pub fn remove_widget(widget: &str) {
     lock(&ID_TO_KEY).remove(&id);
     lock(&STATUS).remove(&id);
     lock(&SENT_URL).remove(&id);
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[cfg(slate_browser)]
     {
         if is_wayland() {
             gtk_thread::remove_created(id);
@@ -284,7 +283,7 @@ pub fn remove_widget(widget: &str) {
             x11_child_thread::remove_created(id);
         }
     }
-    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+    #[cfg(not(slate_browser))]
     let _ = id;
 }
 
@@ -331,7 +330,7 @@ const MAX_RESPONSE_BYTES: usize = 96 * 1024;
 /// threw `'browser page is not ready'` on. A home/culled widget has no
 /// webview until the pane mounts one.
 pub fn exists(widget: &str) -> bool {
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[cfg(slate_browser)]
     {
         lock(&KEY_TO_ID)
             .get(widget)
@@ -339,14 +338,14 @@ pub fn exists(widget: &str) -> bool {
             .map(is_created)
             .unwrap_or(false)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+    #[cfg(not(slate_browser))]
     {
         let _ = widget;
         false
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(slate_browser)]
 fn is_created(id: usize) -> bool {
     if is_wayland() {
         gtk_thread::is_created(id)
@@ -368,7 +367,7 @@ fn resolve_eval(request_id: u64, result: Result<String, String>) {
 /// wrapped script to the widget's webview and waits for the JSON string back.
 /// The script must self-report errors (see `browser::BrowserAgentAction`'s
 /// try/catch envelope) — WebKitGTK gives no exception text.
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(slate_browser)]
 fn eval_script(
     widget: &str,
     script: &str,
@@ -403,7 +402,7 @@ fn eval_script(
 /// no webview yet (fresh `open`, off-viewport) still queues the URL through
 /// `SENT_URL` + the journaled `state.url`, so a short grace answers ok: the
 /// load lands when the element next paints.
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(slate_browser)]
 fn wait_for_load(widget: &str, timeout: std::time::Duration) -> Result<(), String> {
     let id = key_for(widget);
     let deadline = std::time::Instant::now() + timeout;
@@ -462,19 +461,19 @@ fn agent_action_inner(
             return Err("checkout navigation is disabled".to_owned());
         }
         navigate(widget, url);
-        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        #[cfg(slate_browser)]
         wait_for_load(widget, std::time::Duration::from_millis(45_000))?;
-        #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+        #[cfg(not(slate_browser))]
         let _ = widget;
         return Ok(serde_json::json!({ "url": url }));
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+    #[cfg(not(slate_browser))]
     {
         let _ = (widget, action);
         return Err("browser page is not ready".to_owned());
     }
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[cfg(slate_browser)]
     {
         let script = match action.eval_script() {
             Some(script) => script,
@@ -511,12 +510,12 @@ fn agent_action_inner(
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(slate_browser)]
 fn is_wayland() -> bool {
     std::env::var("XDG_SESSION_TYPE").unwrap_or_default() == "Wayland"
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(slate_browser)]
 fn to_wry_bounds(bounds: Bounds<Pixels>, scale_factor: f32) -> wry::Rect {
     // GPUI bounds are in logical pixels. Convert to physical pixels for
     // the native child window since wry positions relative to the parent
@@ -534,7 +533,7 @@ fn to_wry_bounds(bounds: Bounds<Pixels>, scale_factor: f32) -> wry::Rect {
 /// The will-navigate guard from `windowManager.ts`: about:blank always loads
 /// (it is the widget's initial src); http/https anywhere; file: only from a
 /// file: page; everything else — data:, javascript: — is refused.
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(slate_browser)]
 fn navigation_allowed(id: usize, url: &str) -> bool {
     if url == "about:blank" {
         return true;
@@ -567,7 +566,7 @@ fn navigation_allowed(id: usize, url: &str) -> bool {
 /// child path and the Wayland window path so both behave identically.
 /// `nav_flags` reads (can_go_back, can_go_forward) from whichever
 /// thread-local webview store the handler is running on.
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(slate_browser)]
 fn wired_builder(
     id: usize,
     content: &WebViewContent,
@@ -649,7 +648,7 @@ fn wired_builder(
 /// windowManager.ts's popup gate, evaluated on the GTK thread: protocol
 /// allowlist (file: only from a file: page), no credentials, hostname
 /// present, ≤2048 chars, then the dedup + budget counters.
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(slate_browser)]
 fn popup_allowed(id: usize, url: &str) -> bool {
     thread_local! {
         static POPUPS: std::cell::RefCell<HashMap<usize, PopupState>> =
@@ -720,7 +719,7 @@ fn popup_allowed(id: usize, url: &str) -> bool {
 // their own event loop. We run this on a dedicated thread to avoid blocking
 // GPUI's render loop. The main thread extracts raw window IDs and sends
 // them to this thread.
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(slate_browser)]
 mod x11_child_thread {
     use super::*;
     use gtk::glib;
@@ -1209,7 +1208,7 @@ mod x11_child_thread {
 // On Linux/Wayland, build_as_child is unsupported — each webview is a
 // separate GTK window on the same dedicated GTK thread. Behavior matches the
 // vendored element; the chrome stays inside the canvas.
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(slate_browser)]
 mod gtk_thread {
     use super::*;
     use gtk::glib;
@@ -1582,7 +1581,7 @@ impl Element for WebView {
         window: &mut Window,
         _cx: &mut App,
     ) {
-        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        #[cfg(slate_browser)]
         {
             // A degenerate rect is mid-layout or a zero-size widget — no
             // native window should be created or moved for it.
@@ -1619,7 +1618,7 @@ impl Element for WebView {
                 x11_child_thread::maybe_sync_url(self.id, &self.content);
             }
         }
-        #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+        #[cfg(not(slate_browser))]
         {
             let _ = (bounds, window);
         }

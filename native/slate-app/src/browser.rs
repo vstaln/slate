@@ -89,10 +89,9 @@ fn normalize_file_url(raw: &str) -> Option<String> {
     if !(raw.len() >= 5 && raw[..5].eq_ignore_ascii_case("file:")) {
         return None;
     }
+    // `new URL(raw).href` percent-encodes unsafe bytes — whitespace
+    // included — rather than refusing them.
     let rest = &raw[5..];
-    if rest.contains(char::is_whitespace) {
-        return None;
-    }
     let mut out = String::with_capacity(rest.len() + 5);
     out.push_str("file:");
     push_pct_encoded(&mut out, rest);

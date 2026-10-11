@@ -24,6 +24,20 @@
 /// the gpui view packs them with crate::theme::hex().
 pub type CellRgb = (u8, u8, u8);
 
+/// The terminal face the view layer draws in — the ghostty config's
+/// JetBrainsMono build, `Mono` variant so Nerd glyphs keep a one-cell
+/// advance and can't push a run off the grid. [`CELL_W`]/[`CELL_H`] are
+/// the cell box at [`FONT_PX`]; painters, hit-tests and PTY resizes all
+/// scale off these so a glyph, a click and a column always agree.
+pub const FONT_FAMILY: &str = "JetBrainsMono Nerd Font Mono";
+/// The canvas painter's `12·zoom`, the code grid's `TERMINAL_FONT`.
+pub const FONT_PX: f32 = 12.0;
+/// JetBrains Mono's 0.6em advance at [`FONT_PX`].
+pub const CELL_W: f32 = 7.2;
+/// The face's own line height at [`FONT_PX`] — hhea 1020/-300/0 is 1.32em,
+/// not a rounded multiple of the point size (see [`TerminalScreen::process`]).
+pub const CELL_H: f32 = 15.84;
+
 use crate::terminal_protocol::{Control, Decoder};
 use std::time::{Duration, Instant};
 
@@ -52,6 +66,8 @@ pub struct TerminalScreen {
     clipboard_writes: Vec<String>,
     /// The last cwd the program reported through OSC 7.
     cwd: Option<String>,
+    /// The last window title the program set through OSC 0/1/2.
+    title: Option<String>,
     /// Kitty keyboard progressive-enhancement stack; the last entry is the
     /// current flag set. Never empty — the base entry is all flags off.
     kitty_stack: Vec<u8>,
@@ -157,6 +173,7 @@ impl Default for TerminalScreen {
             replies: Vec::new(),
             clipboard_writes: Vec::new(),
             cwd: None,
+            title: None,
             kitty_stack: vec![0],
             selection: None,
         }
@@ -411,6 +428,7 @@ impl TerminalScreen {
                 Control::Attributes => self.replies.extend_from_slice(b"\x1b[?1;2c"),
                 Control::Clipboard(payload) => self.clipboard_writes.push(payload),
                 Control::WorkingDirectory(path) => self.cwd = Some(path),
+                Control::Title(title) => self.title = Some(title),
                 // Kitty keyboard stack: pushing with a full stack evicts the
                 // oldest entry, and popping the last entry resets the flags —
                 // the spec's answer to a program that never balances.
@@ -465,6 +483,11 @@ impl TerminalScreen {
     /// The directory the program last reported through OSC 7, if it has.
     pub fn cwd(&self) -> Option<String> {
         self.cwd.clone()
+    }
+
+    /// The title the program last set through OSC 0/1/2, if it has.
+    pub fn title(&self) -> Option<String> {
+        self.title.clone()
     }
 
     /// The kitty keyboard enhancement flags currently in effect — the top of

@@ -15,11 +15,24 @@ pub struct FreeRect {
     pub maximized: bool,
 }
 
+/// A user-added launcher chip — `/agent <name> <command>` in the command
+/// bar, the pattern T3 Code's provider registry uses at PTY fidelity.
+/// `id` is the slug `selected_agents` and `CodeSession.agent_id` carry;
+/// `command` is the argv the spawned PTY runs.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CustomAgent {
+    pub id: String,
+    pub label: String,
+    pub command: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct UiPreferences {
     pub sidebar_open: bool,
     pub auto_names: bool,
+    /// The launcher's "+ Other" chips — CLIs the user added with `/agent`.
+    pub custom_agents: Vec<CustomAgent>,
     pub layout: CodeLayout,
     pub three_way_split: [f32; 2],
     /// `orcspace-arrange-mode` — the TitleBar arrange pick, `free` default.
@@ -40,6 +53,7 @@ impl Default for UiPreferences {
         Self {
             sidebar_open: false,
             auto_names: true,
+            custom_agents: Vec::new(),
             layout: CodeLayout::Auto,
             three_way_split: [0.5, 0.5],
             arrange_mode: ArrangeMode::Free,

@@ -1006,6 +1006,10 @@ const KNOWN_COMMANDS: &[&str] = &[
     "gate-resolve",
     "plan",
     "canvas",
+    "pane",
+    "panes",
+    "widget",
+    "widgets",
     "terminal",
     "term",
     "git",
@@ -1018,6 +1022,9 @@ const KNOWN_COMMANDS: &[&str] = &[
     "browser",
     "screenshot",
     "shot",
+    "agents",
+    "wait",
+    "prune",
 ];
 
 /// True when `word` is a real command or alias — `slate <path>` uses this

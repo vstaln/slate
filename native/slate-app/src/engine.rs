@@ -50,6 +50,13 @@ const MAX_PENDING_EVENT_BYTES: usize = 8 * 1024 * 1024;
 /// handed over without waiting (see `enqueue_input`), so this is what keeps a
 /// shell that has stopped reading its input from growing the queue forever.
 const MAX_PENDING_INPUT_BYTES: usize = 1024 * 1024;
+
+/// `MAX_TERMINALS` in terminals.ts: the live+dead record table is bounded
+/// so a long-running instance cannot accumulate shells forever.
+const MAX_TERMINALS: usize = 32;
+/// `banId`'s cap — disposed ids are remembered forever, but the list itself
+/// stays bounded; the oldest entries fall off first.
+const MAX_BANNED_TERMINALS: usize = 4096;
 /// `readJson`'s cap in controlServer.ts — past it the request is a 413.
 const MAX_HTTP_BODY_BYTES: usize = 1024 * 1024;
 
@@ -126,6 +133,9 @@ const SUBMIT_GAP: Duration = Duration::from_millis(200);
 /// input is rejected immediately so the caller learns the truth on the very
 /// first keystroke instead of after a megabyte of silence.
 const STUCK_WRITE_MS: u64 = 2_000;
+/// `deliverLine`'s default `timeoutMs` — how long a confirmed write waits
+/// for the writer thread's acknowledgement.
+const DELIVERY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Per-terminal saved tail size — the shell's terminalSnapshots kept 64 KiB.
 const SAVED_SCROLLBACK: usize = 64 * 1024;
@@ -208,6 +218,20 @@ struct Inner {
     /// `/raise` route reads this so it can refuse instead of pretending a
     /// raise happened.
     headless: Mutex<bool>,
+    /// `preferredId` in the TypeScript — the shell the last successful spawn
+    /// or confirmed write touched, so a placeholder target ('' or 'new')
+    /// floats to the terminal the user most recently worked with.
+    preferred: Mutex<Option<String>>,
+    /// Insertion order, kept because `resolveWriteTarget`'s "last alive"
+    /// fallback picked the most recently spawned live shell from `list()` —
+    /// a JS Map answered insertion order; this HashMap cannot.
+    spawn_order: Mutex<Vec<String>>,
+    /// `bannedIds` — ids a `dispose` closed for good. FIFO order so the
+    /// oldest ban falls off once the set caps out.
+    banned: Mutex<std::collections::VecDeque<String>>,
+    /// `nextId`'s monotonic counter — `terminals.ts` had one per manager,
+    /// shared by every prefix it minted.
+    id_counter: std::sync::atomic::AtomicU64,
 }
 
 /// What `POST /canvas/focus` wants the camera to do. Either center on a
@@ -328,6 +352,9 @@ pub struct TerminalSnapshot {
     pub styled: Vec<Vec<slate_app::terminal_screen::StyledRun>>,
     pub alive: bool,
     pub cwd: String,
+    /// The last OSC 0/1/2 title the program set — the `osc_title` region's
+    /// evidence for the agent-state detector.
+    pub title: String,
     /// True while the program has a mouse-tracking mode armed (9/1000/1002/
     /// 1003) — the GUI routes pointer/wheel events to the PTY then instead of
     /// treating them as widget clicks and scrollback scrolls.
@@ -400,12 +427,51 @@ impl TerminalManager {
                 camera_request: Mutex::new(None),
                 raise_requested: Mutex::new(None),
                 headless: Mutex::new(false),
+                preferred: Mutex::new(None),
+                spawn_order: Mutex::new(Vec::new()),
+                banned: Mutex::new(std::collections::VecDeque::new()),
+                id_counter: std::sync::atomic::AtomicU64::new(0),
             }),
         }
     }
 
     pub fn set_name(&self, id: &str, name: &str) {
         lock_recover(&self.inner.names).insert(id.to_owned(), name.to_owned());
+    }
+
+    /// `isRunning(id)` — the record exists and its shell is alive.
+    pub fn is_running(&self, id: &str) -> bool {
+        self.snapshot(id)
+            .map(|snapshot| snapshot.alive)
+            .unwrap_or(false)
+    }
+
+    /// The last successful spawn or confirmed write's terminal — the
+    /// `preferredId` `resolveWriteTarget` prefers.
+    fn note_preferred(&self, id: &str) {
+        *lock_recover(&self.inner.preferred) = Some(id.to_owned());
+    }
+
+    /// `resolveWriteTarget(requested)` — a literal id stays when it is
+    /// running; the ''/`new` placeholders float to the preferred shell, then
+    /// to the most recently spawned live one. An explicit dead id answers
+    /// `None` so the caller fails on the *requested* target instead of
+    /// typing into the wrong terminal.
+    pub fn resolve_write_target(&self, requested: &str) -> Option<String> {
+        let normalized = requested.trim();
+        if !(normalized.is_empty() || normalized == "new") {
+            return self.is_running(normalized).then(|| normalized.to_owned());
+        }
+        if let Some(preferred) = lock_recover(&self.inner.preferred).clone() {
+            if self.is_running(&preferred) {
+                return Some(preferred);
+            }
+        }
+        lock_recover(&self.inner.spawn_order)
+            .iter()
+            .rev()
+            .find(|id| self.is_running(id))
+            .cloned()
     }
 
     pub fn name(&self, id: &str) -> Option<String> {
@@ -489,12 +555,12 @@ impl TerminalManager {
                 1 => Ok(others[0].clone()),
                 0 => Err(CommandError::new(
                     ErrorCode::NotFound,
-                    "no other terminals are open on the canvas",
+                    "no other terminal panes are open",
                 )),
                 _ => Err(CommandError::new(
                     ErrorCode::Invalid,
                     format!(
-                        "several other terminals are open: {} — specify one by name or id",
+                        "several other terminal panes are open: {} — specify one by name or id",
                         others
                             .iter()
                             .map(|id| format!("{} ({})", worker_name(id), id))
@@ -626,7 +692,58 @@ impl TerminalManager {
             let terminals = lock_recover(&self.inner.terminals);
             if let Some(existing) = terminals.get(&id) {
                 if lock_recover(&existing.state).alive {
+                    // The shell set `preferredId` on a "reconnected" create
+                    // too — an already-running shell still becomes the write
+                    // target placeholder resolution prefers.
+                    self.note_preferred(&id);
                     return Ok(true);
+                }
+            }
+        }
+        // `bannedIds` in the TypeScript: a disposed id is refused forever so
+        // a stale caller cannot resurrect a closed terminal's record.
+        if lock_recover(&self.inner.banned).contains(&id) {
+            return Err(format!("terminal {id} was disposed"));
+        }
+        // `MAX_TERMINALS` + `reclaimExitedSlot`: at the cap the oldest exited
+        // record is dropped to make room; a table of only-live shells refuses.
+        {
+            let order = lock_recover(&self.inner.spawn_order).clone();
+            let mut terminals = lock_recover(&self.inner.terminals);
+            if !terminals.contains_key(&id) && terminals.len() >= MAX_TERMINALS {
+                let oldest_dead = order.iter().find(|existing| {
+                    terminals
+                        .get(*existing)
+                        .is_some_and(|handle| !lock_recover(&handle.state).alive)
+                });
+                match oldest_dead {
+                    Some(dead) => {
+                        if let Some(handle) = terminals.remove(dead) {
+                            let dead = dead.clone();
+                            drop(terminals);
+                            set_output_gate(&handle.output_gate, false);
+                            stop_terminal_events(&self.inner, &dead);
+                            lock_recover(&self.inner.names).remove(&dead);
+                            lock_recover(&self.inner.spawn_order)
+                                .retain(|existing| existing != &dead);
+                            if let Some(path) = terminal_state_file(&dead) {
+                                let _ = std::fs::remove_file(path);
+                            }
+                            if let Some(pid) = handle.child_pid {
+                                let _ = thread::Builder::new()
+                                    .name(format!("slate-pty-kill-{dead}"))
+                                    .spawn(move || {
+                                        kill_process_tree(pid);
+                                    });
+                            }
+                            let _ = handle.control_tx.send(ControlCommand::Dispose);
+                        }
+                    }
+                    None => {
+                        return Err(format!(
+                            "terminal limit reached ({MAX_TERMINALS}); close a terminal first"
+                        ))
+                    }
                 }
             }
         }
@@ -916,6 +1033,15 @@ impl TerminalManager {
                 },
             );
         }
+        // `preferredId = id` on a successful spawn, and the spawn-order tail
+        // `resolveWriteTarget` falls back to — a re-spawn moves the id to the
+        // end exactly like Map.set on a deleted key did.
+        {
+            let mut order = lock_recover(&self.inner.spawn_order);
+            order.retain(|existing| existing != &id);
+            order.push(id.clone());
+        }
+        self.note_preferred(&id);
         if let Some(name) = saved_name {
             self.set_name(&id, &name);
         }
@@ -962,6 +1088,7 @@ impl TerminalManager {
         stop_terminal_events(&self.inner, id);
         // Freeing the name lets the pool hand it to the next terminal.
         lock_recover(&self.inner.names).remove(id);
+        lock_recover(&self.inner.spawn_order).retain(|existing| existing != id);
         // A terminal the user closed is gone for good — its saved session
         // must not resurrect if a later spawn reuses the id. App teardown
         // (`dispose_all`) keeps the files instead: those are exactly the
@@ -969,6 +1096,13 @@ impl TerminalManager {
         if !keep_state {
             if let Some(path) = terminal_state_file(id) {
                 let _ = std::fs::remove_file(path);
+            }
+            // `banId` — the id is refused on later spawns so nothing
+            // resurrects a terminal a caller explicitly closed.
+            let mut banned = lock_recover(&self.inner.banned);
+            banned.push_back(id.to_owned());
+            while banned.len() > MAX_BANNED_TERMINALS {
+                banned.pop_front();
             }
         }
         // Kill the whole tree: the actor may be blocked behind a stuck write,
@@ -998,7 +1132,8 @@ impl TerminalManager {
         }
     }
 
-    #[allow(dead_code)]
+    /// `terminals.writeInput` — a raw enqueue that does not wait for an
+    /// acknowledgement: control bytes, path tokens, and bare submits.
     pub fn write_raw(&self, id: &str, data: &[u8]) -> Result<(), String> {
         self.deliver_input(id, data.to_vec())
     }
@@ -1006,7 +1141,7 @@ impl TerminalManager {
     pub fn write_message(&self, id: &str, text: &str) -> Result<DeliveryReceipt, String> {
         let bracketed = lock_recover(&self.handle(id)?.state).bracketed_paste;
         let bytes = encode_terminal_message_input(text, bracketed)?;
-        self.write_encoded(id, bytes, true)
+        self.write_encoded(id, bytes, true, DELIVERY_TIMEOUT)
     }
 
     pub fn write_text(
@@ -1015,8 +1150,20 @@ impl TerminalManager {
         text: &str,
         press_enter: bool,
     ) -> Result<DeliveryReceipt, String> {
+        self.write_text_within(id, text, press_enter, DELIVERY_TIMEOUT)
+    }
+
+    /// `write_text` with the caller's `deliveryTimeoutMs` — `deliverLine`'s
+    /// `timeoutMs` option on the receipt wait.
+    pub fn write_text_within(
+        &self,
+        id: &str,
+        text: &str,
+        press_enter: bool,
+        timeout: Duration,
+    ) -> Result<DeliveryReceipt, String> {
         let bytes = encode_terminal_input(text, false)?;
-        self.write_encoded(id, bytes, press_enter)
+        self.write_encoded(id, bytes, press_enter, timeout)
     }
 
     fn write_encoded(
@@ -1024,6 +1171,7 @@ impl TerminalManager {
         id: &str,
         bytes: Vec<u8>,
         press_enter: bool,
+        timeout: Duration,
     ) -> Result<DeliveryReceipt, String> {
         let count = bytes.len() + usize::from(press_enter);
         let handle = self.handle(id)?;
@@ -1049,8 +1197,11 @@ impl TerminalManager {
                 },
             )?;
         }
-        rx.recv_timeout(Duration::from_secs(5))
+        rx.recv_timeout(timeout)
             .map_err(|_| format!("terminal {id}: input write not confirmed; delivery is uncertain, do not resend automatically"))??;
+        // `preferredId = id` on every successful write — the placeholder
+        // `resolveWriteTarget` float favors the shell last typed into.
+        self.note_preferred(id);
         Ok(DeliveryReceipt {
             id: format!("delivery-{}", uuid::Uuid::new_v4().simple()),
             terminal_id: id.to_owned(),
@@ -1125,17 +1276,16 @@ impl TerminalManager {
         Ok(())
     }
 
-    /// First `terminal-N` not already in use — what `slate terminal new` and
-    /// `worker-start` without a terminal fall back to.
-    pub fn fresh_terminal_id(&self) -> String {
-        let terminals = lock_recover(&self.inner.terminals);
-        for n in 1..10_000u32 {
-            let id = format!("terminal-{n}");
-            if !terminals.contains_key(&id) {
-                return id;
-            }
-        }
-        format!("terminal-{}", now_millis())
+    /// `terminals.nextId` — `{prefix}-{Date.now()}-{counter}`; `reserve`
+    /// minted `agent-*` for agent-owned shells and `term-*` for the user's.
+    /// The counter is process-global across prefixes like the TypeScript's.
+    pub fn next_terminal_id(&self, prefix: &str) -> String {
+        let n = self
+            .inner
+            .id_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        format!("{prefix}-{}-{n}", now_millis())
     }
 
     /// One keystroke from the GUI. The terminal's own screen state decides
@@ -1269,6 +1419,7 @@ impl TerminalManager {
             alive: state.alive,
             // A program that reports its directory through OSC 7 knows better
             // than whatever cwd the terminal was spawned in.
+            title: state.screen.title().unwrap_or_default(),
             cwd: state.screen.cwd().unwrap_or_else(|| state.cwd.clone()),
             mouse_reporting: state.screen.mouse_reporting(),
             alternate: state.screen.alternate_screen(),
@@ -1417,9 +1568,17 @@ impl TerminalManager {
             // the input already queued, and is never refused for want of
             // queue space. The cap is there to bound bulk input, and one
             // keystroke — this keystroke above all — is not that.
-            return push_input(id, &handle, data);
+            let pushed = push_input(id, &handle, data);
+            if pushed.is_ok() {
+                self.note_preferred(id);
+            }
+            return pushed;
         }
-        enqueue_input(id, &handle, data)
+        let pushed = enqueue_input(id, &handle, data);
+        if pushed.is_ok() {
+            self.note_preferred(id);
+        }
+        pushed
     }
 }
 
@@ -2030,8 +2189,14 @@ impl ControlServer {
             token,
             orchestration: Arc::new(Mutex::new(load_orchestration(&orchestration_file))),
             orchestration_file,
-            rate_limiter: Arc::new(Mutex::new(ActorRateLimiter::default())),
-            locks: Arc::new(Mutex::new(slate_app::locks::LockManager::new(None))),
+            rate_limiter: Arc::new(Mutex::new(ActorRateLimiter::new(120.0, 60.0))),
+            flow_rate_limiter: Arc::new(Mutex::new(ActorRateLimiter::new(40.0, 25.0))),
+            locks: slate_app::locks::shared(),
+            // `flow.idempotency` in the TypeScript — one cross-request cache
+            // so a retried mutation is answered, not re-run.
+            idempotency: slate_app::idempotency::shared(),
+            agent_states: Arc::new(Mutex::new(HashMap::new())),
+            agent_transitions: Arc::new(Mutex::new(VecDeque::new())),
         };
 
         // The listener is opened on this thread, before the server thread is
@@ -2071,6 +2236,9 @@ impl ControlServer {
                         .route("/presence", get(presence))
                         .route("/raise", post(raise_window))
                         .route("/orchestration/workers", get(list_workers))
+                        // herdr's `herdr agent list` — every terminal's
+                        // detected agent and its working/blocked/idle state.
+                        .route("/orchestration/agents", get(list_agents))
                         .route("/orchestration/workers/tell", post(tell_worker))
                         .route("/orchestration/workers/rename", post(rename_worker))
                         .route("/terminal/{id}/write", post(write_terminal))
@@ -2141,7 +2309,7 @@ fn load_orchestration(path: &FsPath) -> slate_app::orchestration::OrchestrationS
     }
 }
 
-fn persist_orchestration(
+pub fn persist_orchestration(
     path: &FsPath,
     store: &slate_app::orchestration::OrchestrationStore,
 ) -> std::io::Result<()> {
@@ -2177,10 +2345,27 @@ struct HttpState {
     /// request its own clone of the state.
     orchestration: Arc<Mutex<slate_app::orchestration::OrchestrationStore>>,
     orchestration_file: PathBuf,
+    /// `apiRateLimiter` — the HTTP admission bucket (120 burst, 60/sec) every
+    /// request pays into, journaled command or not.
     rate_limiter: Arc<Mutex<ActorRateLimiter>>,
+    /// `flow.rateLimiter` — the command-level bucket (40 burst, 25/sec) a
+    /// `submit()` pays into after its idempotency check. The TypeScript kept
+    /// the two on separate instances, so a burst of reads cannot starve a
+    /// command and vice versa.
+    flow_rate_limiter: Arc<Mutex<ActorRateLimiter>>,
     /// `core.locks` in the TypeScript — in-memory resource locks behind the
-    /// `/locks` routes.
-    locks: Arc<Mutex<slate_app::locks::LockManager>>,
+    /// `/locks` routes. One process-wide manager (`locks::shared`): the GUI's
+    /// own submits gate on the same table the routes administer.
+    locks: &'static Mutex<slate_app::locks::LockManager>,
+    /// `flow.idempotency` — answered-command cache shared across requests,
+    /// and across the GUI's submit path (`idempotency::shared`).
+    idempotency: &'static Mutex<slate_app::idempotency::IdempotencyCache>,
+    /// Last detected agent state per terminal — `list_agents` diffs each
+    /// response against this and appends flips to `agent_transitions`.
+    agent_states: Arc<Mutex<HashMap<String, String>>>,
+    /// Ring buffer of `{id,name,from,to,at}` state flips, newest last —
+    /// the `transitions` key of the agents response.
+    agent_transitions: Arc<Mutex<VecDeque<serde_json::Value>>>,
 }
 
 /// `detectRunning` from orchestration/workers.ts: which tool a terminal is
@@ -2310,19 +2495,6 @@ fn tail_of(text: &str, max: usize) -> &str {
     &text[start..]
 }
 
-/// Append one chained entry to `command-journal.ndjson` — the same write path
-/// the canvas and CLI use, so socket mutations replay identically.
-fn commit_journal(
-    actor: &str,
-    entry_type: &str,
-    target: &str,
-    payload: serde_json::Value,
-) -> Result<slate_app::journal::JournalEntry, String> {
-    let path = slate_app::ipc::user_data_dir().join("command-journal.ndjson");
-    slate_app::journal_log::JournalLog::open(&path)
-        .and_then(|mut log| log.commit(actor, entry_type, target, payload))
-}
-
 /// The journal folded through `projection.rs` — the canvas the user sees.
 /// Per-workspace: snapshot for the current slot plus the journal tail the
 /// `workspaceDir` filter lets through.
@@ -2408,6 +2580,20 @@ async fn list_workers(
                     .map(|dispatch| dispatch.agent.clone())
                     .or_else(|| detect_running(&name, tail))
                     .unwrap_or_else(|| "shell".to_owned());
+                // The manifest detector's state on the same hint order as
+                // `/orchestration/agents` — herdr's workers list carries
+                // `{working,blocked,idle,unknown}`, not just liveness.
+                let hint = live
+                    .as_ref()
+                    .map(|dispatch| dispatch.agent.clone())
+                    .or_else(|| detect_running(&name, tail))
+                    .map(|r| r.strip_prefix('~').unwrap_or(&r).to_owned())
+                    .or_else(|| slate_app::agent_state::manifest_for("", &name));
+                let detected = slate_app::agent_state::detect(
+                    &snapshot.screen,
+                    &snapshot.title,
+                    hint.as_deref(),
+                );
                 let mut row = serde_json::json!({
                     "id": snapshot.id,
                     "name": name,
@@ -2415,6 +2601,7 @@ async fn list_workers(
                     "self": caller.as_deref() == Some(snapshot.id.as_str()),
                     "alive": snapshot.alive,
                     "running": running,
+                    "state": detected.state.as_str(),
                 });
                 if let Some(dispatch) = live {
                     row["agent"] = serde_json::json!(dispatch.agent);
@@ -2437,26 +2624,120 @@ async fn list_workers(
     Ok(Json(serde_json::json!({ "workers": workers })))
 }
 
+/// `GET /orchestration/agents` — the manifest detector's roster: each
+/// terminal's claimed agent, its `{working,blocked,idle,unknown}` state,
+/// and the rule that won. herdr's `herdr agent list`, serving the same
+/// screen-tail evidence slate's own card dots use.
+async fn list_agents(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    _uri: axum::http::Uri,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    authenticate(&headers, &state.token)?;
+    check_rate_limit(&state, &headers, None)?;
+    let names = state.manager.names();
+    let agents = {
+        let store = lock_recover(&state.orchestration);
+        state
+            .manager
+            .snapshots()
+            .into_iter()
+            .map(|snapshot| {
+                let name = names
+                    .get(&snapshot.id)
+                    .cloned()
+                    .unwrap_or_else(|| snapshot.id.clone());
+                // The hint order mirrors `list_workers`: a dispatch's
+                // recorded agent, then the title/tail sniff, then the
+                // manifest name match.
+                let running = store
+                    .dispatch_for_terminal(&snapshot.id)
+                    .map(|dispatch| dispatch.agent.clone())
+                    .or_else(|| detect_running(&name, tail_of(&snapshot.output, 4_000)));
+                let hint = running
+                    .as_deref()
+                    .map(|r| r.strip_prefix('~').unwrap_or(r).to_owned())
+                    .or_else(|| slate_app::agent_state::manifest_for("", &name));
+                let mut row = slate_app::agent_state::row(
+                    &snapshot.id,
+                    &name,
+                    &snapshot.screen,
+                    &snapshot.title,
+                    hint.as_deref(),
+                );
+                row["alive"] = serde_json::json!(snapshot.alive);
+                row["running"] = serde_json::json!(running);
+                row
+            })
+            .collect::<Vec<_>>()
+    };
+    record_agent_states(&state, &agents);
+    let transitions: Vec<serde_json::Value> = lock_recover(&state.agent_transitions)
+        .iter()
+        .cloned()
+        .collect();
+    Ok(Json(serde_json::json!({ "agents": agents, "transitions": transitions })))
+}
+
+/// Fold freshly-detected rows into the state cache; every flip lands in the
+/// ring buffer that rides the `transitions` key of the agents response.
+/// `unknown` is "no evidence yet", not a state — transitions into it are
+/// noise a coordinator would only misread as an event.
+fn record_agent_states(state: &HttpState, agents: &[serde_json::Value]) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as f64)
+        .unwrap_or(0.0);
+    let mut cache = lock_recover(&state.agent_states);
+    let mut transitions = lock_recover(&state.agent_transitions);
+    for row in agents {
+        let (Some(id), Some(to)) = (
+            row.get("id").and_then(serde_json::Value::as_str),
+            row.get("state").and_then(serde_json::Value::as_str),
+        ) else {
+            continue;
+        };
+        if to == "unknown" {
+            continue;
+        }
+        let from = cache.insert(id.to_owned(), to.to_owned());
+        if let Some(from) = from.filter(|f| f != to) {
+            transitions.push_back(serde_json::json!({
+                "id": id,
+                "name": row.get("name").and_then(serde_json::Value::as_str).unwrap_or(id),
+                "from": from,
+                "to": to,
+                "at": now,
+            }));
+            while transitions.len() > 200 {
+                transitions.pop_front();
+            }
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct WriteRequest {
-    #[serde(alias = "command", alias = "input", alias = "content")]
-    text: Option<String>,
-    #[serde(rename = "pressEnter", default = "default_true")]
-    press_enter: bool,
+    /// `typeof body.text === 'string' ? body.text : ''` — a non-string is
+    /// coerced, not rejected; the `command`/`input`/`content`/`line` aliases
+    /// lived in the apply's `extractTerminalText`, not the route's read.
+    text: Option<serde_json::Value>,
+    /// `body.pressEnter !== false` — anything but literal false presses.
+    #[serde(rename = "pressEnter")]
+    press_enter: Option<serde_json::Value>,
+    /// `body.confirmDelivery !== false` — the route defaulted to confirmed
+    /// delivery; literal `false` types without waiting for the receipt.
+    #[serde(rename = "confirmDelivery")]
+    confirm_delivery: Option<serde_json::Value>,
+    /// `deliverLine`'s `timeoutMs` — the receipt wait, milliseconds.
+    #[serde(rename = "deliveryTimeoutMs")]
+    delivery_timeout_ms: Option<serde_json::Value>,
     #[serde(rename = "agentId")]
     agent_id: Option<String>,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-#[derive(Serialize)]
-struct WriteResponse {
-    ok: bool,
-    id: String,
-    text: String,
-    delivery: Option<DeliveryReceipt>,
+    #[serde(rename = "baseVersion")]
+    base_version: Option<f64>,
+    #[serde(rename = "idempotencyKey")]
+    idempotency_key: Option<String>,
 }
 
 /// `slate tell <worker> "text"` — `POST /orchestration/workers/tell` in the
@@ -2466,12 +2747,28 @@ struct WriteResponse {
 #[derive(Deserialize)]
 struct TellRequest {
     to: String,
-    #[serde(default)]
-    text: String,
-    #[serde(default)]
-    images: Vec<String>,
+    /// `String(body.text ?? '')` — numbers, bools, and arrays coerce the way
+    /// JavaScript's String() did.
+    text: Option<serde_json::Value>,
+    /// `imageList()` — a non-array `images` is ignored, not rejected.
+    images: Option<serde_json::Value>,
+    /// `imageList()` merged a lone `image` into `images` — the same alias the
+    /// attach route reads.
+    image: Option<serde_json::Value>,
+    #[serde(rename = "pressEnter")]
+    press_enter: Option<serde_json::Value>,
+    /// The attach arm read `body.confirmDelivery !== false`; the write arm
+    /// always confirmed, so this only reaches `terminal.attach`.
+    #[serde(rename = "confirmDelivery")]
+    confirm_delivery: Option<serde_json::Value>,
+    #[serde(rename = "deliveryTimeoutMs")]
+    delivery_timeout_ms: Option<serde_json::Value>,
     #[serde(rename = "agentId")]
     agent_id: Option<String>,
+    #[serde(rename = "baseVersion")]
+    base_version: Option<f64>,
+    #[serde(rename = "idempotencyKey")]
+    idempotency_key: Option<String>,
 }
 
 async fn tell_worker(
@@ -2483,105 +2780,723 @@ async fn tell_worker(
     authenticate(&headers, &state.token)?;
     let agent = agent_identity(&headers, &uri, request.agent_id.as_deref());
     check_rate_limit(&state, &headers, agent.as_deref())?;
-    let manager = state.manager.clone();
+    // `resolveWorker` ran at the route, before submit — an unresolvable `to`
+    // answers 400 with no intent entry.
     let to = state
         .manager
         .resolve(&request.to, agent.as_deref())
         .map_err(command_failure)?;
-    let text = request.text.clone();
-    if request.images.len() > 8 {
-        return Err(bad_request("At most 8 images per delivery".into()));
+    // `imageList(body)` — `images` + a lone `image`, trimmed, capped at 8 by
+    // slicing (the shell dropped extras silently rather than 400ing). Read
+    // off a body-shaped Value so the same helper answers both.
+    let body = serde_json::json!({
+        "images": request.images,
+        "image": request.image,
+    });
+    let sources = image_list(&body);
+    // `String(body.text ?? '')` — JavaScript coercion, not a typed string.
+    let text = js_string(request.text.as_ref());
+    let press_enter = json_not_false(request.press_enter.as_ref());
+    // The write arm hardcoded `confirmDelivery: true`; the attach arm read
+    // `body.confirmDelivery !== false` — the same default.
+    let confirm_delivery = json_not_false(request.confirm_delivery.as_ref());
+    let base_version = request.base_version;
+    let idempotency_key = request.idempotency_key.clone();
+    let actor = agent.clone().unwrap_or_else(|| "api".to_owned());
+    let state_for_work = state.clone();
+    let has_images = !sources.is_empty();
+    let mut payload = if has_images {
+        serde_json::json!({
+            "images": sources,
+            "text": text,
+            "pressEnter": press_enter,
+            "confirmDelivery": confirm_delivery,
+        })
+    } else {
+        serde_json::json!({
+            "text": text,
+            "pressEnter": press_enter,
+            "confirmDelivery": true,
+        })
+    };
+    if let Some(ms) = request
+        .delivery_timeout_ms
+        .as_ref()
+        .and_then(serde_json::Value::as_f64)
+        .filter(|ms| ms.is_finite())
+    {
+        payload["deliveryTimeoutMs"] = serde_json::json!(ms);
     }
-    let agent = lock_recover(&state.orchestration)
-        .dispatch_for_terminal(&to)
-        .map(|dispatch| dispatch.agent.clone());
-    let sources = request.images.clone();
-    let delivery_to = to.clone();
-    let (receipt, images) = tokio::task::spawn_blocking(move || -> Result<_, String> {
-        if sources.is_empty() {
-            return manager
-                .write_message(&delivery_to, &text)
-                .map(|r| (r, Vec::<String>::new()));
-        }
-        if !manager.snapshot(&delivery_to)?.alive {
-            return Err("Terminal has exited".into());
-        }
-        let directory = slate_app::ipc::user_data_dir().join("media");
-        let images = sources
-            .iter()
-            .map(|source| {
-                slate_app::attachments::import_image(std::path::Path::new(source), &directory)
-                    .map(|path| path.to_string_lossy().into_owned())
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut content = String::new();
-        for path in &images {
-            content.push_str(&slate_app::attachments::path_token(path)?);
-        }
-        content.push_str(&text.replace(['\r', '\n'], " "));
-        // This branch only runs when at least one image was attached, so the
-        // delivery must be submitted even when the accompanying text is blank.
-        let receipt = manager.write_text(&delivery_to, &content, true)?;
-        Ok((receipt, images))
-    })
-    .await
-    .map_err(|error| bad_request(format!("delivery task failed: {error}")))?
-    .map_err(bad_request)?;
-    // `submit('terminal.write'|'terminal.attach', …)` — the audit entry the
-    // TypeScript journaled for every tell.
-    let journaled = commit_journal(
+    let payload_for_work = payload.clone();
+    let (entry, response) = submit_engine(
+        &state,
         agent.as_deref().unwrap_or("api"),
-        if images.is_empty() {
-            "terminal.write"
-        } else {
+        base_version,
+        idempotency_key,
+        if has_images {
             "terminal.attach"
+        } else {
+            "terminal.write"
         },
         &format!("terminal:{to}"),
-        serde_json::json!({
-            "text": request.text,
-            "images": images,
-            "pressEnter": true,
-            "confirmDelivery": true,
-        }),
-    );
-    let mut response =
-        serde_json::json!({"ok": true, "id": to, "text": request.text, "delivery": receipt});
-    if let Some(agent) = agent {
-        response["agent"] = serde_json::json!(agent);
-    }
-    if !images.is_empty() {
-        response["images"] = serde_json::json!(images);
-        response["mode"] = serde_json::json!("path");
-    }
-    let (version, seq) = journal_position(&journaled);
-    Ok(Json(envelope(response, version, seq)))
+        payload,
+        "POST /workers/{to}",
+        move || {
+            let to = to.clone();
+            let actor = actor.clone();
+            async move {
+                let state = state_for_work;
+                tokio::task::spawn_blocking(move || {
+                    if has_images {
+                        attach_apply(&state, &actor, &to, &payload_for_work)
+                    } else {
+                        write_apply(&state, &actor, &to, &payload_for_work)
+                    }
+                })
+                .await
+                .map_err(|error| {
+                    axum_failure(bad_request(format!("delivery task failed: {error}")))
+                })?
+            }
+        },
+    )
+    .await?;
+    Ok(Json(envelope(response, entry.version.unwrap_or(0), entry.seq)))
 }
 
-/// `reply()`'s `{ok, version, seq, data}` around a flat answer. The flat fields
-/// stay at the top level beside `data`, so `slate --json` callers keep reading
-/// what they always read.
+/// The `reply(result)` wire shape: `{ok, version, seq, data}` — the apply's
+/// result rides entirely inside `data`, nothing is hoisted to the top level.
 fn envelope(flat: serde_json::Value, version: i64, seq: u64) -> serde_json::Value {
-    let mut body = serde_json::json!({
+    serde_json::json!({
         "ok": true,
         "version": version,
         "seq": seq,
-        "data": flat.clone(),
-    });
-    if let (Some(out), serde_json::Value::Object(fields)) = (body.as_object_mut(), flat) {
-        for (key, value) in fields {
-            out.insert(key, value);
-        }
-    }
-    body
+        "data": flat,
+    })
 }
 
-/// The version and seq a journal append landed at — zero when the journal
-/// could not be written, which the caller already reports through the receipt.
-fn journal_position(entry: &Result<slate_app::journal::JournalEntry, String>) -> (i64, u64) {
-    entry
-        .as_ref()
-        .map(|entry| (entry.version.unwrap_or(0), entry.seq))
-        .unwrap_or((0, 0))
+/// A routed `Response` as the axum handlers' `(StatusCode, Json)` pair — the
+/// same envelope shape the pure router's path returns.
+fn response_failure(
+    response: slate_app::http::Response,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::from_u16(response.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        Json(response.body),
+    )
+}
+
+/// The reverse — an axum-style rejection the work half produced, back into
+/// the router's `Response` so `submit_finish` can record and replay it.
+fn axum_failure(
+    (status, Json(body)): (StatusCode, Json<serde_json::Value>),
+) -> slate_app::http::Response {
+    slate_app::http::Response::json(status.as_u16(), body)
+}
+
+/// Build the short-lived `RouteDeps` the submit halves need — the store lock
+/// is taken only for the call, never held across an `.await`.
+fn route_deps<'a>(
+    store: &'a mut slate_app::orchestration::OrchestrationStore,
+    env: &'a mut EngineEnv<'a>,
+) -> slate_app::http::RouteDeps<'a> {
+    slate_app::http::RouteDeps {
+        orchestration: store,
+        app_version: env!("CARGO_PKG_VERSION"),
+        workspace_dir: None,
+        now: now_millis().min(i64::MAX as u128) as i64,
+        env: Some(env),
+    }
+}
+
+/// `submit_begin` → async handler work → `submit_finish`, for the dedicated
+/// axum handlers whose effect must `.await` between the intent and the
+/// commit. The store guard and env borrows are dropped before `work` runs —
+/// the terminal handlers touch the PTY table, not the store, so nothing is
+/// held over the await. `work` answers `Result<Value, Response>` like the
+/// router's closures: the value is the response's `data`, the commit's id,
+/// and the idempotent record's replay.
+async fn submit_engine<F, Fut>(
+    state: &HttpState,
+    actor: &str,
+    base_version: Option<f64>,
+    idempotency_key: Option<String>,
+    entry_type: &str,
+    target: &str,
+    payload: serde_json::Value,
+    what: &str,
+    work: F,
+) -> Result<(slate_app::journal::JournalEntry, serde_json::Value), (StatusCode, Json<serde_json::Value>)>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<serde_json::Value, slate_app::http::Response>>,
+{
+    let pending = {
+        let mut store = lock_recover(&state.orchestration);
+        let mut env = EngineEnv {
+            manager: &state.manager,
+            locks: state.locks,
+            idempotency: state.idempotency,
+            rate_limiter: state.flow_rate_limiter.as_ref(),
+        };
+        let mut deps = route_deps(&mut store, &mut env);
+        match slate_app::http::submit_begin(
+            &mut deps,
+            actor,
+            base_version,
+            idempotency_key,
+            entry_type,
+            target,
+            payload,
+            what,
+        ) {
+            Err(response) => return Err(response_failure(response)),
+            Ok(slate_app::http::Submit::Replay(replayed)) => {
+                return replayed.map_err(response_failure);
+            }
+            Ok(slate_app::http::Submit::Run(pending)) => pending,
+        }
+    };
+    let result = work().await;
+    let mut store = lock_recover(&state.orchestration);
+    let mut env = EngineEnv {
+        manager: &state.manager,
+        locks: state.locks,
+        idempotency: state.idempotency,
+        rate_limiter: state.flow_rate_limiter.as_ref(),
+    };
+    let mut deps = route_deps(&mut store, &mut env);
+    slate_app::http::submit_finish(&mut deps, pending, result, what).map_err(response_failure)
+}
+
+fn now_i64() -> i64 {
+    now_millis().min(i64::MAX as u128) as i64
+}
+
+/// The apply's own `extraLock` on the resolved `terminal:{id}` — the flow's
+/// gate locked `terminal:{raw}`, and when the placeholder floated the real
+/// serialization lives here. `true` means this call took the lock and the
+/// caller must release it; `false` means the actor already held it.
+fn acquire_resolved_lock(
+    resource: &str,
+    actor: &str,
+    reason: &str,
+) -> Result<bool, slate_app::http::Response> {
+    let now = now_i64();
+    let mut locks = lock_recover(slate_app::locks::shared());
+    if locks.is_locked_by_other(resource, actor, now) {
+        if let Some(lock) = locks.holder(resource, now) {
+            return Err(slate_app::http::Response::from_error(
+                &CommandError::with_details(
+                    ErrorCode::Locked,
+                    format!("{resource} is locked by {}", lock.actor_id),
+                    serde_json::json!({
+                        "lock": {
+                            "resource": lock.resource,
+                            "actorId": lock.actor_id,
+                            "expiresAt": lock.expires_at,
+                        }
+                    }),
+                ),
+            ));
+        }
+    }
+    if locks.is_held_by(resource, actor, now) {
+        return Ok(false);
+    }
+    locks
+        .acquire(
+            slate_app::locks::AcquireInput {
+                resource,
+                actor_id: actor,
+                ttl_ms: None,
+                reason: Some(reason.to_owned()),
+                implicit: true,
+            },
+            now,
+        )
+        .map(|_| true)
+        .map_err(|error| slate_app::http::Response::from_error(&error))
+}
+
+/// The apply's `finally { if (extraLock) release }`.
+fn release_resolved_lock(resource: &str, actor: &str, took: bool) {
+    if took {
+        let _ = lock_recover(slate_app::locks::shared()).release(resource, actor, now_i64());
+    }
+}
+
+/// `resolveWriteTarget` + the "failed on the requested id" error — a dead
+/// explicit id is reported as itself, so the caller learns both what was
+/// asked for and what (if anything) the placeholder floated to.
+fn resolved_or_keep(manager: &TerminalManager, requested: &str) -> String {
+    let id = requested.trim();
+    if manager.is_running(id) {
+        return id.to_owned();
+    }
+    manager
+        .resolve_write_target(id)
+        .unwrap_or_else(|| id.to_owned())
+}
+
+fn terminal_not_running(requested: &str, resolved: &str) -> slate_app::http::Response {
+    slate_app::http::Response::from_error(&CommandError::with_details(
+        ErrorCode::NotFound,
+        format!("terminal not running (wanted {requested})"),
+        serde_json::json!({ "requested": requested, "resolved": resolved }),
+    ))
+}
+
+/// `extractTerminalText` — first non-empty string among the alias keys, read
+/// from the journaled payload so a submit that spelled the text `command`/
+/// `input`/`content`/`line` replays the same as `text`.
+fn extract_terminal_text(payload: &serde_json::Value) -> String {
+    ["text", "command", "input", "content", "line"]
+        .iter()
+        .find_map(|key| {
+            payload
+                .get(*key)
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or("")
+        .to_owned()
+}
+
+/// `v !== false` — the route's `pressEnter`/`confirmDelivery` default checks:
+/// anything that isn't the literal JSON false defaults true, including the
+/// non-bool spellings JavaScript coerced.
+fn json_not_false(value: Option<&serde_json::Value>) -> bool {
+    !matches!(value, Some(serde_json::Value::Bool(false)))
+}
+
+/// `v === true` — the attach route's `confirmDelivery` check and the write
+/// apply's: only literal true confirms.
+fn json_is_true(value: Option<&serde_json::Value>) -> bool {
+    matches!(value, Some(serde_json::Value::Bool(true)))
+}
+
+/// `typeof v === 'number' ? v : undefined` — `deliveryTimeoutMs` was
+/// number-or-absent; a non-finite or negative value never made a timeout.
+fn json_duration_ms(value: Option<&serde_json::Value>) -> Option<Duration> {
+    value
+        .and_then(serde_json::Value::as_f64)
+        .filter(|ms| ms.is_finite() && *ms >= 0.0)
+        .map(|ms| Duration::from_secs_f64(ms / 1_000.0))
+}
+
+/// `String(v ?? '')` — the tell route's text coercion: numbers and bools take
+/// their JavaScript spelling, arrays join on `,`, objects are
+/// `[object Object]`.
+fn js_string(value: Option<&serde_json::Value>) -> String {
+    match value {
+        None | Some(serde_json::Value::Null) => String::new(),
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Bool(b)) => b.to_string(),
+        Some(serde_json::Value::Number(n)) => n.to_string(),
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .map(|item| js_string(Some(item)))
+            .collect::<Vec<_>>()
+            .join(","),
+        Some(serde_json::Value::Object(_)) => "[object Object]".to_owned(),
+    }
+}
+
+/// `imageList` — `images` (array-or-nothing) merged with a lone `image`,
+/// strings trimmed, blanks and non-strings dropped, capped at eight. Both
+/// the attach route and the apply's own re-merge ran this shape.
+fn image_list(payload: &serde_json::Value) -> Vec<String> {
+    payload
+        .get("images")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(Some)
+        .chain(std::iter::once(payload.get("image")))
+        .filter_map(|value| {
+            value
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+        })
+        .take(8)
+        .collect()
+}
+
+/// The `terminal.write` apply body — resolve the placeholder target, take
+/// the apply's own lock on the resolved resource, park on a still-starting
+/// shell inside it, then type the collapsed line. `POST /terminal/{id}/write`
+/// and `POST /workers/{to}` both run this. Every field is read off the
+/// journaled payload, like the apply read `command.payload`.
+fn write_apply(
+    state: &HttpState,
+    actor: &str,
+    requested: &str,
+    payload: &serde_json::Value,
+) -> Result<serde_json::Value, slate_app::http::Response> {
+    // `terminalIdOf` — the literal id; resolveWriteTarget floats only the
+    // ''/'new' placeholders, so an explicit dead id fails as itself.
+    let id = resolved_or_keep(&state.manager, requested);
+    // The apply's own lock on the resolved resource — the flow gated
+    // `terminal:{raw}`; when the target floated the real serialization
+    // lives here.
+    let resource = format!("terminal:{id}");
+    let extra_lock = acquire_resolved_lock(&resource, actor, "terminal.write")?;
+    let outcome = (|| {
+        // `waitUntilRunning(8000)` — a still-starting shell is worth the
+        // park; the wait runs inside the lock like the apply's try did.
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        while !state.manager.is_running(&id) {
+            if std::time::Instant::now() >= deadline {
+                return Err(terminal_not_running(requested, &id));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // `extractTerminalText` — an empty payload text fails inside the
+        // apply, after the intent landed.
+        let text = extract_terminal_text(payload);
+        if text.is_empty() {
+            return Err(slate_app::http::Response::from_error(&CommandError::new(
+                ErrorCode::Invalid,
+                "terminal.write needs non-empty text (payload.text) — nothing to type",
+            )));
+        }
+        let single_line = text.replace(['\r', '\n'], " ");
+        // `command.payload?.pressEnter !== false` — absent presses too.
+        let press_enter = json_not_false(payload.get("pressEnter"));
+        let delivery_timeout = json_duration_ms(payload.get("deliveryTimeoutMs"))
+            .unwrap_or(DELIVERY_TIMEOUT);
+        if json_is_true(payload.get("confirmDelivery")) {
+            // `deliverLine` — the receipt answers `delivery` in the result.
+            let receipt = state
+                .manager
+                .write_text_within(&id, &single_line, press_enter, delivery_timeout)
+                .map_err(|error| {
+                    slate_app::http::Response::from_error(&CommandError::new(
+                        ErrorCode::Failed,
+                        error,
+                    ))
+                })?;
+            Ok(serde_json::json!({
+                "ok": true,
+                "id": id,
+                "text": single_line,
+                "delivery": receipt,
+            }))
+        } else {
+            // `writeLine` — same encoding, no acknowledgement wait.
+            let bytes = encode_terminal_input(&single_line, press_enter).map_err(|error| {
+                slate_app::http::Response::from_error(&CommandError::new(
+                    ErrorCode::Failed,
+                    error,
+                ))
+            })?;
+            state.manager.write_raw(&id, &bytes).map_err(|error| {
+                slate_app::http::Response::from_error(&CommandError::new(
+                    ErrorCode::Failed,
+                    error,
+                ))
+            })?;
+            Ok(serde_json::json!({
+                "ok": true,
+                "id": id,
+                "text": single_line,
+            }))
+        }
+    })();
+    release_resolved_lock(&resource, actor, extra_lock);
+    outcome
+}
+
+/// `attachmentAgent` — the first executable token of a command line, mapped
+/// to the agent's canonical name when it is one the paste-shortcut table
+/// knows.
+fn attachment_agent(command: &str) -> Option<String> {
+    let trimmed = command.trim();
+    let token = if let Some(rest) = trimmed.strip_prefix('"') {
+        rest.split('"').next().unwrap_or("")
+    } else if let Some(rest) = trimmed.strip_prefix('\'') {
+        rest.split('\'').next().unwrap_or("")
+    } else {
+        trimmed.split_whitespace().next().unwrap_or("")
+    };
+    let lowered = token.rsplit(['/', '\\']).next().unwrap_or("").to_lowercase();
+    let name = lowered
+        .strip_suffix(".exe")
+        .or_else(|| lowered.strip_suffix(".cmd"))
+        .or_else(|| lowered.strip_suffix(".ps1"))
+        .or_else(|| lowered.strip_suffix(".bat"))
+        .unwrap_or(&lowered);
+    match name {
+        "cursor-agent" | "agent" => Some("cursor".to_owned()),
+        "agy" => Some("antigravity".to_owned()),
+        n if [
+            "claude",
+            "codex",
+            "kimi",
+            "grok",
+            "opencode",
+            "cursor",
+            "commandcode",
+            "pi",
+            "antigravity",
+        ]
+        .contains(&n) =>
+        {
+            Some(n.to_owned())
+        }
+        _ => None,
+    }
+}
+
+/// `imagePasteShortcut(agent, platform)` — the keystroke that makes the
+/// agent's composer read the OS clipboard. Win32 got ESC-v for the
+/// claude-family agents; everything else pastes with Ctrl+V.
+fn image_paste_shortcut(agent: Option<&str>) -> Option<&'static str> {
+    let name = attachment_agent(agent.unwrap_or(""))?;
+    if ["claude", "kimi", "grok", "commandcode", "pi"].contains(&name.as_str()) {
+        return Some(if cfg!(windows) { "\u{1b}v" } else { "\x16" });
+    }
+    if ["codex", "opencode", "cursor", "antigravity"].contains(&name.as_str()) {
+        return Some("\x16");
+    }
+    None
+}
+
+/// `terminalAgent` — a live dispatch names its agent outright; otherwise
+/// the same tail sniffing `slate workers` uses answers it, minus the `~`
+/// that marks a guess.
+fn terminal_agent(state: &HttpState, id: &str) -> Option<String> {
+    let dispatched = lock_recover(&state.orchestration)
+        .list_dispatches(None, None, Some(id))
+        .into_iter()
+        .find(|dispatch| dispatch.state == "running")
+        .map(|dispatch| dispatch.agent);
+    if dispatched.is_some() {
+        return dispatched;
+    }
+    let title = state.manager.name(id).unwrap_or_else(|| id.to_owned());
+    let tail = state
+        .manager
+        .read_terminal_output(id, true, false, None, None)
+        .map(|output| {
+            output
+                .chars()
+                .rev()
+                .take(4_000)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect::<String>()
+        })
+        .unwrap_or_default();
+    detect_running(&title, &tail).map(|name| name.trim_start_matches('~').to_owned())
+}
+
+/// `stageClipboardImage` — the image lands on the OS clipboard as
+/// `image/png` so the agent's paste keystroke picks it up. The Electron
+/// version did not transcode either — it labeled whatever bytes the file
+/// held as png, so the file is staged verbatim here too. Wayland uses
+/// `wl-copy`, X11 `xclip` — both fork and serve the selection after the
+/// command returns.
+fn stage_clipboard_image(path: &std::path::Path) -> Result<(), String> {
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        if let Ok(file) = std::fs::File::open(path) {
+            if std::process::Command::new("wl-copy")
+                .arg("-t")
+                .arg("image/png")
+                .stdin(std::process::Stdio::from(file))
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+            {
+                return Ok(());
+            }
+        }
+    }
+    if std::env::var_os("DISPLAY").is_some()
+        && std::process::Command::new("xclip")
+            .args(["-selection", "clipboard", "-t", "image/png", "-i"])
+            .arg(path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    {
+        return Ok(());
+    }
+    Err("Clipboard image support is unavailable".to_owned())
+}
+
+/// The `terminal.attach` apply body — `deliver_with_images` grew into the
+/// full original: import the sources into the media store, then either the
+/// clipboard paste (a lone image into a composer that reads it) or quoted
+/// path tokens, then the text line. Runs inside `spawn_blocking`; the
+/// caller passes the resolved-id lock to release in `finally`.
+fn attach_apply(
+    state: &HttpState,
+    actor: &str,
+    requested: &str,
+    payload: &serde_json::Value,
+) -> Result<serde_json::Value, slate_app::http::Response> {
+    let id = resolved_or_keep(&state.manager, requested);
+    // The apply re-merged `p.images` + `p.image` itself — the route's
+    // imageList rode in `images`, a journaled `image` still merges here.
+    let sources = image_list(payload);
+    if sources.is_empty() {
+        return Err(slate_app::http::Response::from_error(&CommandError::new(
+            ErrorCode::Invalid,
+            "terminal.attach needs payload.image or payload.images",
+        )));
+    }
+    // `resolveImage` per source — imported into the media store before the
+    // extra lock is taken, in the same order the apply ran them.
+    let directory = slate_app::ipc::user_data_dir().join("media");
+    let mut files = Vec::with_capacity(sources.len());
+    for source in sources {
+        files.push(
+            slate_app::attachments::import_image(std::path::Path::new(&source), &directory)
+                .map_err(|error| {
+                    slate_app::http::Response::from_error(&CommandError::new(
+                        ErrorCode::Invalid,
+                        error,
+                    ))
+                })?,
+        );
+    }
+    let resource = format!("terminal:{id}");
+    let extra_lock = acquire_resolved_lock(&resource, actor, "terminal.attach")?;
+    let outcome = (|| {
+        // `waitUntilRunning` — the apply parked on a still-starting shell
+        // inside the extra lock rather than rejecting it outright.
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        while !state.manager.is_running(&id) {
+            if std::time::Instant::now() >= deadline {
+                return Err(terminal_not_running(requested, &id));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let agent = terminal_agent(state, &id);
+        let shortcut = image_paste_shortcut(agent.as_deref());
+        // `attachmentMode` — a lone image pastes through the clipboard when
+        // the composer reads it; a batch or an unsupported agent gets paths.
+        let mut mode = if files.len() == 1 && shortcut.is_some() {
+            "clipboard"
+        } else {
+            "path"
+        };
+        if mode == "clipboard" {
+            if stage_clipboard_image(&files[0]).is_ok() {
+                // `writeInput` — the keystroke is a raw enqueue, never a
+                // confirmed write: a control byte echoes nothing to confirm.
+                state
+                    .manager
+                    .write_raw(&id, shortcut.unwrap_or("\x16").as_bytes())
+                    .map_err(|error| {
+                        slate_app::http::Response::from_error(&CommandError::new(
+                            ErrorCode::Failed,
+                            error,
+                        ))
+                    })?;
+                // `IMAGE_PASTE_SETTLE_MS` — the agent reads the clipboard
+                // asynchronously; text arriving inside the window lands
+                // before the image or dies in the repaint.
+                std::thread::sleep(Duration::from_millis(500));
+            } else {
+                mode = "path";
+            }
+        }
+        if mode == "path" {
+            for file in &files {
+                let token = slate_app::attachments::path_token(&file.to_string_lossy())
+                    .map_err(|error| {
+                        slate_app::http::Response::from_error(&CommandError::new(
+                            ErrorCode::Failed,
+                            error,
+                        ))
+                    })?;
+                state
+                    .manager
+                    .write_raw(&id, token.as_bytes())
+                    .map_err(|error| {
+                        slate_app::http::Response::from_error(&CommandError::new(
+                            ErrorCode::Failed,
+                            error,
+                        ))
+                    })?;
+            }
+        }
+        // `p.text.replace(/\r\n|\r|\n/g,' ').trim()` — one collapsed line.
+        let single_line = payload
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .replace(['\r', '\n'], " ")
+            .trim()
+            .to_owned();
+        // `p.pressEnter === undefined ? text.length > 0 : p.pressEnter !==
+        // false` — the apply's own fallback for a payload that omits it.
+        let press_enter = match payload.get("pressEnter") {
+            None => !single_line.is_empty(),
+            value => json_not_false(value),
+        };
+        let confirm_delivery = json_is_true(payload.get("confirmDelivery"));
+        let delivery_timeout = json_duration_ms(payload.get("deliveryTimeoutMs"))
+            .unwrap_or(DELIVERY_TIMEOUT);
+        if !single_line.is_empty() {
+            if confirm_delivery {
+                // `deliverLine` — the only leg that answers with a receipt.
+                state
+                    .manager
+                    .write_text_within(&id, &single_line, press_enter, delivery_timeout)
+                    .map_err(|error| {
+                        slate_app::http::Response::from_error(&CommandError::new(
+                            ErrorCode::Failed,
+                            error,
+                        ))
+                    })?;
+            } else {
+                // `writeLine` — same encoding, no acknowledgement wait.
+                let bytes = encode_terminal_input(&single_line, press_enter).map_err(|error| {
+                    slate_app::http::Response::from_error(&CommandError::new(
+                        ErrorCode::Failed,
+                        error,
+                    ))
+                })?;
+                state.manager.write_raw(&id, &bytes).map_err(|error| {
+                    slate_app::http::Response::from_error(&CommandError::new(
+                        ErrorCode::Failed,
+                        error,
+                    ))
+                })?;
+            }
+        } else if press_enter {
+            state.manager.write_raw(&id, b"\r").map_err(|error| {
+                slate_app::http::Response::from_error(&CommandError::new(
+                    ErrorCode::Failed,
+                    error,
+                ))
+            })?;
+        }
+        let mut response = serde_json::json!({
+            "ok": true,
+            "id": id,
+            "mode": mode,
+            "images": files.iter().map(|f| f.to_string_lossy()).collect::<Vec<_>>(),
+        });
+        if let Some(agent) = agent {
+            response["agent"] = serde_json::json!(agent);
+        }
+        if !single_line.is_empty() {
+            response["text"] = serde_json::json!(single_line);
+        }
+        Ok(response)
+    })();
+    release_resolved_lock(&resource, actor, extra_lock);
+    outcome
 }
 
 async fn write_terminal(
@@ -2594,51 +3509,86 @@ async fn write_terminal(
     authenticate(&headers, &state.token)?;
     let agent = agent_identity(&headers, &uri, request.agent_id.as_deref());
     check_rate_limit(&state, &headers, agent.as_deref())?;
+    // `!/^[A-Za-z0-9_-]{1,128}$/.test(rawId)` — a malformed id 400s at the
+    // route before the journal opens.
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "invalid terminal id" })),
+        ));
+    }
+    // `typeof body.text === 'string' ? body.text : ''` — a non-string text
+    // submits as empty and fails inside the apply, intent already written.
     let text = request
         .text
-        .ok_or_else(|| bad_request("terminal.write requires text".to_owned()))?;
+        .as_ref()
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_owned();
     // The shell refused writes over 64 KiB with 413 — a full file paste
     // belongs to terminal.attach, not a keystroke stream.
     if text.len() > 64 * 1024 {
         return Err((
             StatusCode::PAYLOAD_TOO_LARGE,
             Json(serde_json::json!({
-                "error": "terminal.write payload exceeds 64 KiB",
-                "code": "invalid",
+                "error": "write exceeds 65536 bytes",
             })),
         ));
     }
-    let manager = state.manager.clone();
-    let press_enter = request.press_enter;
-    let id = state
-        .manager
-        .resolve(&id, agent.as_deref())
-        .map_err(command_failure)?;
-    let delivery_id = id.clone();
-    let delivery_text = text.clone();
-    let receipt = tokio::task::spawn_blocking(move || {
-        manager.write_text(&delivery_id, &delivery_text, press_enter)
-    })
-    .await
-    .map_err(|error| bad_request(format!("delivery task failed: {error}")))?
-    .map_err(bad_request)?;
-    // `submit('terminal.write', …)` — the delivered write was journaled in
-    // the TypeScript; the record is the audit trail, the PTY is the effect.
-    let journaled = commit_journal(
+    // `submit(body, 'terminal.write', terminal:{rawId}, …)` — the apply
+    // resolved the id, parked on a still-starting shell, and delivered, so
+    // a bad name or a dead shell lands intent+abort rather than answering
+    // before the journal opens.
+    let actor = agent.clone().unwrap_or_else(|| "api".to_owned());
+    let state_for_work = state.clone();
+    let raw = id.clone();
+    let mut payload = serde_json::json!({
+        "text": &text,
+        "pressEnter": json_not_false(request.press_enter.as_ref()),
+        "confirmDelivery": json_not_false(request.confirm_delivery.as_ref()),
+    });
+    if let Some(ms) = request
+        .delivery_timeout_ms
+        .as_ref()
+        .and_then(serde_json::Value::as_f64)
+        .filter(|ms| ms.is_finite())
+    {
+        payload["deliveryTimeoutMs"] = serde_json::json!(ms);
+    }
+    let payload_for_work = payload.clone();
+    let (entry, flat) = submit_engine(
+        &state,
         agent.as_deref().unwrap_or("api"),
+        request.base_version,
+        request.idempotency_key,
         "terminal.write",
-        &format!("terminal:{id}"),
-        serde_json::json!({ "text": &text, "pressEnter": press_enter }),
-    );
-    let flat = serde_json::to_value(WriteResponse {
-        ok: true,
-        id,
-        text,
-        delivery: Some(receipt),
-    })
-    .unwrap_or_default();
-    let (version, seq) = journal_position(&journaled);
-    Ok(Json(envelope(flat, version, seq)))
+        &format!("terminal:{raw}"),
+        payload,
+        "POST /terminal/{id}/write",
+        move || async move {
+            let state = state_for_work;
+            let actor = actor.clone();
+            let raw = raw.clone();
+            tokio::task::spawn_blocking(move || {
+                write_apply(&state, &actor, &raw, &payload_for_work)
+            })
+            .await
+            .map_err(|error| {
+                axum_failure(bad_request(format!("delivery task failed: {error}")))
+            })?
+        },
+    )
+    .await?;
+    Ok(Json(envelope(
+        flat,
+        entry.version.unwrap_or(0),
+        entry.seq,
+    )))
 }
 
 #[derive(Serialize)]
@@ -2691,6 +3641,10 @@ struct SpawnRequest {
     command: Option<String>,
     #[serde(rename = "agentId")]
     agent_id: Option<String>,
+    #[serde(rename = "baseVersion")]
+    base_version: Option<f64>,
+    #[serde(rename = "idempotencyKey")]
+    idempotency_key: Option<String>,
 }
 
 /// `slate terminal new`: a shell on a fresh PTY. The canvas adopts it as a
@@ -2706,93 +3660,149 @@ async fn spawn_terminal(
     authenticate(&headers, &state.token)?;
     let agent = agent_identity(&headers, &uri, request.agent_id.as_deref());
     check_rate_limit(&state, &headers, agent.as_deref())?;
-    let id = request
+    // `submit(body, 'terminal.create', NEW.terminal, {title, cwd, agentOwned})`
+    // — `terminals.reserve` minted the id inside apply, so a failed spawn
+    // leaves intent+abort and the payload carries no id.
+    let title = request
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.chars().take(200).collect::<String>());
+    let manager = state.manager.clone();
+    let requested_id = request
         .id
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(str::to_owned)
-        .unwrap_or_else(|| state.manager.fresh_terminal_id());
-    // `submit('terminal.create', 'terminal:new', …)` — the original journaled
-    // the create before the PTY came up, so a failed spawn still leaves the
-    // record of the attempt.
-    commit_journal(
-        agent.as_deref().unwrap_or("api"),
-        "terminal.create",
-        "terminal:new",
-        serde_json::json!({
-            "id": id,
-            "title": request.name,
-            "cwd": request.cwd,
-            "agentOwned": true,
-        }),
-    )
-    .map_err(bad_request)?;
-    let manager = state.manager.clone();
-    let spawn_id = id.clone();
+        .map(str::to_owned);
+    // `body.cwd.slice(0, 1024)` — the route's cap, same as the title's 200.
+    let cwd_field = request
+        .cwd
+        .as_deref()
+        .map(|cwd| cwd.chars().take(1024).collect::<String>());
     let launch = request
         .command
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_owned);
-    let (id, name) = tokio::task::spawn_blocking(move || -> Result<_, String> {
-        // `command` is a launch line, not an executable path — the original
-        // always spawned the user's shell, and dispatch's launch path types
-        // the agent command into it. Same here: exec'ing the raw string would
-        // fail on anything with arguments.
-        // No cwd in the request → the picked workspace, then the launch dir —
-        // the same ladder `RouteDeps::workspace_dir` gives the routed path.
-        let cwd = request
-            .cwd
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
-            .or_else(slate_app::workspace::current)
-            .or_else(|| {
-                std::env::current_dir()
-                    .ok()
-                    .map(|p| p.to_string_lossy().into_owned())
-            });
-        manager.spawn_with_options(
-            spawn_id.clone(),
-            120,
-            32,
-            cwd,
-            shell_command(),
-            HashMap::new(),
-        )?;
-        if let Some(command) = &launch {
-            let _ = manager.write_text(&spawn_id, command, true);
-        }
-        let name = request
-            .name
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned);
-        if let Some(name) = &name {
-            manager.set_name(&spawn_id, name);
-        }
-        Ok((spawn_id, name))
-    })
-    .await
-    .map_err(|error| bad_request(format!("spawn task failed: {error}")))?
-    .map_err(bad_request)?;
-    // The TypeScript answered `terminal.create`'s data: `{id, title, cwd,
-    // ready}` — callers (`slate terminal open` among them) unwrap `.data`.
-    let cwd = state
-        .manager
-        .snapshot(&id)
-        .map(|snapshot| snapshot.cwd)
-        .unwrap_or_default();
-    let title = name.clone().unwrap_or_else(|| id.clone());
-    Ok(Json(serde_json::json!({
-        "ok": true,
-        "id": id,
-        "name": name,
-        "data": { "id": id, "title": title, "cwd": cwd, "ready": true },
-    })))
+    let base_version = request.base_version;
+    let idempotency_key = request.idempotency_key.clone();
+    let title_for_work = title.clone();
+    // `undefined` keys did not serialize — a missing title/cwd leaves no key
+    // in the journaled payload rather than a null.
+    let mut create_payload = serde_json::json!({ "agentOwned": true });
+    if let Some(title) = &title {
+        create_payload["title"] = serde_json::json!(title);
+    }
+    if let Some(cwd) = &cwd_field {
+        create_payload["cwd"] = serde_json::json!(cwd);
+    }
+    let (entry, data) = submit_engine(
+        &state,
+        agent.as_deref().unwrap_or("api"),
+        base_version,
+        idempotency_key,
+        "terminal.create",
+        "terminal:new",
+        create_payload,
+        "POST /terminal",
+        move || async move {
+            let id = requested_id.unwrap_or_else(|| manager.next_terminal_id("agent"));
+            // `command` is a launch line, not an executable path — the original
+            // always spawned the user's shell, and dispatch's launch path types
+            // the agent command into it. Same here: exec'ing the raw string would
+            // fail on anything with arguments.
+            // No cwd in the request → the picked workspace, then the launch dir —
+            // the same ladder `RouteDeps::workspace_dir` gives the routed path.
+            let cwd = cwd_field
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .or_else(slate_app::workspace::current)
+                .or_else(|| {
+                    std::env::current_dir()
+                        .ok()
+                        .map(|p| p.to_string_lossy().into_owned())
+                });
+            let spawn_id = id.clone();
+            let name = title_for_work.clone();
+            let spawner = manager.clone();
+            tokio::task::spawn_blocking(move || -> Result<_, slate_app::http::Response> {
+                // `terminals.reserve` ran inside the apply — the mount's own
+                // `terminal.spawn` entry arrives later, when the widget adopts
+                // the running shell.
+                spawner
+                    .spawn_with_options(
+                        spawn_id.clone(),
+                        120,
+                        32,
+                        cwd,
+                        shell_command(),
+                        HashMap::new(),
+                    )
+                    .map_err(|error| {
+                        slate_app::http::Response::from_error(&CommandError::new(
+                            ErrorCode::Failed,
+                            error,
+                        ))
+                    })?;
+                if let Some(command) = &launch {
+                    let _ = spawner.write_text(&spawn_id, command, true);
+                }
+                if let Some(name) = &name {
+                    spawner.set_name(&spawn_id, name);
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|error| {
+                slate_app::http::Response::from_error(&CommandError::new(
+                    ErrorCode::Failed,
+                    format!("spawn task failed: {error}"),
+                ))
+            })??;
+            // `waitUntilRunning(10_000)` — a shell that never reaches its read
+            // loop gets disposed and the command fails.
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !manager.is_running(&id) {
+                if std::time::Instant::now() >= deadline {
+                    let _ = manager.dispose(&id);
+                    return Err(slate_app::http::Response::from_error(&CommandError::new(
+                        ErrorCode::Failed,
+                        "the Slate window did not open a terminal for this request",
+                    )));
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let cwd = manager
+                .snapshot(&id)
+                .map(|snapshot| snapshot.cwd)
+                .unwrap_or_default();
+            Ok(serde_json::json!({
+                "id": id.clone(),
+                "terminalId": id,
+                "title": title_for_work.unwrap_or_else(|| id.clone()),
+                "cwd": cwd,
+                "ready": true,
+            }))
+        },
+    )
+    .await?;
+    let (version, seq) = (entry.version.unwrap_or(0), entry.seq);
+    // `reply()` put the apply's `{id, title, cwd, ready}` under `data`; the
+    // flat `id`/`name` stay at the top for the CLI's convenience readers.
+    let mut body = envelope(
+        serde_json::json!({
+            "id": data.get("id").cloned().unwrap_or_default(),
+            "name": title,
+        }),
+        version,
+        seq,
+    );
+    body["data"] = data;
+    Ok(Json(body))
 }
 
 #[derive(Deserialize)]
@@ -2835,6 +3845,10 @@ struct WorkerRenameRequest {
     name: String,
     #[serde(rename = "agentId")]
     agent_id: Option<String>,
+    #[serde(rename = "baseVersion")]
+    base_version: Option<f64>,
+    #[serde(rename = "idempotencyKey")]
+    idempotency_key: Option<String>,
 }
 
 /// `slate rename --to term-3 --name backend` — `POST /orchestration/workers/
@@ -2868,17 +3882,43 @@ async fn rename_worker(
         ));
     }
     if on_canvas {
-        let actor = agent.as_deref().unwrap_or("api");
-        commit_journal(
-            actor,
+        // `submit(body, 'widget.update', widget:{id}, {title})` — the apply
+        // was `patchWidget`; for a terminal-backed widget the names map is
+        // the title's other home.
+        let manager = state.manager.clone();
+        let rename_id = id.clone();
+        let rename = name.clone();
+        submit_engine(
+            &state,
+            agent.as_deref().unwrap_or("api"),
+            request.base_version,
+            request.idempotency_key.clone(),
             "widget.update",
             &format!("widget:{id}"),
             serde_json::json!({ "title": name }),
+            "POST /orchestration/workers/rename",
+            move || async move {
+                if manager.snapshot(&rename_id).is_ok() {
+                    manager.set_name(&rename_id, &rename);
+                }
+                // `patchWidget` returned the merged widget; synthesize the
+                // same row since the commit has not folded yet.
+                let row = folded_canvas()
+                    .ok()
+                    .and_then(|canvas| canvas.widgets.get(&rename_id).cloned())
+                    .map(|mut widget| {
+                        widget.title = rename.clone();
+                        widget.version += 1.0;
+                        slate_app::http::widget_row(&widget)
+                    });
+                Ok(row.unwrap_or_else(|| {
+                    serde_json::json!({ "id": rename_id, "title": rename })
+                }))
+            },
         )
-        .map_err(bad_request)?;
-        if state.manager.snapshot(&id).is_ok() {
-            state.manager.set_name(&id, &name);
-        }
+        .await?;
+        // The shell answered the flat `{ok, id, name}` — not `reply()`'s
+        // envelope.
         return Ok(Json(
             serde_json::json!({"ok": true, "id": id, "name": name}),
         ));
@@ -2890,19 +3930,29 @@ async fn rename_worker(
 /// media-store imports — what `slate tell --image` sends.
 #[derive(Deserialize)]
 struct AttachRequest {
-    #[serde(default)]
-    text: String,
-    #[serde(default)]
-    images: Vec<String>,
+    /// `typeof body.text === 'string' ? body.text : ''` — coerced, not typed.
+    text: Option<serde_json::Value>,
+    /// `imageList()` — a non-array `images` is ignored, not rejected.
+    images: Option<serde_json::Value>,
     /// `imageList()` in the TypeScript merges a lone `image` into `images`.
-    #[serde(default)]
-    image: Option<String>,
-    /// `pressEnter = text.length > 0` in the shell — bare image drops staged
-    /// the tokens without submitting; with text they sent the line.
+    image: Option<serde_json::Value>,
+    /// `body.pressEnter !== false` at the route — bare image drops staged
+    /// the tokens then submitted the line; the apply's `text.length > 0`
+    /// fallback only met a payload that omitted the field.
     #[serde(rename = "pressEnter")]
-    press_enter: Option<bool>,
+    press_enter: Option<serde_json::Value>,
+    /// `body.confirmDelivery === true` — unlike the write route, attach
+    /// defaulted to unconfirmed delivery.
+    #[serde(rename = "confirmDelivery")]
+    confirm_delivery: Option<serde_json::Value>,
+    #[serde(rename = "deliveryTimeoutMs")]
+    delivery_timeout_ms: Option<serde_json::Value>,
     #[serde(rename = "agentId")]
     agent_id: Option<String>,
+    #[serde(rename = "baseVersion")]
+    base_version: Option<f64>,
+    #[serde(rename = "idempotencyKey")]
+    idempotency_key: Option<String>,
 }
 
 /// `POST /terminal/{id}/attach`: typed text plus file paths, imported into
@@ -2918,96 +3968,87 @@ async fn attach_terminal(
     authenticate(&headers, &state.token)?;
     let agent = agent_identity(&headers, &uri, request.agent_id.as_deref());
     check_rate_limit(&state, &headers, agent.as_deref())?;
-    let id = state
-        .manager
-        .resolve(&id, agent.as_deref())
-        .map_err(command_failure)?;
-    let sources: Vec<String> = {
-        let mut list: Vec<String> = request
-            .images
-            .iter()
-            .chain(request.image.iter())
-            .map(|s| s.trim().to_owned())
-            .filter(|s| !s.is_empty())
-            .collect();
-        list.dedup();
-        list
-    };
-    if sources.len() > 8 {
-        return Err(bad_request("At most 8 images per delivery".into()));
-    }
-    // `terminal.attach` required at least one image — text-only calls are
-    // writes and the shell sent them there.
-    if sources.is_empty() {
-        return Err(bad_request(
-            "terminal.attach requires at least one image".into(),
+    // `!/^[A-Za-z0-9_-]{1,128}$/.test(rawId)` — a malformed id 400s at the
+    // route before the journal opens.
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "invalid terminal id" })),
         ));
     }
-    let manager = state.manager.clone();
-    let text = request.text.clone();
-    let press_enter = request.press_enter.unwrap_or(!text.is_empty());
-    let delivery_id = id.clone();
-    let (receipt, images) = tokio::task::spawn_blocking(move || -> Result<_, String> {
-        deliver_with_images(&manager, &delivery_id, &text, &sources, press_enter)
-    })
-    .await
-    .map_err(|error| bad_request(format!("delivery task failed: {error}")))?
-    .map_err(bad_request)?;
-    // `submit('terminal.attach', …)` — same audit entry the TypeScript wrote.
-    let _ = commit_journal(
-        agent.as_deref().unwrap_or("api"),
-        "terminal.attach",
-        &format!("terminal:{id}"),
-        serde_json::json!({
-            "text": &request.text,
-            "images": images,
-            "pressEnter": press_enter,
-        }),
-    );
-    let mut response = serde_json::json!({
-        "ok": true, "id": id, "delivery": receipt,
+    // `submit(body, 'terminal.attach', terminal:{rawId}, {images: imageList(body),
+    // …})` — the apply resolved the id, required a non-empty image list, and
+    // ran the media-store import, so an empty list or a bad path leaves
+    // intent+abort.
+    let body = serde_json::json!({
+        "images": request.images,
+        "image": request.image,
     });
-    if !images.is_empty() {
-        response["images"] = serde_json::json!(images);
-        response["mode"] = serde_json::json!("path");
+    let sources = image_list(&body);
+    // `pressEnter: body.pressEnter !== false` — the dedicated route defaulted
+    // to submitting; `text.length > 0` was only the apply's fallback for a
+    // payload that omitted the field entirely.
+    let press_enter = json_not_false(request.press_enter.as_ref());
+    // `body.confirmDelivery === true` — the attach route's check was strict:
+    // only literal true confirmed, anything else typed unconfirmed.
+    let confirm_delivery = json_is_true(request.confirm_delivery.as_ref());
+    let text = request
+        .text
+        .as_ref()
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let actor = agent.clone().unwrap_or_else(|| "api".to_owned());
+    let state_for_work = state.clone();
+    let raw = id.clone();
+    let mut payload = serde_json::json!({
+        "text": text,
+        "images": sources,
+        "pressEnter": press_enter,
+        "confirmDelivery": confirm_delivery,
+    });
+    if let Some(ms) = request
+        .delivery_timeout_ms
+        .as_ref()
+        .and_then(serde_json::Value::as_f64)
+        .filter(|ms| ms.is_finite())
+    {
+        payload["deliveryTimeoutMs"] = serde_json::json!(ms);
     }
-    Ok(Json(response))
-}
-
-/// The delivery `tell` and `attach` share: import each image into the media
-/// store, type the path tokens followed by the text — or, with no images, a
-/// plain message write.
-fn deliver_with_images(
-    manager: &TerminalManager,
-    id: &str,
-    text: &str,
-    sources: &[String],
-    press_enter: bool,
-) -> Result<(DeliveryReceipt, Vec<String>), String> {
-    if sources.is_empty() {
-        let receipt = manager.write_text(id, text, press_enter)?;
-        return Ok((receipt, Vec::new()));
-    }
-    if !manager.snapshot(id)?.alive {
-        return Err("Terminal has exited".into());
-    }
-    let directory = slate_app::ipc::user_data_dir().join("media");
-    let images = sources
-        .iter()
-        .map(|source| {
-            slate_app::attachments::import_image(std::path::Path::new(source), &directory)
-                .map(|path| path.to_string_lossy().into_owned())
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut content = String::new();
-    for path in &images {
-        content.push_str(&slate_app::attachments::path_token(path)?);
-    }
-    content.push_str(&text.replace(['\r', '\n'], " "));
-    // This branch only runs when at least one image was attached, so the
-    // delivery must be submitted even when the accompanying text is blank.
-    let receipt = manager.write_text(id, &content, true)?;
-    Ok((receipt, images))
+    let payload_for_work = payload.clone();
+    let (entry, response) = submit_engine(
+        &state,
+        agent.as_deref().unwrap_or("api"),
+        request.base_version,
+        request.idempotency_key.clone(),
+        "terminal.attach",
+        &format!("terminal:{raw}"),
+        payload,
+        "POST /terminal/{id}/attach",
+        move || async move {
+            let state = state_for_work;
+            let actor = actor.clone();
+            let raw = raw.clone();
+            tokio::task::spawn_blocking(move || {
+                attach_apply(&state, &actor, &raw, &payload_for_work)
+            })
+            .await
+            .map_err(|error| {
+                axum_failure(bad_request(format!("delivery task failed: {error}")))
+            })?
+        },
+    )
+    .await?;
+    Ok(Json(envelope(
+        response,
+        entry.version.unwrap_or(0),
+        entry.seq,
+    )))
 }
 
 /// `GET /presence` — the one route answered without the control token, so a
@@ -3080,64 +4121,139 @@ async fn dispose_terminal(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     authenticate(&headers, &state.token)?;
     check_rate_limit(&state, &headers, None)?;
-    // DELETE carries `{agentId}` in its body when one exists; a bare
-    // `curl -XDELETE` sends none, and the route must not 400 over that.
-    let agent_id = serde_json::from_slice::<serde_json::Value>(&body)
-        .ok()
-        .and_then(|value| value.get("agentId")?.as_str().map(str::to_owned));
+    // DELETE carries `{agentId}`/`baseVersion`/`idempotencyKey` in its body
+    // when one exists; a bare `curl -XDELETE` sends none, and the route must
+    // not 400 over that.
+    let body_fields = serde_json::from_slice::<serde_json::Value>(&body).ok();
+    let field = |name: &str| {
+        body_fields
+            .as_ref()
+            .and_then(|value| value.get(name).cloned())
+    };
+    let agent_id = field("agentId")
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .or_else(|| {
+            headers
+                .get("x-agent-id")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        });
+    // `/^[A-Za-z0-9_-]{1,128}$/` — the route's id guard ran before the
+    // terminal check.
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(bad_request("invalid id".to_owned()));
+    }
     // `DELETE /widgets/:id`/`DELETE /terminal/:id` matched `terminals.has(id)`
-    // exactly in the shell — names and prefixes were never resolved here, so
-    // `DELETE /terminal/other` 404s instead of killing a neighbor.
+    // exactly in the shell — names and prefixes were never resolved here.
+    // A non-terminal id fell through to `widget.remove`, not a 404.
     let exists = state.manager.snapshot(&id).is_ok();
     if !exists {
-        return Err(not_found(format!("terminal \"{id}\" not found")));
+        let on_canvas = folded_canvas()
+            .map(|canvas| canvas.widgets.contains_key(&id))
+            .unwrap_or(false);
+        let widget_id = id.clone();
+        let (entry, data) = submit_engine(
+            &state,
+            agent_id.as_deref().unwrap_or("api"),
+            field("baseVersion").and_then(|value| value.as_f64()),
+            field("idempotencyKey").and_then(|value| value.as_str().map(str::to_owned)),
+            "widget.remove",
+            &format!("widget:{id}"),
+            serde_json::json!({}),
+            "DELETE /terminal/{id}",
+            move || async move {
+                // `removeWidget` threw not_found inside apply.
+                if !on_canvas {
+                    return Err(slate_app::http::Response::from_error(&CommandError::new(
+                        ErrorCode::NotFound,
+                        format!("widget {widget_id} not found"),
+                    )));
+                }
+                Ok(serde_json::json!({ "id": widget_id }))
+            },
+        )
+        .await?;
+        return Ok(Json(envelope(
+            data,
+            entry.version.unwrap_or(0),
+            entry.seq,
+        )));
     }
-    state.manager.dispose(&id).map_err(not_found)?;
-    // `submit('terminal.dispose', …)` — the journal records the kill before
-    // the fallout is cleaned up, as the TypeScript did.
-    let _ = commit_journal(
-        agent_id
-            .as_deref()
-            .or_else(|| headers.get("x-agent-id").and_then(|v| v.to_str().ok()))
-            .unwrap_or("api"),
+    // `submit(body, 'terminal.dispose', terminal:{id}, {})` — the apply ran
+    // `terminals.dispose`, `failTerminalDispatches`, and `requestWidgetRemoval`.
+    let dispose_id = id.clone();
+    let state_ref = &state;
+    let (entry, data) = submit_engine(
+        &state,
+        agent_id.as_deref().unwrap_or("api"),
+        field("baseVersion").and_then(|value| value.as_f64()),
+        field("idempotencyKey").and_then(|value| value.as_str().map(str::to_owned)),
         "terminal.dispose",
         &format!("terminal:{id}"),
         serde_json::json!({}),
-    );
-    // `failTerminalDispatches` — a running dispatch on a dead shell cannot
-    // report, so it settles as failed rather than hanging forever.
-    {
-        let mut store = lock_recover(&state.orchestration);
-        let live: Vec<String> = store
-            .list_dispatches(None, None, Some(&id))
-            .iter()
-            .filter(|dispatch| dispatch.state == "running")
-            .map(|dispatch| dispatch.id.clone())
-            .collect();
-        let mut touched = false;
-        for dispatch_id in live {
-            touched |= store
-                .settle_dispatch(&dispatch_id, "failed", None, now_millis() as i64)
-                .is_ok();
-        }
-        if touched {
-            let _ = persist_orchestration(&state.orchestration_file, &store);
-        }
-    }
-    // The `requestWidgetRemoval` half — only when the journal knows a widget
-    // by this id; an adopted-in-flight terminal may not have one yet.
+        "DELETE /terminal/{id}",
+        move || async move {
+            state_ref
+                .manager
+                .dispose(&dispose_id)
+                .map_err(|error| axum_failure(bad_request(error)))?;
+            // `failTerminalDispatches` — a running dispatch on a dead shell
+            // cannot report, so it settles as failed rather than hanging.
+            {
+                let mut store = lock_recover(&state_ref.orchestration);
+                let live: Vec<String> = store
+                    .list_dispatches(None, None, Some(&dispose_id))
+                    .iter()
+                    .filter(|dispatch| dispatch.state == "running")
+                    .map(|dispatch| dispatch.id.clone())
+                    .collect();
+                let mut touched = false;
+                for dispatch_id in live {
+                    touched |= store
+                        .settle_dispatch(&dispatch_id, "failed", None, now_millis() as i64)
+                        .is_ok();
+                }
+                if touched {
+                    let _ = persist_orchestration(&state_ref.orchestration_file, &store);
+                }
+            }
+            Ok(serde_json::json!({ "id": dispose_id }))
+        },
+    )
+    .await?;
+    // The `requestWidgetRemoval` half — the original's apply fired it at the
+    // renderer and its `widget.remove` landed whenever the window answered,
+    // after this command's commit. It goes through the same gates here; only
+    // when the journal knows a widget by this id — an adopted-in-flight
+    // terminal may not have one yet.
     if folded_canvas()
         .map(|canvas| canvas.widgets.contains_key(&id))
         .unwrap_or(false)
     {
-        let _ = commit_journal(
-            "api",
+        let widget_id = id.clone();
+        let _ = submit_engine(
+            &state,
+            agent_id.as_deref().unwrap_or("api"),
+            None,
+            None,
             "widget.remove",
             &format!("widget:{id}"),
             serde_json::json!({}),
-        );
+            "DELETE /terminal/{id}",
+            move || async move { Ok(serde_json::json!({ "id": widget_id })) },
+        )
+        .await;
     }
-    Ok(Json(serde_json::json!({"ok": true, "id": id})))
+    Ok(Json(envelope(
+        data,
+        entry.version.unwrap_or(0),
+        entry.seq,
+    )))
 }
 
 /// `slate canvas focus`: park a camera request for the view's next tick.
@@ -3321,12 +4437,12 @@ fn capture_screenshot(
             .resolve(name, None)
             .unwrap_or_else(|_| name.to_owned());
         let canvas =
-            folded_canvas().map_err(|error| format!("cannot read the canvas journal: {error}"))?;
+            folded_canvas().map_err(|error| format!("cannot read the workspace journal: {error}"))?;
         let widget = find_widget(&canvas, &resolved)
             .or_else(|_| find_widget(&canvas, name))
             .map_err(|_| {
                 if manager.snapshot(&resolved).is_ok() {
-                    format!("widget '{resolved}' is not on the canvas yet")
+                    format!("terminal '{resolved}' has no pane yet")
                 } else {
                     format!("no widget called '{name}'")
                 }
@@ -3522,7 +4638,9 @@ async fn handle_routed(
                 .unwrap_or_default();
             let mut env = EngineEnv {
                 manager: &state.manager,
-                locks: state.locks.as_ref(),
+                locks: state.locks,
+                idempotency: state.idempotency,
+                rate_limiter: state.flow_rate_limiter.as_ref(),
             };
             let mut deps = slate_app::http::RouteDeps {
                 orchestration: &mut store,
@@ -3600,6 +4718,8 @@ async fn handle_routed(
 struct EngineEnv<'a> {
     manager: &'a TerminalManager,
     locks: &'a Mutex<slate_app::locks::LockManager>,
+    idempotency: &'a Mutex<slate_app::idempotency::IdempotencyCache>,
+    rate_limiter: &'a Mutex<ActorRateLimiter>,
 }
 
 impl slate_app::http::RouteEnv for EngineEnv<'_> {
@@ -3655,8 +4775,12 @@ impl slate_app::http::RouteEnv for EngineEnv<'_> {
             .map_err(|_| CommandError::new(ErrorCode::NotFound, format!("no terminal \"{id}\"")))
     }
 
-    fn fresh_terminal_id(&mut self) -> String {
-        self.manager.fresh_terminal_id()
+    fn resolve_write_target(&mut self, requested: &str) -> Option<String> {
+        self.manager.resolve_write_target(requested)
+    }
+
+    fn next_terminal_id(&mut self, prefix: &str) -> String {
+        self.manager.next_terminal_id(prefix)
     }
 
     fn spawn_terminal(&mut self, id: &str, title: &str, cwd: &str) -> Result<(), String> {
@@ -3674,6 +4798,10 @@ impl slate_app::http::RouteEnv for EngineEnv<'_> {
         )?;
         self.manager.set_name(id, title);
         Ok(())
+    }
+
+    fn terminal_running(&mut self, id: &str) -> bool {
+        self.manager.is_running(id)
     }
 
     fn write_terminal(&mut self, id: &str, text: &str, press_enter: bool) -> Result<(), String> {
@@ -3707,6 +4835,44 @@ impl slate_app::http::RouteEnv for EngineEnv<'_> {
 
     fn socket_path(&self) -> Option<String> {
         self.manager.control_socket()
+    }
+
+    /// `versionOf(target)` — fold the on-disk journal to the version the
+    /// store registries would report, exactly as `flow.apply` read it before
+    /// checking `baseVersion`.
+    fn target_version(&mut self, target: &str) -> u64 {
+        let data_dir = slate_app::ipc::user_data_dir();
+        let entries = self
+            .journal()
+            .map(|log| log.entries().to_vec())
+            .unwrap_or_default();
+        slate_app::http::folded_target_version(&entries, &data_dir, target)
+    }
+
+    fn idempotency(
+        &mut self,
+    ) -> std::sync::MutexGuard<'_, slate_app::idempotency::IdempotencyCache> {
+        lock_recover(self.idempotency)
+    }
+
+    /// `rateLimiter.tryConsume(actorId)` — the same shared bucket and the
+    /// same 128-char key cap `check_rate_limit` applies at the axum layer.
+    fn rate_limit(&mut self, actor: &str, now: i64) -> bool {
+        // `isPrivileged = !actor || actor.type === 'user' | 'system'` — the
+        // flow limiter charged only registered actors, and the HTTP layer
+        // registered every validated agentId as 'agent'. The unnamed "api"
+        // caller was never in the table, so it never paid; internal actors
+        // never do either.
+        if matches!(actor, "api" | "user" | "assistant" | "system") {
+            return true;
+        }
+        let raw = actor.trim();
+        let key = raw
+            .char_indices()
+            .nth(128)
+            .map(|(index, _)| &raw[..index])
+            .unwrap_or(raw);
+        lock_recover(self.rate_limiter).try_consume(key, 1.0, now)
     }
 }
 
@@ -3767,16 +4933,18 @@ fn check_rate_limit(
     let header = headers
         .get("x-agent-id")
         .and_then(|value| value.to_str().ok());
-    let raw = hint
-        .filter(|value| !value.trim().is_empty())
-        .or(header)
-        .unwrap_or("api")
-        .trim();
-    let key = raw
+    // `rateLimitKey` — `agent:<id>` for a named caller, `anonymous` for one
+    // that declined to say, so a caller literally named "anonymous" cannot
+    // ride the shared bucket.
+    let key = match hint.filter(|value| !value.trim().is_empty()).or(header) {
+        Some(id) => format!("agent:{}", id.trim()),
+        None => "anonymous".to_owned(),
+    };
+    let key = key
         .char_indices()
         .nth(128)
-        .map(|(index, _)| &raw[..index])
-        .unwrap_or(raw);
+        .map(|(index, _)| &key[..index])
+        .unwrap_or(&key);
     let now = now_millis().min(i64::MAX as u128) as i64;
     if lock_recover(&state.rate_limiter).try_consume(key, 1.0, now) {
         Ok(())
@@ -3982,11 +5150,13 @@ mod tests {
 
     #[test]
     fn write_request_defaults_to_enter_and_accepts_camel_case() {
+        // `pressEnter !== false` — absent presses, literal false doesn't.
+        let presses = |r: &WriteRequest| r.press_enter != Some(json!(false));
         let defaulted: WriteRequest = serde_json::from_value(json!({"text": "run"})).unwrap();
-        assert!(defaulted.press_enter);
+        assert!(presses(&defaulted));
         let raw: WriteRequest =
             serde_json::from_value(json!({"text": "run", "pressEnter": false})).unwrap();
-        assert!(!raw.press_enter);
+        assert!(!presses(&raw));
     }
 
     fn output(id: &str, data: &str) -> TerminalEvent {
@@ -4120,6 +5290,10 @@ mod tests {
             camera_request: std::sync::Mutex::new(None),
             raise_requested: std::sync::Mutex::new(None),
             headless: std::sync::Mutex::new(false),
+            preferred: std::sync::Mutex::new(None),
+            spawn_order: std::sync::Mutex::new(Vec::new()),
+            banned: std::sync::Mutex::new(std::collections::VecDeque::new()),
+                id_counter: std::sync::atomic::AtomicU64::new(0),
         });
 
         let first = "a".repeat(MAX_PENDING_EVENT_BYTES / 2);
@@ -4174,6 +5348,10 @@ mod tests {
             camera_request: std::sync::Mutex::new(None),
             raise_requested: std::sync::Mutex::new(None),
             headless: std::sync::Mutex::new(false),
+            preferred: std::sync::Mutex::new(None),
+            spawn_order: std::sync::Mutex::new(Vec::new()),
+            banned: std::sync::Mutex::new(std::collections::VecDeque::new()),
+                id_counter: std::sync::atomic::AtomicU64::new(0),
         });
         super::push_event(
             &inner,
@@ -4515,7 +5693,7 @@ mod transport_tests {
         let created = request(
             &path,
             "POST",
-            "/orchestration/runs",
+            "/orchestration/runs?agentId=transport-test",
             "tok",
             Some(r#"{"objective":"ship it"}"#),
         );

@@ -42,6 +42,15 @@ impl Default for IdempotencyCache {
     }
 }
 
+/// `flow.idempotency` in the TypeScript — the process-wide answered-command
+/// cache. The HTTP layer and the GUI share it: a `slate` retry and a canvas
+/// submit with the same key replay the same recorded result.
+pub fn shared() -> &'static std::sync::Mutex<IdempotencyCache> {
+    static SHARED: std::sync::LazyLock<std::sync::Mutex<IdempotencyCache>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(IdempotencyCache::default()));
+    &SHARED
+}
+
 impl IdempotencyCache {
     pub fn new(max_entries: usize, ttl_ms: i64) -> Self {
         Self {

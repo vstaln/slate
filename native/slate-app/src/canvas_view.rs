@@ -1,9 +1,9 @@
-//! The infinite canvas — the actual Slate UI, replacing the tab-strip
-//! placeholder. Widgets live at world coordinates under a pannable/zoomable
-//! camera; everything mutates through the journal so a relaunch restores the
-//! layout. Geometry comes from `canvas.rs`, state reduction from
-//! `projection.rs`, colours from `theme.rs` — all ports of the Electron
-//! renderer's `canvasState.ts`/`canvasLayout.ts`/`tokens.ts`.
+//! The workspace shell — Slate's root UI. Widgets render as panes: one
+//! fills the work area under the pane strip, and the strip (or the sidebar,
+//! or Ctrl+Tab) switches between them. Everything still mutates through the
+//! journal so a relaunch restores the pane set. Widget state reduction comes
+//! from `projection.rs`, colours from `theme.rs` — both ports of the
+//! Electron renderer's `canvasState.ts`/`tokens.ts`.
 
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -14,10 +14,13 @@ use gpui::*;
 use serde_json::{json, Value};
 
 use crate::engine::{TerminalManager, TerminalSnapshot};
-use slate_app::canvas::{self, is_visible, zoom_at, Pos2, Vec2};
+use slate_app::canvas::{self, Pos2, Vec2};
 use slate_app::journal_log::JournalLog;
 use slate_app::projection::{self, CanvasState, Widget};
-use slate_app::terminal_screen::{KeyInput, KeyMods, MouseButton as TermMouseButton, MouseKind};
+use slate_app::terminal_screen::{
+    KeyInput, KeyMods, MouseButton as TermMouseButton, MouseKind, CELL_H, CELL_W,
+    FONT_FAMILY, FONT_PX,
+};
 use slate_app::theme;
 
 /// Widget sizes the Electron renderer defaulted to (`types.ts` WIDGET_DEFAULTS).
@@ -42,73 +45,6 @@ fn default_size(kind: &str) -> (f64, f64) {
     }
 }
 
-enum Drag {
-    /// Empty-space drag pans the camera by the pointer's screen delta.
-    Pan { last: Pos2 },
-    /// Header drag moves the widget in world space; `grab` is the offset of
-    /// the pointer inside the widget's own origin so the frame does not jump.
-    /// `press`/`moved` gate the gesture on the original's 3px threshold —
-    /// under it the press is a click and the widget stays put.
-    Widget {
-        id: String,
-        grab: Pos2,
-        press: Pos2,
-        moved: bool,
-    },
-    /// Edge/corner drag resizes the widget: `dir` uses n/s/e/w letters like
-    /// the Electron shell's RESIZE_HANDLES; `origin` is (x, y, w, h) at
-    /// gesture start and `anchor` the world point grabbed.
-    Resize {
-        id: String,
-        dir: &'static str,
-        origin: (f64, f64, f64, f64),
-        anchor: Pos2,
-    },
-    /// Draw-mode left-drag on empty canvas: world-space points collect in
-    /// `pending_stroke` and commit to `canvas.strokes` on release. `start`
-    /// is the screen point pressed at — under `DRAW_CLICK_THRESHOLD` of
-    /// travel the gesture is a click and draws nothing.
-    Stroke { start: Pos2, moved: bool },
-    /// Erase-mode press on empty canvas: every pointer position cuts the
-    /// strokes under it (eraseAt in useCanvas.ts — a click erases too, so
-    /// the down itself applies). `dirty` means strokes changed and the
-    /// array must be committed on release.
-    Erase { dirty: bool },
-    /// Select-tool drag on empty canvas: a screen-space marquee rect; on
-    /// release the topmost widget inside it comes to the front (the
-    /// shell's select tool — bringToFront of the top-z hit, not a
-    /// multi-select).
-    Select {
-        start: Pos2,
-        rect: Option<(Pos2, Pos2)>,
-    },
-}
-
-/// Resize cursors per direction, matching the Electron frame's handle map.
-fn resize_cursor(dir: &str) -> gpui::CursorStyle {
-    use gpui::CursorStyle as C;
-    match dir {
-        "n" | "s" => C::ResizeUpDown,
-        "e" | "w" => C::ResizeLeftRight,
-        "ne" | "sw" => C::ResizeUpRightDownLeft,
-        _ => C::ResizeUpLeftDownRight,
-    }
-}
-
-/// DRAW_CLICK_THRESHOLD_PX from canvasMetrics.ts: a draw-mode press that
-/// moves less than this many *screen* px is a click, not a stroke.
-const DRAW_CLICK_THRESHOLD: f32 = 4.0;
-
-/// types.ts STROKE_COLORS — the toolbar's swatch row, in order. New strokes
-/// take `STROKE_COLORS[self.stroke_color]`; the Electron default is [0].
-const STROKE_COLORS: [&str; 8] = [
-    "#ffffff", "#ff6b6b", "#ffa94d", "#ffd43b", "#69db7c", "#4dabf7", "#b197fc", "#f783ac",
-];
-
-/// eraseAt's screen-space radius (`eraseAt(point, radius = 14)`, already
-/// under the 28px clamp): the hit distance is `ERASE_RADIUS_PX / zoom` in
-/// world units.
-const ERASE_RADIUS_PX: f32 = 14.0;
 
 /// The shell's `isTerminal`: a widget with no kind is a terminal, not an
 /// "unknown widget" — legacy journal entries rely on it.
@@ -116,15 +52,11 @@ fn is_terminal_kind(kind: Option<&str>) -> bool {
     matches!(kind, None | Some("terminal"))
 }
 
-/// projection::MAX_POINTS_PER_STROKE — longer strokes are truncated here
-/// rather than written and then dropped by the sanitizer on replay.
-const MAX_STROKE_POINTS: usize = 10_000;
 
 /// StartupWordmark's fixed beats, in seconds since the first frame: the
 /// particle timeline runs to t=8, and the startup screen itself fades out
 /// over the following ~0.9s (`is-ready`'s 200ms delay + 900ms transition).
 const SPLASH_PARTICLES_END: f32 = 8.0;
-const SPLASH_DONE: f32 = 9.2;
 
 /// `smooth()` from StartupWordmark.tsx — smoothstep on a clamped [0,1].
 fn smooth01(value: f32) -> f32 {
@@ -285,26 +217,6 @@ fn kbd_hint(chip: &'static str, suffix: &'static str, tip: &'static str) -> Stat
         .child(suffix)
 }
 
-/// The WorkView tablist's value — the shell's `activeView`: which pane
-/// fills `<main>` under the title bar. Canvas keeps its full world; the
-/// other two render their own pane over it instead.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum ActiveView {
-    Canvas,
-    Code,
-    Overview,
-}
-
-impl ActiveView {
-    /// The tablist's `data-view`/`titlebar_command` payload string.
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Canvas => "canvas",
-            Self::Code => "code",
-            Self::Overview => "overview",
-        }
-    }
-}
 
 pub struct CanvasView {
     pub(crate) focus: FocusHandle,
@@ -327,35 +239,16 @@ pub struct CanvasView {
     /// Terminal awaiting the "Close terminal? The running process will be
     /// terminated." answer — the shell's `confirm()` dialog.
     pending_close: Option<String>,
-    drag: Option<Drag>,
     /// (cols, rows) last pushed to each PTY — resized only on change.
     term_cells: HashMap<String, (u16, u16)>,
     /// Debounce slot for PTY resizes — the shell's 150ms fit timer.
     /// `(target size, last change)` per terminal; applied once settled.
     term_resize_pending: HashMap<String, ((u16, u16), Instant)>,
-    /// Camera commits are journal writes; drags and wheel zoom would flood
-    /// the file, so they are flushed at most this often and on mouse-up.
-    camera_dirty_at: Option<Instant>,
     /// Screen position of the right-click spawn menu, when open.
     menu: Option<Pos2>,
     /// Context-menu keyboard cursor — the shell's arrow/Enter nav. Resets
     /// to 0 each time the menu opens.
     menu_sel: usize,
-    /// `d` toggles draw mode: empty-canvas drags draw strokes instead of
-    /// panning, and the cursor goes crosshair.
-    draw_mode: bool,
-    /// `e` toggles erase mode — the shell's `tool === 'erase'`. Mutually
-    /// exclusive with draw mode, the way `tool` was one value; empty-canvas
-    /// presses and drags cut strokes under the pointer.
-    erase_mode: bool,
-    /// `s` toggles the select tool — the toolbar's Select button: drags on
-    /// empty canvas draw a marquee instead of panning. Mutually exclusive
-    /// with draw/erase, the way `tool` was one value.
-    select_mode: bool,
-    /// World-space snap guides while a widget drag is near an alignment —
-    /// the shell's snap-guide-x/y accent lines. `.0` is the vertical line's
-    /// world x, `.1` the horizontal line's world y; None between drags.
-    snap_guides: Option<(Option<f64>, Option<f64>)>,
     /// Screen-space pointer position while an OS file drag hovers the
     /// canvas — `on_drag_move::<ExternalPaths>` keeps it fresh so `on_drop`
     /// knows where the files landed (the shell's `M(clientX, clientY)`).
@@ -377,12 +270,6 @@ pub struct CanvasView {
     /// Set while a `canvas.restore` or an arrange batch commits so the
     /// history push stays a single entry per user action.
     suppress_history: bool,
-    /// Index into STROKE_COLORS — the shell's `strokeColor` state. `c` in
-    /// draw mode cycles it; new strokes take it.
-    stroke_color: usize,
-    /// World-space points of the stroke currently being drawn; committed
-    /// to `canvas.strokes` on mouse-up.
-    pending_stroke: Vec<Pos2>,
     /// Widget id mid-title-rename plus the edit buffer — the shell's
     /// double-click-on-title input. Keystrokes route here while it is set.
     renaming: Option<String>,
@@ -404,8 +291,6 @@ pub struct CanvasView {
     name_copied_at: Option<(String, Instant)>,
     /// The `/` command bar's text buffer while it is open.
     command_bar: Option<String>,
-    /// The toolbar's `⋯` overflow menu — workspace/target/zoom/strokes.
-    toolbar_overflow: bool,
     /// The shell's suggestion-highlight index — ↑/↓ in command mode and
     /// the listbox's `aria-selected` row. Resets when the query changes.
     command_suggestion: usize,
@@ -420,9 +305,6 @@ pub struct CanvasView {
     /// refresh tick once each PTY has had a moment to reach its read loop
     /// — the native queueInitialCommand.
     pending_commands: Vec<PendingCommand>,
-    /// Two /proc/stat samples a tick apart make a CPU% for the status bar.
-    cpu_last: Option<(u64, u64)>,
-    cpu_percent: Option<u32>,
     /// Mtime of the journal last folded into `canvas`, so the tick can spot
     /// a CLI writer's commit and refold — the original's `canvas:changed`
     /// push without a watcher.
@@ -439,6 +321,15 @@ pub struct CanvasView {
     viewport: Vec2,
     /// The shell's `orcspace-agent-select/launched-agent` localStorage keys.
     agent_picks: slate_app::agent_picks::AgentPicks,
+    /// The launcher's worktree toggle — `launch_code_session` spends it
+    /// on `git worktree add` when the workspace is a repo.
+    code_worktree: bool,
+    /// herdr's pane classifier output per terminal — refreshed on the
+    /// snapshot tick (`refresh_agent_states`), the card dots' source.
+    agent_states: HashMap<String, slate_app::agent_state::AgentState>,
+    /// Throttle for the classifier — a busy terminal repaints far faster
+    /// than tail-pattern rules need to see it.
+    agent_scan_at: Instant,
     /// The mount-effect guard (`H.current`): each restored terminal
     /// relaunches its recorded agent once per app run.
     agent_relaunched: HashSet<String>,
@@ -471,12 +362,22 @@ pub struct CanvasView {
     git_polling: bool,
     /// Startup splash clock — the Electron `StartupWordmark` overlay.
     /// `Some` holds the launch instant while the intro plays; `None` once
-    /// it finishes (~9.2s) or the first deliberate press dismisses it.
+    /// it finishes or the first deliberate press dismisses it.
     splash_started: Option<Instant>,
     /// The particle field — react-bits `cloudPoint`s generated once the
     /// viewport size is known (the count scales with it). `Rc` so the
     /// paint closure can share it without a per-frame clone.
     splash_points: Rc<Vec<SplashPoint>>,
+    /// Boot work the splash actually waits on: ids of every terminal PTY
+    /// respawned from the journal, dropped as each shows its first screen
+    /// (or exits). `ready` does not flip while this is non-empty — the
+    /// "Preparing your workspace" caption measures real loading instead
+    /// of running on a fixed clock.
+    splash_pending: HashSet<String>,
+    /// When boot work and the intro animation both finished — the ready
+    /// latch. The screen's fade-out runs off this instant, not the launch
+    /// clock, so slow PTYs hold the loader instead of lying about it.
+    splash_ready_at: Option<Instant>,
     /// The wallpaper as rendered, keyed `(data-url hash, backgroundBlur)`
     /// — the blur runs off-thread (`blur_wallpaper`) because gpui has no
     /// image filter; the unblurred decode paints until it lands.
@@ -490,12 +391,27 @@ pub struct CanvasView {
     /// shell stored a managed *file path* there (not a data URL), so the
     /// render read below encodes it once and memoizes on the raw string.
     wallpaper_resolved: Option<(String, String)>,
-    /// `activeView` — the title bar's Canvas | Code | Overview tablist.
-    active_view: ActiveView,
     /// `codeSessions` — the Code view's cards. Each owns a manager PTY
     /// (`terminal_id`) that has no canvas widget; the pane paints it from
     /// `snapshots` like a terminal widget body does.
     code_sessions: Vec<crate::views_code::CodeSession>,
+    /// `ResumeAgents` — conversations scanned for `workspace_dir`, newest
+    /// first. See `views_code::CodeState::conversations`.
+    code_conversations: Vec<slate_app::code_resume::AgentConversation>,
+    /// The dir the last scan answered for — `None` arms a fresh scan the
+    /// next time the empty code grid renders.
+    code_resume_dir: Option<String>,
+    code_resume_loading: bool,
+    code_resume_expanded: bool,
+    /// `conversation_key`s — ticked rows / waved-away rows.
+    code_resume_selected: std::collections::HashSet<String>,
+    code_resume_dismissed: std::collections::HashSet<String>,
+    /// `selectedAgentIds` / `agentCounts` / `activeAgentId` — the
+    /// multi-select fan-out state shared by the empty grid and the
+    /// launcher panel.
+    code_selected_agents: Vec<String>,
+    code_agent_counts: std::collections::HashMap<String, u32>,
+    code_active_agent: Option<String>,
     /// `focusedSessionId` — the card with the accent hairline; its
     /// terminal_id also lands in `active` so the PTY gets the keyboard.
     code_focused: Option<String>,
@@ -861,7 +777,7 @@ fn toolbar_suggestions(buffer: &str, command_prefix: &str) -> Vec<(String, Strin
         None => first.to_lowercase(),
     };
     let squashed = query.replace('-', "");
-    WIDGET_CATALOG
+    let mut out: Vec<(String, String, String)> = WIDGET_CATALOG
         .iter()
         .filter(|(kind, _, _)| renderable(kind))
         .filter(|(kind, _, _)| {
@@ -869,25 +785,39 @@ fn toolbar_suggestions(buffer: &str, command_prefix: &str) -> Vec<(String, Strin
                 || kind.replace('-', "").starts_with(squashed.as_str())
         })
         .map(|&(kind, label, hint)| (kind.to_owned(), label.to_owned(), hint.to_owned()))
+        .collect();
+    // `/agent` is a verb, not a widget — it persists a custom launcher
+    // chip — but it still completes like one in the listbox.
+    if "agent".starts_with(query.as_str()) || "agent".starts_with(squashed.as_str()) {
+        out.push((
+            "agent".to_owned(),
+            "Agent".to_owned(),
+            "Save a custom CLI to the launcher".to_owned(),
+        ));
+    }
+    out
+}
+
+/// WidgetFrame.tsx AGENTS — the launch picker types the command into the
+/// terminal and presses Enter. The pick list is dynamic like the launcher's:
+/// the built-in `gray` plus the user's `/agent` customs, resolving to
+/// `(id, label, command)` rows. The id persists as
+/// `orcspace-launched-agent:<id>` so the pick re-launches.
+fn agent_launchers(
+    prefs: &slate_app::ui_preferences::UiPreferences,
+) -> Vec<(String, String, String)> {
+    crate::views_code::CODE_AGENTS
+        .iter()
+        .map(|a| (a.id.to_owned(), a.label.to_owned(), a.command.to_owned()))
+        .chain(
+            prefs
+                .custom_agents
+                .iter()
+                .map(|a| (a.id.clone(), a.label.clone(), a.command.clone())),
+        )
         .collect()
 }
 
-/// WidgetFrame.tsx AGENTS: (label, command) — the launch picker types the
-/// command into the terminal and presses Enter. Icons don't port; the name
-/// column carries the picker. The first column is the shell's agent id —
-/// persisted as `orcspace-launched-agent:<id>` so the pick re-launches.
-const AGENT_LAUNCHERS: [(&str, &str, &str); 8] = [
-    ("gray", "Gray", "gray"),
-    ("antigravity", "Antigravity", "agy"),
-    ("claude", "Claude", "claude"),
-    ("codex", "Codex", "codex"),
-    ("opencode", "OpenCode", "opencode"),
-    ("grok", "Grok Build", "grok"),
-    ("kimi", "Kimi Code", "kimi"),
-    ("cursor", "Cursor Agent", "cursor-agent"),
-];
-
-const CAMERA_COMMIT_EVERY: Duration = Duration::from_millis(500);
 
 fn journal_path() -> std::path::PathBuf {
     slate_app::ipc::user_data_dir().join("command-journal.ndjson")
@@ -903,6 +833,278 @@ fn load_orchestration_store() -> slate_app::orchestration::OrchestrationStore {
             _ => slate_app::orchestration::OrchestrationStore::new(),
         },
         Err(_) => slate_app::orchestration::OrchestrationStore::new(),
+    }
+}
+
+/// The GUI's `RouteEnv` — the same live objects `EngineEnv` hands the HTTP
+/// router, borrowed from the view instead of the server. `rate_limit`
+/// always answers `true`: `isPrivileged` in the TypeScript skipped the flow
+/// limiter for actors outside the agent registry (`user`, `system`,
+/// `arrange`), and the canvas never submits under a registered agent id.
+/// Locks and `baseVersion` still gate, so a `user` drag and an `api`
+/// command contend for `widget:x` on the same terms the renderer did.
+struct GuiEnv<'a> {
+    manager: &'a TerminalManager,
+}
+
+fn lock_recover<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The apply's `throw new CommandError(code, message)` — the abort entry
+/// carries the code, the notice carries the message.
+fn command_failed(
+    code: slate_app::command::ErrorCode,
+    message: impl Into<String>,
+) -> slate_app::http::Response {
+    slate_app::http::Response::from_error(&slate_app::command::CommandError::new(
+        code,
+        message.into(),
+    ))
+}
+
+/// The submit chain without a `CanvasView` — the intent→work→commit halves
+/// `commit_work` wraps, callable where `self` cannot reach (the boot
+/// relaunch runs inside `new`, the mtime watcher inside its closure).
+fn gui_submit(
+    manager: &TerminalManager,
+    workspace_dir: Option<&str>,
+    actor: &str,
+    base_version: Option<f64>,
+    entry_type: &str,
+    target: &str,
+    payload: Value,
+    work: impl FnOnce() -> Result<Value, slate_app::http::Response>,
+) -> Result<
+    (slate_app::journal::JournalEntry, Value),
+    slate_app::http::Response,
+> {
+    let mut env = GuiEnv { manager };
+    let mut orchestration = load_orchestration_store();
+    let mut deps = slate_app::http::RouteDeps {
+        orchestration: &mut orchestration,
+        app_version: env!("CARGO_PKG_VERSION"),
+        workspace_dir,
+        now: SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_millis() as i64),
+        env: Some(&mut env),
+    };
+    match slate_app::http::submit_begin(
+        &mut deps,
+        actor,
+        base_version,
+        None,
+        entry_type,
+        target,
+        payload,
+        "canvas edit",
+    ) {
+        Ok(slate_app::http::Submit::Run(pending)) => {
+            let outcome = work();
+            // The commit *is* the write — the fold applies it like the
+            // handler's store mutation did.
+            slate_app::http::submit_finish(&mut deps, pending, outcome, "canvas edit")
+        }
+        Ok(slate_app::http::Submit::Replay(result)) => result,
+        Err(response) => Err(response),
+    }
+}
+
+/// `terminal:create` IPC — the widget-mount spawn went through
+/// `send('terminal.spawn', terminal:{id})`, so a mount journals like any
+/// other command: the intent, then the PTY work, then the commit. The
+/// answer is `spawn_with_options`' `live` flag — `true` means the shell
+/// was already running and this adopted it.
+fn mount_spawn(
+    manager: &TerminalManager,
+    workspace_dir: Option<&str>,
+    id: &str,
+    cols: u16,
+    rows: u16,
+    cwd: Option<String>,
+    title: Option<&str>,
+) -> Result<bool, String> {
+    let mut payload = json!({ "cols": cols, "rows": rows });
+    if let Some(cwd) = &cwd {
+        payload["cwd"] = json!(cwd);
+    }
+    if let Some(title) = title {
+        payload["title"] = json!(title);
+    }
+    let mut live = None;
+    let result = gui_submit(
+        manager,
+        workspace_dir,
+        "user",
+        None,
+        "terminal.spawn",
+        &format!("terminal:{id}"),
+        payload,
+        || {
+            let adopted = manager.spawn_with_options(
+                id.to_owned(),
+                cols,
+                rows,
+                cwd,
+                slate_app::platform::shell_command(),
+                HashMap::new(),
+            )
+            .map_err(|error| command_failed(slate_app::command::ErrorCode::Failed, error))?;
+            live = Some(adopted);
+            // The apply answered `{ok, live, scrollback}` — `fullOutput` for
+            // a reconnect, the retained scrollback otherwise.
+            let scrollback = manager
+                .snapshot(id)
+                .map(|snapshot| snapshot.output)
+                .unwrap_or_default();
+            Ok(json!({ "ok": true, "live": adopted, "scrollback": scrollback }))
+        },
+    );
+    match result {
+        Ok(_) => live.ok_or_else(|| "terminal.spawn committed no spawn".to_owned()),
+        Err(response) => Err(response
+            .body
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("terminal.spawn failed")
+            .to_owned()),
+    }
+}
+
+impl slate_app::http::RouteEnv for GuiEnv<'_> {
+    fn journal(&mut self) -> Result<JournalLog, String> {
+        JournalLog::open(journal_path())
+    }
+
+    fn terminals(&mut self) -> Vec<Value> {
+        let names = self.manager.names();
+        self.manager
+            .snapshots()
+            .iter()
+            .map(|snapshot| {
+                let name = names.get(&snapshot.id).cloned();
+                json!({
+                    "id": snapshot.id,
+                    "name": name,
+                    "title": name,
+                    "kind": "terminal",
+                    "alive": snapshot.alive,
+                    "cwd": snapshot.cwd,
+                    "lastActiveAt": snapshot.last_data_at,
+                })
+            })
+            .collect()
+    }
+
+    fn terminal_exists(&mut self, id: &str) -> bool {
+        self.manager.snapshot(id).is_ok()
+    }
+
+    fn dispose_terminal(&mut self, id: &str) -> Result<(), String> {
+        self.manager.dispose(id)
+    }
+
+    fn set_terminal_title(&mut self, id: &str, title: &str) {
+        self.manager.set_name(id, title);
+    }
+
+    fn resolve_terminal(
+        &mut self,
+        target: &str,
+        caller: Option<&str>,
+    ) -> Result<String, slate_app::command::CommandError> {
+        let id = self.manager.resolve(target, caller)?;
+        self.manager
+            .snapshot(&id)
+            .map(|_| id.clone())
+            .map_err(|_| {
+                slate_app::command::CommandError::new(
+                    slate_app::command::ErrorCode::NotFound,
+                    format!("no terminal \"{id}\""),
+                )
+            })
+    }
+
+    fn resolve_write_target(&mut self, requested: &str) -> Option<String> {
+        self.manager.resolve_write_target(requested)
+    }
+
+    fn next_terminal_id(&mut self, prefix: &str) -> String {
+        self.manager.next_terminal_id(prefix)
+    }
+
+    fn spawn_terminal(&mut self, id: &str, title: &str, cwd: &str) -> Result<(), String> {
+        self.manager.spawn_with_options(
+            id.to_owned(),
+            120,
+            32,
+            if cwd.is_empty() {
+                None
+            } else {
+                Some(cwd.to_owned())
+            },
+            slate_app::platform::shell_command(),
+            std::collections::HashMap::new(),
+        )?;
+        self.manager.set_name(id, title);
+        Ok(())
+    }
+
+    fn terminal_running(&mut self, id: &str) -> bool {
+        self.manager.is_running(id)
+    }
+
+    fn write_terminal(&mut self, id: &str, text: &str, press_enter: bool) -> Result<(), String> {
+        self.manager.write_text(id, text, press_enter).map(|_| ())
+    }
+
+    fn tail_terminal(&mut self, id: &str, max: usize) -> Option<String> {
+        let output = self
+            .manager
+            .read_terminal_output(id, true, false, None, None)
+            .ok()?;
+        Some(
+            output
+                .chars()
+                .rev()
+                .take(max)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect(),
+        )
+    }
+
+    fn locks(&self) -> std::sync::MutexGuard<'_, slate_app::locks::LockManager> {
+        lock_recover(slate_app::locks::shared())
+    }
+
+    fn data_dir(&self) -> std::path::PathBuf {
+        slate_app::ipc::user_data_dir()
+    }
+
+    fn socket_path(&self) -> Option<String> {
+        self.manager.control_socket()
+    }
+
+    fn target_version(&mut self, target: &str) -> u64 {
+        let data_dir = slate_app::ipc::user_data_dir();
+        let entries = self
+            .journal()
+            .map(|log| log.entries().to_vec())
+            .unwrap_or_default();
+        slate_app::http::folded_target_version(&entries, &data_dir, target)
+    }
+
+    fn idempotency(
+        &mut self,
+    ) -> std::sync::MutexGuard<'_, slate_app::idempotency::IdempotencyCache> {
+        lock_recover(slate_app::idempotency::shared())
+    }
+
+    fn rate_limit(&mut self, _actor: &str, _now: i64) -> bool {
+        true
     }
 }
 
@@ -933,42 +1135,49 @@ impl CanvasView {
 
         let agent_picks = slate_app::agent_picks::AgentPicks::load();
         let settings = slate_app::settings::Settings::load();
+        let prefs = slate_app::ui_preferences::UiPreferences::load_or_default();
         // `targetTerminalId` — the command bar's remembered target.
         let command_target = settings
             .extra("targetTerminalId")
             .and_then(Value::as_str)
             .map(str::to_owned);
         let mut relaunch: Vec<PendingCommand> = Vec::new();
+        let mut boot_pending: HashSet<String> = HashSet::new();
         for widget in canvas.widgets.values() {
             if is_terminal_kind(widget.kind.as_deref()) {
                 let (cols, rows) = terminal_cells(widget.w, widget.h, canvas.camera.zoom);
-                if let Ok(live) = manager.spawn_with_options(
-                    widget.id.clone(),
+                // The Electron widget mount went through `terminal:create`
+                // → `send('terminal.spawn')`, so a boot relaunch journals
+                // intent+commit like the mount did.
+                if let Ok(live) = mount_spawn(
+                    &manager,
+                    workspace_dir.as_deref(),
+                    &widget.id,
                     cols,
                     rows,
                     None,
-                    slate_app::platform::shell_command(),
-                    HashMap::new(),
+                    Some(&widget.title),
                 ) {
+                    boot_pending.insert(widget.id.clone());
                     if let Some(agent_id) = agent_picks.launched.get(&widget.id) {
-                        if let Some((_, _, command)) = AGENT_LAUNCHERS
+                        if let Some((_, _, command)) = agent_launchers(&prefs)
                             .iter()
-                            .find(|(id, _, _)| *id == agent_id.as_str())
+                            .find(|(id, _, _)| *id == *agent_id)
                         {
                             relaunch.push(PendingCommand {
                                 terminal_id: widget.id.clone(),
-                                command: (*command).to_owned(),
+                                command: command.clone(),
                                 attempts: 0,
                                 watch: true,
                                 live,
                             });
                         }
                     }
+
                 }
             }
         }
 
-        let prefs = slate_app::ui_preferences::UiPreferences::load_or_default();
         // `orcspace-code-layout-mode` — the picker choice persists
         // across restarts through `native-ui.json`.
         let code_layout = prefs.layout;
@@ -982,27 +1191,17 @@ impl CanvasView {
             active: None,
             frame_focus: None,
             pending_close: None,
-            drag: None,
             selection_drag: None,
             term_cells: HashMap::new(),
             term_resize_pending: HashMap::new(),
-            camera_dirty_at: None,
             menu: None,
             menu_sel: 0,
-            // The shell's `useState<CanvasTool>('select')` — select is the
-            // resting tool; every-false is the explicit `pan` tool.
-            draw_mode: false,
-            erase_mode: false,
-            select_mode: true,
-            snap_guides: None,
             drop_point: None,
             cascade_count: 0,
             notice: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             suppress_history: false,
-            stroke_color: 0,
-            pending_stroke: Vec::new(),
             renaming: None,
             rename_buffer: String::new(),
             browser_editing: None,
@@ -1010,7 +1209,6 @@ impl CanvasView {
             agent_menu: None,
             name_copied_at: None,
             command_bar: None,
-            toolbar_overflow: false,
             command_suggestion: 0,
             command_message: false,
             command_target,
@@ -1018,10 +1216,11 @@ impl CanvasView {
             journal_mtime: None,
             focus_sent: None,
             last_state_save: Instant::now(),
-            cpu_last: None,
-            cpu_percent: None,
             viewport: Vec2::new(0.0, 0.0),
             agent_picks,
+            code_worktree: false,
+            agent_states: HashMap::new(),
+            agent_scan_at: Instant::now(),
             agent_relaunched: HashSet::new(),
             startup_watch: HashMap::new(),
             startup_notice: HashMap::new(),
@@ -1033,14 +1232,33 @@ impl CanvasView {
             git_chip: Default::default(),
             git_next_poll: Instant::now(),
             git_polling: false,
-            splash_started: Some(Instant::now()),
+            // The intro only runs when there's genuinely something
+            // loading — respawned PTYs still coming up. An empty boot
+            // (new workspace, nothing to restore) skips the screen
+            // entirely; it was never a welcome, it just always pretended
+            // there was work to do.
+            splash_started: if boot_pending.is_empty() {
+                None
+            } else {
+                Some(Instant::now())
+            },
             splash_points: Rc::new(Vec::new()),
+            splash_pending: boot_pending,
+            splash_ready_at: None,
             wallpaper_cache: None,
             wallpaper_raw: None,
             wallpaper_blurring: None,
             wallpaper_resolved: None,
-            active_view: ActiveView::Canvas,
             code_sessions: Vec::new(),
+            code_conversations: Vec::new(),
+            code_resume_dir: None,
+            code_resume_loading: false,
+            code_resume_expanded: false,
+            code_resume_selected: std::collections::HashSet::new(),
+            code_resume_dismissed: std::collections::HashSet::new(),
+            code_selected_agents: Vec::new(),
+            code_agent_counts: std::collections::HashMap::new(),
+            code_active_agent: None,
             code_focused: None,
             code_launcher_open: false,
             code_layout,
@@ -1064,6 +1282,7 @@ impl CanvasView {
             notes_buffer: String::new(),
         };
         view.snapshots = view.manager.snapshots();
+        view.refresh_agent_states();
         for pending in relaunch {
             view.agent_relaunched.insert(pending.terminal_id.clone());
             view.pending_commands.push(pending);
@@ -1080,6 +1299,7 @@ impl CanvasView {
                 let alive = this
                     .update(cx, |view, cx| {
                         view.snapshots = view.manager.snapshots();
+        view.refresh_agent_states();
                         // Recovery timers — the child-exit confirmation and
                         // the Ctrl-C/D corpse check (the shell's
                         // `modeRecoveryTimer`/`interruptRecoveryTimer`).
@@ -1130,31 +1350,14 @@ impl CanvasView {
                             }
                         }
                         // `slate canvas focus` posted through the socket lands
-                        // here: jump to the widget or the given camera state.
+                        // here: panes have no camera to move, so a widget id
+                        // just raises and activates that pane.
                         if let Some(request) = view.manager.take_camera_request() {
-                            if let Some(zoom) = request.zoom {
-                                view.canvas.camera.zoom =
-                                    zoom.clamp(canvas::MIN_ZOOM as f64, canvas::MAX_ZOOM as f64);
-                            }
-                            let zoom = view.canvas.camera.zoom;
                             if let Some(id) = request.widget_id.as_deref() {
-                                if let Some(widget) = view.canvas.widgets.get(id) {
-                                    let cx_w = widget.x + widget.w / 2.0;
-                                    let cy_w = widget.y + widget.h / 2.0;
-                                    view.canvas.camera.x =
-                                        view.viewport.x as f64 / 2.0 - cx_w * zoom;
-                                    view.canvas.camera.y =
-                                        view.viewport.y as f64 / 2.0 - cy_w * zoom;
-                                    view.active = Some(widget.id.clone());
+                                if view.canvas.widgets.contains_key(id) {
+                                    view.active = Some(id.to_owned());
                                 }
                             }
-                            if let Some(x) = request.x {
-                                view.canvas.camera.x = x;
-                            }
-                            if let Some(y) = request.y {
-                                view.canvas.camera.y = y;
-                            }
-                            view.commit_camera();
                         }
                         // Second-instance raise: a `slate` invocation asked
                         // the running window to come forward. Same mailbox
@@ -1187,93 +1390,85 @@ impl CanvasView {
                             }
                             view.focus_sent = focus_now;
                         }
-                        // The CLI is a second journal writer (`canvas move`,
+                        // The CLI is a second journal writer (`slate move`,
                         // `plan create`): when the file changes under us,
-                        // refold so the canvas matches. Skipped mid-drag — the
-                        // uncommitted pointer position would get stomped.
-                        if view.drag.is_none() {
-                            let mtime = std::fs::metadata(journal_path())
-                                .and_then(|m| m.modified())
-                                .ok();
-                            if mtime.is_some() && mtime != view.journal_mtime {
-                                let first = view.journal_mtime.is_none();
-                                view.journal_mtime = mtime;
-                                if !first {
-                                    if let Ok(log) = JournalLog::open(journal_path()) {
-                                        let prior: HashSet<String> =
-                                            view.canvas.widgets.keys().cloned().collect();
-                                        // The shell merged deltas into live
-                                        // state — a camera panned but not yet
-                                        // committed (trailing write pending)
-                                        // survives the refold.
-                                        let pending_camera = view
-                                            .camera_dirty_at
-                                            .is_some()
-                                            .then(|| view.canvas.camera.clone());
-                                        view.canvas = slate_app::canvas_store::load_with_tail(
+                        // refold so the panes match.
+                        let mtime = std::fs::metadata(journal_path())
+                            .and_then(|m| m.modified())
+                            .ok();
+                        if mtime.is_some() && mtime != view.journal_mtime {
+                            let first = view.journal_mtime.is_none();
+                            view.journal_mtime = mtime;
+                            if !first {
+                                if let Ok(log) = JournalLog::open(journal_path()) {
+                                    let prior: HashSet<String> =
+                                        view.canvas.widgets.keys().cloned().collect();
+                                    // The shell merged deltas into live
+                                    // state; the refold simply replaces it.
+                                    view.canvas = slate_app::canvas_store::load_with_tail(
+                                        view.workspace_dir.as_deref(),
+                                        &log,
+                                    )
+                                    .0;
+                                    view.journal = Some(log);
+                                    // Widget-mount spawn: a terminal
+                                    // widget that just appeared via the
+                                    // journal gets a PTY (the shell's
+                                    // xterm mount did terminal.create).
+                                    // Only NEW ids — an existing widget
+                                    // losing its snapshot is a dispose,
+                                    // and the stale check below closes it.
+                                    let newcomers: Vec<(String, String, f64, f64)> = view
+                                        .canvas
+                                        .widgets
+                                        .values()
+                                        .filter(|w| {
+                                            !prior.contains(&w.id)
+                                                && is_terminal_kind(w.kind.as_deref())
+                                                && view.manager.snapshot(&w.id).is_err()
+                                        })
+                                        .map(|w| {
+                                            (w.id.clone(), w.title.clone(), w.w, w.h)
+                                        })
+                                        .collect();
+                                    for (id, title, w, h) in newcomers {
+                                        let (cols, rows) =
+                                            terminal_cells(w, h, view.canvas.camera.zoom);
+                                        // The mount journaled
+                                        // `terminal.spawn` — same
+                                        // intent+commit as the IPC.
+                                        if let Ok(live) = mount_spawn(
+                                            &view.manager,
                                             view.workspace_dir.as_deref(),
-                                            &log,
-                                        )
-                                        .0;
-                                        if let Some(camera) = pending_camera {
-                                            view.canvas.camera = camera;
+                                            &id,
+                                            cols,
+                                            rows,
+                                            None,
+                                            Some(&title),
+                                        ) {
+                                            view.relaunch_agent(&id, live);
                                         }
-                                        view.journal = Some(log);
-                                        // Widget-mount spawn: a terminal
-                                        // widget that just appeared via the
-                                        // journal gets a PTY (the shell's
-                                        // xterm mount did terminal.create).
-                                        // Only NEW ids — an existing widget
-                                        // losing its snapshot is a dispose,
-                                        // and the stale check below closes it.
-                                        let newcomers: Vec<(String, f64, f64)> = view
-                                            .canvas
-                                            .widgets
-                                            .values()
-                                            .filter(|w| {
-                                                !prior.contains(&w.id)
-                                                    && is_terminal_kind(w.kind.as_deref())
-                                                    && view.manager.snapshot(&w.id).is_err()
-                                            })
-                                            .map(|w| (w.id.clone(), w.w, w.h))
-                                            .collect();
-                                        for (id, w, h) in newcomers {
-                                            let (cols, rows) =
-                                                terminal_cells(w, h, view.canvas.camera.zoom);
-                                            if let Ok(live) = view
-                                                .manager
-                                                .spawn_with_options(
-                                                    id.clone(),
-                                                    cols,
-                                                    rows,
-                                                    None,
-                                                    slate_app::platform::shell_command(),
-                                                    HashMap::new(),
-                                                )
-                                            {
-                                                view.relaunch_agent(&id, live);
-                                            }
+                                    }
+                                    // `view.snapshots` was taken at tick
+                                    // start — a journal-created terminal's
+                                    // fresh PTY isn't in it yet, and the
+                                    // stale sweep below would remove the
+                                    // widget one beat after it appeared.
+                                    // Refresh so `live` sees the spawns.
+                                    view.snapshots = view.manager.snapshots();
+        view.refresh_agent_states();
+                                    // A focused widget can vanish in the
+                                    // refold (`slate canvas remove`) — a
+                                    // stale id would keep swallowing keys
+                                    // into a dead terminal.
+                                    if let Some(active) = &view.active {
+                                        if !view.canvas.widgets.contains_key(active) {
+                                            view.active = None;
                                         }
-                                        // `view.snapshots` was taken at tick
-                                        // start — a journal-created terminal's
-                                        // fresh PTY isn't in it yet, and the
-                                        // stale sweep below would remove the
-                                        // widget one beat after it appeared.
-                                        // Refresh so `live` sees the spawns.
-                                        view.snapshots = view.manager.snapshots();
-                                        // A focused widget can vanish in the
-                                        // refold (`slate canvas remove`) — a
-                                        // stale id would keep swallowing keys
-                                        // into a dead terminal.
-                                        if let Some(active) = &view.active {
-                                            if !view.canvas.widgets.contains_key(active) {
-                                                view.active = None;
-                                            }
-                                        }
-                                        if let Some(renaming) = &view.renaming {
-                                            if !view.canvas.widgets.contains_key(renaming) {
-                                                view.renaming = None;
-                                            }
+                                    }
+                                    if let Some(renaming) = &view.renaming {
+                                        if !view.canvas.widgets.contains_key(renaming) {
+                                            view.renaming = None;
                                         }
                                     }
                                 }
@@ -1328,6 +1523,27 @@ impl CanvasView {
                                 .view()
                                 .to_world(Pos2::new(90.0 + col * 60.0, 90.0 + row * 60.0));
                             view.create_widget_at(&id, "terminal", &title, at);
+                            // The mount journaled `terminal.spawn` too —
+                            // `spawn` on a live shell answers `live: true`,
+                            // so this is a journalled reconnect, not a second
+                            // PTY.
+                            let (w, h) = view
+                                .canvas
+                                .widgets
+                                .get(&id)
+                                .map(|widget| (widget.w, widget.h))
+                                .unwrap_or((352.0, 295.0));
+                            let (cols, rows) =
+                                terminal_cells(w, h, view.canvas.camera.zoom);
+                            let _ = mount_spawn(
+                                &view.manager,
+                                view.workspace_dir.as_deref(),
+                                &id,
+                                cols,
+                                rows,
+                                None,
+                                Some(&title),
+                            );
                         }
                         // A terminal disposed over the socket leaves the
                         // snapshot list entirely; its widget goes with it.
@@ -1518,20 +1734,6 @@ impl CanvasView {
                         }
                         view.pending_commands = deferred;
                         view.poll_startup_watches();
-                        // Status bar CPU%: two /proc/stat samples a tick
-                        // apart — cheap enough to keep polling.
-                        if let Some((idle, total)) = proc_stat_sample() {
-                            if let Some((prev_idle, prev_total)) = view.cpu_last {
-                                let di = idle.saturating_sub(prev_idle) as f64;
-                                let dt = total.saturating_sub(prev_total) as f64;
-                                if dt > 0.0 {
-                                    view.cpu_percent =
-                                        Some(((1.0 - di / dt) * 100.0).round().clamp(0.0, 100.0)
-                                            as u32);
-                                }
-                            }
-                            view.cpu_last = Some((idle, total));
-                        }
                         // The original repaired out-of-range widgets on every
                         // widgets change (App.tsx): non-maximizable kinds
                         // cannot stay maximized, and a persisted size outside
@@ -1557,14 +1759,6 @@ impl CanvasView {
                         for fixed in repairs {
                             view.canvas.widgets.insert(fixed.id.clone(), fixed.clone());
                             view.commit_widget(&fixed);
-                        }
-                        // A camera gesture that stopped moving still needs its
-                        // resting position written through to the journal.
-                        if let Some(at) = view.camera_dirty_at {
-                            if at.elapsed() >= CAMERA_COMMIT_EVERY {
-                                view.camera_dirty_at = None;
-                                view.commit_camera();
-                            }
                         }
                         cx.notify();
                     })
@@ -1616,14 +1810,10 @@ impl CanvasView {
         view
     }
 
+    /// `makeLocalId` — `{kind}-{crypto.randomUUID()}` in the renderer, so a
+    /// disposed widget's id never recycles into a second journal history.
     fn fresh_id(&mut self, kind: &str) -> String {
-        loop {
-            self.counter += 1;
-            let id = format!("{kind}-{}", self.counter);
-            if !self.canvas.widgets.contains_key(&id) && self.manager.snapshot(&id).is_err() {
-                return id;
-            }
-        }
+        format!("{kind}-{}", uuid::Uuid::new_v4())
     }
 
     /// recordHistory — snapshot the canvas before a mutating commit. The
@@ -1644,16 +1834,108 @@ impl CanvasView {
 
     /// `updateWidgets(updates, actor)` — most commits are the `"user"`
     /// actor; the arrange pass journals `"arrange"` like the renderer did.
+    /// Every commit runs the command flow's gate chain — the renderer's
+    /// `send` called `flow.submit`, so heartbeats, lock conflicts,
+    /// `baseVersion`, and the intent→commit/abort pair all apply here too.
     fn commit_as(&mut self, actor: &str, entry_type: &str, target: &str, payload: Value) {
+        let _ = self.commit_work(actor, entry_type, target, payload, || Ok(json!({})));
+    }
+
+    /// `commit_as` with the handler's work between the intent and the
+    /// commit — the file-pane mutations run their filesystem op inside the
+    /// gates so a failure lands `intent + abort` like the original's apply
+    /// throw, and a successful op still carries the journal's version. The
+    /// closure answers the apply's `CommandError('failed', …)` as `Err`.
+    fn commit_work(
+        &mut self,
+        actor: &str,
+        entry_type: &str,
+        target: &str,
+        payload: Value,
+        work: impl FnOnce() -> Result<Value, slate_app::http::Response>,
+    ) -> Result<slate_app::journal::JournalEntry, slate_app::http::Response> {
         if !self.suppress_history
             && (entry_type.starts_with("widget.") || entry_type.starts_with("canvas."))
         {
             self.record_history();
         }
-        if let Some(journal) = &mut self.journal {
-            if let Err(error) = journal.commit(actor, entry_type, target, payload) {
-                self.notice(format!("journal {entry_type}: {error}"));
+        let base_version = self.commit_base_version(entry_type, target);
+        let result = gui_submit(
+            &self.manager,
+            self.workspace_dir.as_deref(),
+            actor,
+            base_version,
+            entry_type,
+            target,
+            payload,
+            work,
+        );
+        match result {
+            Ok((entry, _)) => {
+                self.adopt_committed_version(&entry);
+                Ok(entry)
             }
+            Err(response) => {
+                let message = response
+                    .body
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("submit failed")
+                    .to_owned();
+                self.notice(format!("journal {entry_type}: {message}"));
+                Err(response)
+            }
+        }
+    }
+
+    /// The `baseVersion` the renderer sent — what it believed the target's
+    /// version to be from its own folded state, not the journal's freshest
+    /// read. A commit the mtime watcher has not refolded yet then reads as
+    /// a genuine conflict, exactly like a stale renderer did. Only the
+    /// commands whose IPC carried a version get one; the rest submit
+    /// ungated, matching their `send` calls.
+    fn commit_base_version(&self, entry_type: &str, target: &str) -> Option<f64> {
+        let parsed = slate_app::resources::parse_resource(target)?;
+        match (entry_type, parsed.scheme.as_str()) {
+            ("widget.update", "widget") => self
+                .canvas
+                .widgets
+                .get(parsed.id.as_str())
+                .map(|widget| widget.version),
+            ("plan.update" | "plan.toggle", "plan") => {
+                let dir = slate_app::ipc::user_data_dir();
+                let document = slate_app::planner_document::PlannerDocument::open(
+                    dir.join("workspace-planner.json"),
+                )
+                .ok()?;
+                let log = JournalLog::open(journal_path()).ok()?;
+                let items = document
+                    .folded_items(&log, &slate_app::planner::today_local())
+                    .ok()?;
+                items.get(parsed.id.as_str()).map(|item| item.version)
+            }
+            _ => None,
+        }
+    }
+
+    /// After a commit lands, the local widget's version must match what the
+    /// fold will assign — otherwise the next `widget.update` submits the
+    /// stale version and conflicts on the commit it just wrote. (The
+    /// planner document refolds from the journal on every read, so plan
+    /// items never need this.)
+    fn adopt_committed_version(&mut self, entry: &slate_app::journal::JournalEntry) {
+        if entry.entry_type != "widget.update" && entry.entry_type != "widget.create" {
+            return;
+        }
+        let Some(parsed) = slate_app::resources::parse_resource(&entry.target) else {
+            return;
+        };
+        if parsed.scheme != "widget" {
+            return;
+        }
+        let version = entry.version.unwrap_or(0) as f64;
+        if let Some(widget) = self.canvas.widgets.get_mut(parsed.id.as_str()) {
+            widget.version = version;
         }
     }
 
@@ -1669,19 +1951,48 @@ impl CanvasView {
         let Some(agent_id) = self.agent_picks.launched.get(id).cloned() else {
             return;
         };
-        if let Some((_, _, command)) = AGENT_LAUNCHERS
+                if let Some((_, _, command)) = agent_launchers(&self.prefs)
             .iter()
-            .find(|(aid, _, _)| *aid == agent_id.as_str())
+            .find(|(aid, _, _)| *aid == *agent_id)
         {
             self.agent_relaunched.insert(id.to_owned());
             self.pending_commands.push(PendingCommand {
                 terminal_id: id.to_owned(),
-                command: (*command).to_owned(),
+                command: command.clone(),
                 attempts: 0,
                 watch: true,
                 live,
             });
         }
+    }
+
+    /// herdr's `detect_state` per live terminal — the manifest is chosen
+    /// by the code session's `agent_id`, else the terminal's named-agent
+    /// match; `detect` reads the snapshot's parsed screen tail.
+    fn refresh_agent_states(&mut self) {
+        if self.agent_scan_at.elapsed() < Duration::from_millis(400) {
+            return;
+        }
+        self.agent_scan_at = Instant::now();
+        let names = self.manager.names();
+        let mut out = HashMap::new();
+        for snap in &self.snapshots {
+            let hint = self
+                .code_sessions
+                .iter()
+                .find(|s| s.terminal_id == snap.id)
+                .map(|s| s.agent_id.clone())
+                .or_else(|| {
+                    names
+                        .get(&snap.id)
+                        .and_then(|n| slate_app::agent_state::manifest_for("", n))
+                });
+            out.insert(
+                snap.id.clone(),
+                slate_app::agent_state::detect(&snap.screen, "", hint.as_deref()).state,
+            );
+        }
+        self.agent_states = out;
     }
 
     /// Arming the launch-failure watch — the shell's `createStartupProbe`
@@ -1750,74 +2061,6 @@ impl CanvasView {
     /// modes snapshot every widget once (`orcspace-arrange-free-layout`),
     /// tile them into the visible area and journal each move; Free replays
     /// the snapshot once and clears it.
-    fn apply_arrange(&mut self, mode: slate_app::arrange::ArrangeMode, cx: &mut Context<Self>) {
-        use slate_app::arrange::ArrangeMode;
-        self.prefs.arrange_mode = mode;
-        // One arrange is one history entry — the batch suppresses per-widget
-        // pushes after this single snapshot.
-        self.record_history();
-        self.suppress_history = true;
-        if mode == ArrangeMode::Free {
-            let saved = std::mem::take(&mut self.prefs.arrange_free_layout);
-            for (id, rect) in saved {
-                let Some(widget) = self.canvas.widgets.get_mut(&id) else {
-                    continue;
-                };
-                widget.x = rect.x;
-                widget.y = rect.y;
-                widget.w = rect.w;
-                widget.h = rect.h;
-                widget.maximized = rect.maximized;
-                let widget = widget.clone();
-                self.commit_widget_as("arrange", &widget);
-            }
-        } else {
-            if self.prefs.arrange_free_layout.is_empty() {
-                self.prefs.arrange_free_layout = self
-                    .canvas
-                    .widgets
-                    .values()
-                    .map(|w| {
-                        (
-                            w.id.clone(),
-                            slate_app::ui_preferences::FreeRect {
-                                x: w.x,
-                                y: w.y,
-                                w: w.w,
-                                h: w.h,
-                                maximized: w.maximized,
-                            },
-                        )
-                    })
-                    .collect();
-            }
-            for (id, x, y, w, h) in slate_app::arrange::layout(
-                mode,
-                &self.canvas,
-                self.viewport,
-                self.active.as_deref(),
-            ) {
-                let Some(widget) = self.canvas.widgets.get_mut(&id) else {
-                    continue;
-                };
-                widget.x = x;
-                widget.y = y;
-                widget.w = w;
-                widget.h = h;
-                widget.maximized = false;
-                let widget = widget.clone();
-                self.commit_widget_as("arrange", &widget);
-            }
-        }
-        self.suppress_history = false;
-        if let Err(error) = self
-            .prefs
-            .save(&slate_app::ui_preferences::UiPreferences::path())
-        {
-            self.notice(format!("arrange: {error}"));
-        }
-        cx.notify();
-    }
 
     /// Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y — the shell's `orcspace:canvas-undo`
     /// and `-redo` events. The popped state journals as `canvas.restore` so
@@ -1838,7 +2081,7 @@ impl CanvasView {
         // snapshot so the same shape serves both writers.
         payload.as_object_mut().map(|map| map.remove("snapshotSeq"));
         self.suppress_history = true;
-        self.commit("canvas.restore", "canvas", payload);
+        self.commit("canvas.restore", "canvas:main", payload);
         self.suppress_history = false;
         self.canvas = restored;
     }
@@ -1848,7 +2091,7 @@ impl CanvasView {
     pub(crate) fn titlebar_command(
         &mut self,
         action: &str,
-        payload: Value,
+        _payload: Value,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1859,7 +2102,6 @@ impl CanvasView {
                     // A modal opening dismisses the floating menus — the
                     // backdrop eats the outside click that would.
                     self.arrange_menu = false;
-                    self.toolbar_overflow = false;
                 }
             }
             "sidebar" => {
@@ -1872,21 +2114,6 @@ impl CanvasView {
             // pop the same rings Ctrl+Z/Ctrl+Shift+Z do.
             "undo" => self.undo(false),
             "redo" => self.undo(true),
-            // The WorkView tablist — `activeView` swaps the `<main>`
-            // fill; the canvas keeps every widget and its camera while a
-            // workview covers it.
-            "view" => {
-                if let Some(view) = payload.get("view").and_then(Value::as_str) {
-                    let next = match view {
-                        "code" => ActiveView::Code,
-                        "overview" => ActiveView::Overview,
-                        _ => ActiveView::Canvas,
-                    };
-                    if next != self.active_view {
-                        self.set_active_view(next);
-                    }
-                }
-            }
             // The Arrange `LayoutGrid` button — opens the mode menu that
             // used to ride the status bar chip; the popover anchors under
             // the bar, the shell's `top-[36px]` drop.
@@ -2105,19 +2332,6 @@ impl CanvasView {
                                 .prefs
                                 .save(&slate_app::ui_preferences::UiPreferences::path());
                         }
-                        "arrange_mode" => {
-                            if let Some(label) = value.as_ref().and_then(Value::as_str) {
-                                if let Some(mode) = slate_app::arrange::ArrangeMode::ALL
-                                    .iter()
-                                    .find(|m| m.label().eq_ignore_ascii_case(label))
-                                {
-                                    let mode = *mode;
-                                    if mode != self.prefs.arrange_mode {
-                                        self.apply_arrange(mode, cx);
-                                    }
-                                }
-                            }
-                        }
                         "image_insert_shortcut" => {
                             if let Some(shortcut) = value.as_ref().and_then(Value::as_str) {
                                 if self.settings.set_image_insert_shortcut(shortcut) {
@@ -2161,156 +2375,6 @@ impl CanvasView {
         cx.notify();
     }
 
-    /// Bottom-toolbar buttons (`views_toolbar::toolbar_pane`) — every control
-    /// the Electron Toolbar exposed, dispatching to the same code its keys do.
-    pub(crate) fn toolbar_command(
-        &mut self,
-        action: &str,
-        _payload: Value,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(tool) = action.strip_prefix("tool:") {
-            // The shell's single `tool` state — `pan` is all-false, and
-            // picking the active tool is a no-op, never an off-toggle.
-            self.draw_mode = tool == "draw";
-            self.erase_mode = tool == "erase";
-            self.select_mode = tool == "select";
-            if !self.draw_mode {
-                self.pending_stroke.clear();
-            }
-            cx.notify();
-            return;
-        }
-        if let Some(n) = action
-            .strip_prefix("stroke:")
-            .and_then(|s| s.parse::<usize>().ok())
-        {
-            self.stroke_color = n.min(STROKE_COLORS.len() - 1);
-            cx.notify();
-            return;
-        }
-        if let Some(id) = action.strip_prefix("target:") {
-            self.command_target = Some(id.to_owned());
-            // The shell's `updateSettings({ targetTerminalId })` — the pick
-            // survives restarts through the unmanaged-key passthrough.
-            self.settings.set_extra("targetTerminalId", json!(id));
-            self.settings.save();
-            cx.notify();
-            return;
-        }
-        if let Some(kind) = action.strip_prefix("suggest:") {
-            // The suggestions popover's click = "adopt this kind into the
-            // input" — the original filled `<sigil><kind> ` with the typed
-            // sigil (or the configured prefix) and kept focus.
-            let prefix = self
-                .command_bar
-                .as_deref()
-                .and_then(|b| b.trim_start().chars().next())
-                .filter(|c| matches!(c, '/' | '.' | '@'))
-                .map(|c| c.to_string())
-                .unwrap_or_else(|| {
-                    let configured = self.settings.command_prefix();
-                    if configured == "any" {
-                        "/".to_owned()
-                    } else {
-                        configured.to_owned()
-                    }
-                });
-            self.command_bar = Some(format!("{prefix}{kind} "));
-            cx.notify();
-            return;
-        }
-        if action == "submit" {
-            // The `↵` button — `submitCommand`'s onSubmit without the
-            // keypress; identical to Enter.
-            self.submit_command_bar(self.viewport, cx);
-            cx.notify();
-            return;
-        }
-        if action == "overflow" {
-            self.toolbar_overflow = !self.toolbar_overflow;
-            cx.notify();
-            return;
-        }
-        if action == "workspace:pick" {
-            self.toolbar_overflow = false;
-        }
-        if action == "settings" {
-            self.toolbar_overflow = false;
-            self.arrange_menu = false;
-            self.settings_open = true;
-            cx.notify();
-            return;
-        }
-        if action == "clear_strokes" {
-            // `tool-clear-strokes` — `canvas.clearStrokes`, journaled.
-            if !self.canvas.strokes.is_empty() {
-                self.canvas.strokes.clear();
-                self.commit_strokes();
-            }
-            self.toolbar_overflow = false;
-            cx.notify();
-            return;
-        }
-        if let Some(mode) = action.strip_prefix("mode:") {
-            self.command_message = mode == "message";
-            // Mode change resets the suggestion highlight — the shell's
-            // `setSuggestionIndex(0)` effect on `[suggestionQuery, mode, …]`.
-            self.command_suggestion = 0;
-            if self.command_bar.is_none() {
-                self.command_bar = Some(String::new());
-            }
-            cx.notify();
-            return;
-        }
-        let center = Pos2::new(self.viewport.x / 2.0, self.viewport.y / 2.0);
-        match action {
-            "zoom_in" => {
-                zoom_at(&mut self.canvas.camera, Pos2::ZERO, center, 1.2);
-                self.commit_camera();
-            }
-            "zoom_out" => {
-                zoom_at(&mut self.canvas.camera, Pos2::ZERO, center, 1.0 / 1.2);
-                self.commit_camera();
-            }
-            "zoom_reset" => {
-                self.canvas.camera.zoom = 1.0;
-                self.commit_camera();
-            }
-            "fit" => self.fit(self.viewport, cx),
-            "undo" => self.undo(false),
-            "redo" => self.undo(true),
-            "focus_input" => {
-                if self.command_bar.is_none() {
-                    self.command_bar = Some(String::new());
-                }
-            }
-            "workspace:pick" => {
-                // Async folder pick; the workspace adopts the choice.
-                let picked = cx.prompt_for_paths(gpui::PathPromptOptions {
-                    files: false,
-                    directories: true,
-                    multiple: false,
-                    prompt: Some("Workspace folder".into()),
-                });
-                cx.spawn(async move |this, cx| {
-                    if let Ok(Ok(Some(paths))) = picked.await {
-                        if let Some(dir) = paths.first() {
-                            let dir = dir.to_string_lossy().into_owned();
-                            let _ = this.update(cx, |this, cx| {
-                                this.switch_workspace(dir);
-                                cx.notify();
-                            });
-                        }
-                    }
-                })
-                .detach();
-            }
-            _ => {}
-        }
-        cx.notify();
-    }
-
     /// Sidebar rows (`views_sidebar::sidebar_pane`) — focus raises a widget
     /// and centers the camera on it; the rest reuse the existing paths.
     pub(crate) fn sidebar_command(&mut self, action: &str, payload: Value, cx: &mut Context<Self>) {
@@ -2327,28 +2391,12 @@ impl CanvasView {
                 self.settings_open = !self.settings_open;
                 if self.settings_open {
                     self.arrange_menu = false;
-                    self.toolbar_overflow = false;
                 }
             }
             "focus" => {
                 if let Some(id) = payload.get("id").and_then(Value::as_str) {
-                    self.raise(id);
                     self.active = Some(id.to_owned());
-                    if let Some(widget) = self.canvas.widgets.get(id).cloned() {
-                        // Camera centers the widget at 1× like a shell click.
-                        // screen = camera + world·zoom, so the camera offset
-                        // is viewport/2 minus the widget's screen-space
-                        // center — not the world-space version of it.
-                        let zoom = self.canvas.camera.zoom.max(0.2);
-                        self.canvas.camera.x = self.viewport.x as f64 / 2.0
-                            - (widget.x + widget.w / 2.0) * zoom;
-                        self.canvas.camera.y = self.viewport.y as f64 / 2.0
-                            - (widget.y + widget.h / 2.0) * zoom;
-                        // A programmatic camera move journals the same as a
-                        // gesture — without the commit the next refold snaps
-                        // the view back to the last journaled camera.
-                        self.commit_camera();
-                    }
+                    // (view is pinned — no canvas to reveal)
                 }
             }
             "close" => {
@@ -2407,150 +2455,6 @@ impl CanvasView {
         );
     }
 
-    /// `canvas.strokes` replaces the whole strokes array — that is how the
-    /// projection applies the event — so a clear writes `[]` and an added
-    /// stroke writes every stroke including it.
-    fn commit_strokes(&mut self) {
-        let strokes: Vec<Value> = self
-            .canvas
-            .strokes
-            .iter()
-            .map(|stroke| {
-                json!({
-                    "id": stroke.id,
-                    "color": stroke.color,
-                    "points": stroke
-                        .points
-                        .iter()
-                        .map(|point| json!({"x": point.x, "y": point.y}))
-                        .collect::<Vec<_>>(),
-                })
-            })
-            .collect();
-        self.commit("canvas.strokes", "canvas", json!({ "strokes": strokes }));
-    }
-
-    /// useCanvas.ts `eraseAt`: a press/drag position in erase mode cuts the
-    /// strokes under it. Points within the world radius die; a segment whose
-    /// interior crosses the footprint kills both its ends; each surviving run
-    /// of ≥2 points keeps the stroke's color under a fresh id — the original
-    /// splits strokes rather than deleting them whole. Single-point "dots"
-    /// survive unless directly hit; empty strokes drop. Returns whether the
-    /// strokes array changed (the caller commits once on release).
-    fn erase_at(&mut self, world: Pos2) -> bool {
-        let zoom = self.canvas.camera.zoom.max(0.1) as f32;
-        let radius = ERASE_RADIUS_PX / zoom;
-        let near = |p: &projection::Point| {
-            let dx = p.x - world.x as f64;
-            let dy = p.y - world.y as f64;
-            dx * dx + dy * dy <= (radius as f64) * (radius as f64)
-        };
-        let crosses = |a: &projection::Point, b: &projection::Point| {
-            let (dx, dy) = (b.x - a.x, b.y - a.y);
-            let len_sq = dx * dx + dy * dy;
-            let t = if len_sq == 0.0 {
-                0.0
-            } else {
-                (((world.x as f64 - a.x) * dx + (world.y as f64 - a.y) * dy) / len_sq)
-                    .clamp(0.0, 1.0)
-            };
-            let (px, py) = (
-                world.x as f64 - (a.x + t * dx),
-                world.y as f64 - (a.y + t * dy),
-            );
-            px * px + py * py <= (radius as f64) * (radius as f64)
-        };
-
-        let mut changed = false;
-        let mut next: Vec<projection::Stroke> = Vec::new();
-        for stroke in std::mem::take(&mut self.canvas.strokes) {
-            let pts = stroke.points;
-            // A zero-point stroke carries nothing — the original dropped it
-            // on any erase; a one-point "dot" survives unless directly hit.
-            if pts.is_empty() {
-                changed = true;
-                continue;
-            }
-            if pts.len() == 1 {
-                if near(&pts[0]) {
-                    changed = true;
-                } else {
-                    next.push(projection::Stroke {
-                        points: pts,
-                        ..stroke
-                    });
-                }
-                continue;
-            }
-            // Bounds reject: strokes whose box misses the footprint are kept
-            // untouched, skipping the per-point pass.
-            let (mut min_x, mut min_y, mut max_x, mut max_y) =
-                (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
-            for p in &pts {
-                min_x = min_x.min(p.x);
-                min_y = min_y.min(p.y);
-                max_x = max_x.max(p.x);
-                max_y = max_y.max(p.y);
-            }
-            let r = radius as f64;
-            if max_x < world.x as f64 - r
-                || min_x > world.x as f64 + r
-                || max_y < world.y as f64 - r
-                || min_y > world.y as f64 + r
-            {
-                next.push(projection::Stroke {
-                    points: pts,
-                    ..stroke
-                });
-                continue;
-            }
-            let mut dead = vec![false; pts.len()];
-            let mut any_dead = false;
-            for i in 0..pts.len() {
-                if near(&pts[i]) {
-                    dead[i] = true;
-                    any_dead = true;
-                } else if i > 0 && !dead[i - 1] && crosses(&pts[i - 1], &pts[i]) {
-                    dead[i] = true;
-                    dead[i - 1] = true;
-                    any_dead = true;
-                }
-            }
-            if !any_dead {
-                next.push(projection::Stroke {
-                    points: pts,
-                    ..stroke
-                });
-                continue;
-            }
-            changed = true;
-            let mut run: Vec<projection::Point> = Vec::new();
-            for (i, p) in pts.into_iter().enumerate() {
-                if dead[i] {
-                    if run.len() > 1 {
-                        next.push(projection::Stroke {
-                            id: format!("stroke-{}", uuid::Uuid::new_v4().simple()),
-                            points: std::mem::take(&mut run),
-                            color: stroke.color.clone(),
-                        });
-                    } else {
-                        run.clear();
-                    }
-                } else {
-                    run.push(p);
-                }
-            }
-            if run.len() > 1 {
-                next.push(projection::Stroke {
-                    id: format!("stroke-{}", uuid::Uuid::new_v4().simple()),
-                    points: run,
-                    color: stroke.color.clone(),
-                });
-            }
-        }
-        self.canvas.strokes = next;
-        changed
-    }
 
     /// Double-clicking a widget title opens the shell's rename input. The
     /// buffer seeds from the current title; Enter or a click elsewhere
@@ -2604,21 +2508,16 @@ impl CanvasView {
         self.rename_buffer.clear();
     }
 
-    fn commit_camera(&mut self) {
-        let camera = &self.canvas.camera;
-        self.commit(
-            "canvas.camera",
-            "canvas",
-            json!({"x": camera.x, "y": camera.y, "zoom": camera.zoom}),
-        );
-    }
-
     /// The workspace swap shared by the toolbar's pick and the Overview's
     /// recents: persist the dir, update `workspace_dir` (a stale field
     /// refolds the old canvas on the next journal-mtime check), and
     /// hydrate the new workspace's canvas — snapshot + journal tail are
     /// per-dir, like the shell's `onDirChange` reload.
     fn switch_workspace(&mut self, dir: String) {
+        self.code_resume_dir = None;
+        self.code_conversations.clear();
+        self.code_resume_selected.clear();
+        self.code_resume_dismissed.clear();
         let mut state = slate_app::workspace::WorkspaceState::load();
         if !state.set_workspace_dir(Some(dir.clone())) {
             return;
@@ -2646,9 +2545,9 @@ impl CanvasView {
         if self.viewport.x <= 0.0 {
             return (dw, dh);
         }
-        let zoom = self.canvas.camera.zoom.max(0.01) as f32;
-        let c = (self.viewport.x - 64.0) / zoom;
-        let i = (self.viewport.y - 192.0) / zoom;
+        // Panes have no zoom — sizes compute against the plain viewport.
+        let c = self.viewport.x - 64.0;
+        let i = self.viewport.y - 192.0;
         (
             (dw as f32).min(c.floor()).max(280.0) as f64,
             (dh as f32).min(i.floor()).max(160.0) as f64,
@@ -2662,11 +2561,19 @@ impl CanvasView {
     fn create_widget_at(&mut self, id: &str, kind: &str, title: &str, at: Pos2) {
         if self.canvas.widgets.len() >= projection::MAX_WIDGETS {
             // addWidget returned false → the shell's "Canvas is full" notice.
-            self.notice("Canvas is full — close a widget before adding another.");
+            self.notice("Pane limit reached — close a widget before adding another.");
             return;
         }
-        // `addWidget` anchored spawns at `point - 16` in world units.
-        let at = Pos2::new(at.x - 16.0, at.y - 16.0);
+        // `addWidget` anchored spawns at `point - 16` in world units. The
+        // journaled position is invisible in pane mode — it only feeds the
+        // Overview minimap — so stagger each spawn a notch to keep the rects
+        // distinct there.
+        let n = self.cascade_count;
+        self.cascade_count += 1;
+        let at = Pos2::new(
+            at.x - 16.0 + (n % 6) as f32 * 28.0,
+            at.y - 16.0 + (n / 6 % 6) as f32 * 28.0,
+        );
         let (w, h) = self.spawn_size(kind);
         let at = if self.viewport.x > 0.0 {
             canvas::clamp_to_visible_world(&self.canvas.camera, self.viewport, at, w, h)
@@ -2736,7 +2643,7 @@ impl CanvasView {
         let mut placed = 0usize;
         for source in paths.paths() {
             if self.canvas.widgets.len() >= projection::MAX_WIDGETS {
-                self.notice("Canvas is full — close a widget before adding another.");
+                self.notice("Pane limit reached — close a widget before adding another.");
                 continue;
             }
             let name = source
@@ -2838,134 +2745,7 @@ impl CanvasView {
         cx.notify();
     }
 
-    /// The shell's `matchesShortcut(u, combo)` — "Mod+Shift+I" style combos
-    /// from `imageInsertShortcut`. `Mod` is the platform modifier (Ctrl on
-    /// Linux/Windows, Cmd on macOS); CTRL/ALT/SHIFT/META are literal.
-    fn shortcut_matches(keystroke: &Keystroke, combo: &str) -> bool {
-        let mut want_mod = false;
-        let mut want_ctrl = false;
-        let mut want_alt = false;
-        let mut want_shift = false;
-        let mut want_meta = false;
-        let mut key = None;
-        for token in combo.split('+') {
-            match token.trim().to_ascii_uppercase().as_str() {
-                "MOD" => want_mod = true,
-                "CTRL" | "CONTROL" => want_ctrl = true,
-                "ALT" | "OPTION" => want_alt = true,
-                "SHIFT" => want_shift = true,
-                "META" | "CMD" | "COMMAND" => want_meta = true,
-                other if !other.is_empty() => key = Some(other.to_owned()),
-                _ => {}
-            }
-        }
-        let mods = &keystroke.modifiers;
-        // Mod folds into the platform modifier — on Linux/Windows that IS
-        // Ctrl (same physical key), so Mod and Ctrl in a combo can't be
-        // checked independently.
-        let (want_control, want_platform) = if cfg!(target_os = "macos") {
-            (want_ctrl, want_mod || want_meta)
-        } else {
-            (want_mod || want_ctrl, want_meta)
-        };
-        let Some(key) = key else { return false };
-        want_control == mods.control
-            && want_platform == mods.platform
-            && want_alt == mods.alt
-            && want_shift == mods.shift
-            && keystroke.key.eq_ignore_ascii_case(&key)
-    }
 
-    /// The shell's image-widget hotkey handler (`Mod+Shift+I` by default,
-    /// `imageInsertShortcut` in settings): the clipboard's image lands as an
-    /// `image` widget centred in the viewport — `saveClipboard` then
-    /// `addWidget("image", rect, name, {imagePath, imageName})`. The
-    /// shortcut fired even over a focused terminal (xterm was excluded from
-    /// the input-context guard), so this runs ahead of the terminal branch.
-    fn image_insert(&mut self, cx: &mut Context<Self>) {
-        let Some(item) = cx.read_from_clipboard() else {
-            self.notice("No image found in the clipboard.");
-            return;
-        };
-        let image = item.entries.iter().find_map(|entry| match entry {
-            ClipboardEntry::Image(image) => Some(image),
-            _ => None,
-        });
-        let Some(image) = image else {
-            self.notice("No image found in the clipboard.");
-            return;
-        };
-        let media_dir = slate_app::ipc::user_data_dir().join("media");
-        // The shell's `saveClipboard` → `saveBytes`: content-addressed into
-        // the same media store drops use.
-        let path = match slate_app::attachments::save_bytes(
-            &image.bytes,
-            image.format.extension(),
-            &media_dir,
-        ) {
-            Ok(path) => path,
-            Err(error) => {
-                self.notice(format!("Failed to save clipboard image: {error}"));
-                return;
-            }
-        };
-        if self.canvas.widgets.len() >= projection::MAX_WIDGETS {
-            self.notice("Canvas is full — close a widget before adding another.");
-            return;
-        }
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "Image".to_owned());
-        let (w, h) = self.spawn_size("image");
-        // The shell centred it on the viewport's world point.
-        let view_now = canvas::View::new(&self.canvas.camera, Pos2::ZERO);
-        let center = view_now.to_world(Pos2::new(self.viewport.x / 2.0, self.viewport.y / 2.0));
-        // `addWidget` anchors spawns at `point - 16`.
-        let at = Pos2::new(
-            center.x - (w / 2.0) as f32 - 16.0,
-            center.y - (h / 2.0) as f32 - 16.0,
-        );
-        let z = self
-            .canvas
-            .widgets
-            .values()
-            .map(|widget| widget.z)
-            .fold(0.0, f64::max)
-            + 1.0;
-        let id = self.fresh_id("image");
-        let image_path = path.to_string_lossy().into_owned();
-        self.commit(
-            "widget.create",
-            &format!("widget:{id}"),
-            json!({
-                "id": id, "title": name, "kind": "image",
-                "x": at.x as f64, "y": at.y as f64,
-                "w": w, "h": h, "z": z, "maximized": false,
-                "imagePath": image_path, "imageName": name,
-            }),
-        );
-        self.canvas.widgets.insert(
-            id.clone(),
-            Widget {
-                id,
-                title: name.clone(),
-                kind: Some("image".to_owned()),
-                x: at.x as f64,
-                y: at.y as f64,
-                w,
-                h,
-                z,
-                maximized: false,
-                image_path: Some(image_path),
-                image_name: Some(name),
-                state: None,
-                version: 1.0,
-                updated_at: 0.0,
-            },
-        );
-        cx.notify();
-    }
 
     /// Spawn centred in the current viewport, like the Electron app's T/N.
     fn spawn_terminal(&mut self, viewport: Vec2, cx: &mut Context<Self>) {
@@ -2999,14 +2779,17 @@ impl CanvasView {
         self.create_widget_at(&id, "terminal", &title, at);
         self.manager.set_name(&id, &title);
         let (w, h) = default_size("terminal");
-        let (cols, rows) = terminal_cells(w, h, self.canvas.camera.zoom);
-        let _ = self.manager.spawn_with_options(
-            id.clone(),
+        let (cols, rows) = terminal_cells(w, h, 1.0);
+        // The mount journaled `terminal.spawn` (the `terminal:create` IPC
+        // submitted it) — a user-spawned shell goes through the same gates.
+        let _ = mount_spawn(
+            &self.manager,
+            self.workspace_dir.as_deref(),
+            &id,
             cols,
             rows,
             None,
-            slate_app::platform::shell_command(),
-            HashMap::new(),
+            Some(&title),
         );
         self.active = Some(id.clone());
         self.frame_focus = None;
@@ -3081,71 +2864,53 @@ impl CanvasView {
         cx.notify();
     }
 
-    /// The header's maximize/restore button — `canvas.toggleMaximize`.
-    /// Maximized state lives on the widget itself, so it survives journal
-    /// replay exactly like the Electron version.
-    fn toggle_maximize(&mut self, id: &str, cx: &mut Context<Self>) {
-        let maximizing = {
-            let Some(widget) = self.canvas.widgets.get(id) else {
-                return;
-            };
-            // NON_MAXIMIZABLE gate — but un-maximizing stays allowed so a
-            // stale journal can never strand a widget at fullscreen.
-            if !widget.maximized && canvas::non_maximizable(widget.kind.as_deref()) {
-                return;
-            }
-            !widget.maximized
-        };
-        // recordHistory before the mutation — the undo snapshot must hold
-        // the pre-toggle canvas.
-        self.record_history();
-        self.suppress_history = true;
-        // The shell guaranteed one maximized widget at a time —
-        // mergePatch(other, {maximized:false}) for siblings on every
-        // toggle, and `z: nextZ()` applied to the target even when
-        // un-maximizing, so a shrinking widget still pops to the top.
-        let siblings: Vec<String> = self
-            .canvas
-            .widgets
-            .values()
-            .filter(|w| w.id != id && w.maximized)
-            .map(|w| w.id.clone())
-            .collect();
-        for sibling in siblings {
-            if let Some(widget) = self.canvas.widgets.get_mut(&sibling) {
-                widget.maximized = false;
-                let widget = widget.clone();
-                self.commit_widget(&widget);
-            }
-        }
-        let top = self
-            .canvas
-            .widgets
-            .values()
-            .map(|widget| widget.z)
-            .fold(0.0, f64::max);
-        if let Some(widget) = self.canvas.widgets.get_mut(id) {
-            widget.maximized = maximizing;
-            widget.z = top + 1.0;
-            let widget = widget.clone();
-            self.commit_widget(&widget);
-        }
-        self.suppress_history = false;
-        self.active = Some(id.to_owned());
-        cx.notify();
-    }
 
     fn close_widget(&mut self, id: &str, cx: &mut Context<Self>) {
-        if let Some(widget) = self.canvas.widgets.get(id) {
-            if is_terminal_kind(widget.kind.as_deref()) {
-                let _ = self.manager.dispose(id);
-            }
-        }
+        let is_terminal = self
+            .canvas
+            .widgets
+            .get(id)
+            .is_some_and(|widget| is_terminal_kind(widget.kind.as_deref()));
         self.canvas.widgets.shift_remove(id);
         self.canvas
             .connections
             .retain(|c| c.from != id && c.to != id);
-        self.commit("widget.remove", &format!("widget:{id}"), json!({}));
+        let manager = self.manager.clone();
+        let dispose_id = id.to_owned();
+        // The apply disposed the shell and failed its live dispatches inside
+        // the command — post-intent — so they ride in `commit_work` rather
+        // than before the journal entry.
+        let _ = self.commit_work(
+            "user",
+            "widget.remove",
+            &format!("widget:{id}"),
+            json!({}),
+            move || {
+                if is_terminal && manager.snapshot(&dispose_id).is_ok() {
+                    let _ = manager.dispose(&dispose_id);
+                }
+                // `failTerminalDispatches` — a running dispatch on a dead
+                // shell cannot report, so it settles failed.
+                let path = slate_app::ipc::user_data_dir().join("orchestration.json");
+                let mut store = load_orchestration_store();
+                let live: Vec<String> = store
+                    .list_dispatches(None, None, Some(&dispose_id))
+                    .iter()
+                    .filter(|dispatch| dispatch.state == "running")
+                    .map(|dispatch| dispatch.id.clone())
+                    .collect();
+                if !live.is_empty() {
+                    let now = SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .map_or(0, |elapsed| elapsed.as_millis() as i64);
+                    for dispatch_id in &live {
+                        let _ = store.settle_dispatch(dispatch_id, "failed", None, now);
+                    }
+                    let _ = crate::engine::persist_orchestration(&path, &store);
+                }
+                Ok(json!({ "id": dispose_id }))
+            },
+        );
         if self.active.as_deref() == Some(id) {
             self.active = None;
         }
@@ -3182,6 +2947,24 @@ impl CanvasView {
         canvas::View::new(&self.canvas.camera, Pos2::ZERO)
     }
 
+    /// Which widget fills the work area: the active widget, or the topmost
+    /// one when nothing is focused. `z` is the pane's position in the strip.
+    fn shown_widget_id(&self) -> Option<String> {
+        if let Some(id) = self
+            .active
+            .as_deref()
+            .filter(|id| self.canvas.widgets.contains_key(*id))
+        {
+            return Some(id.to_owned());
+        }
+        self.canvas
+            .widgets
+            .values()
+            .max_by(|a, b| a.z.total_cmp(&b.z))
+            .map(|w| w.id.clone())
+    }
+
+
     /// The command bar's `activeTerminalId`: the configured target while
     /// that terminal still lives, else the topmost one — the shell's
     /// `terminals[0]?.id` fallback on its z-descending list.
@@ -3216,14 +2999,7 @@ impl CanvasView {
 
     /// `chooseSuggestion` — fill the input with `prefix + kind + " "` and
     /// keep it open for the rest of the line.
-    fn adopt_suggestion(&mut self) {
-        let suggestions = self.command_suggestions();
-        let Some((kind, _, _)) = suggestions
-            .get(self.command_suggestion.min(suggestions.len().saturating_sub(1)))
-        else {
-            return;
-        };
-        let kind = kind.clone();
+    fn adopt_kind(&mut self, kind: &str) {
         let prefix = self
             .command_bar
             .as_deref()
@@ -3241,6 +3017,81 @@ impl CanvasView {
             });
         self.command_bar = Some(format!("{prefix}{kind} "));
         self.command_suggestion = 0;
+    }
+
+    /// The `/agent` verb — `agent <name> <command…>` saves a launcher chip
+    /// (`UiPreferences::custom_agents`, persisted to `native-ui.json`),
+    /// `agent rm <name>` drops one, a bare `agent` prints usage. T3 Code's
+    /// "Other" provider slot, kept at PTY fidelity.
+    fn add_agent_line(&mut self, buffer: &str) {
+        let mut parts = buffer.trim_start().split_whitespace();
+        let _verb = parts.next();
+        let rest: Vec<&str> = parts.collect();
+        match rest.as_slice() {
+            ["rm", name] | ["remove", name] => {
+                let before = self.prefs.custom_agents.len();
+                self.prefs
+                    .custom_agents
+                    .retain(|a| a.id != *name && a.label != *name);
+                if self.prefs.custom_agents.len() == before {
+                    self.notice(format!("no custom agent `{name}`"));
+                } else {
+                    let _ = self
+                        .prefs
+                        .save(&slate_app::ui_preferences::UiPreferences::path());
+                    self.notice(format!("agent removed: {name}"));
+                }
+            }
+            [name, command @ ..] if !command.is_empty() => {
+                let slug: String = name
+                    .to_lowercase()
+                    .chars()
+                    .map(|c| {
+                        if c.is_ascii_alphanumeric() || c == '-' {
+                            c
+                        } else {
+                            '-'
+                        }
+                    })
+                    .collect();
+                let id = format!("custom-{slug}");
+                let command = command.join(" ");
+                self.prefs.custom_agents.retain(|a| a.id != id);
+                self.prefs
+                    .custom_agents
+                    .push(slate_app::ui_preferences::CustomAgent {
+                        id,
+                        label: (*name).to_owned(),
+                        command,
+                    });
+                let _ = self
+                    .prefs
+                    .save(&slate_app::ui_preferences::UiPreferences::path());
+                self.notice(format!("agent added: {name}"));
+            }
+            _ => self.notice("usage: /agent <name> <command> — /agent rm <name> removes"),
+        }
+    }
+
+    fn adopt_suggestion(&mut self) {
+        let suggestions = self.command_suggestions();
+        let Some((kind, _, _)) = suggestions
+            .get(self.command_suggestion.min(suggestions.len().saturating_sub(1)))
+        else {
+            return;
+        };
+        self.adopt_kind(&kind.clone());
+    }
+
+    /// The summon-only command bar's two click verbs: `↵` is Enter's
+    /// `submitCommand`, `suggest:<kind>` a listbox row's adopt.
+    pub(crate) fn commandbar_command(&mut self, action: &str, cx: &mut Context<Self>) {
+        if action == "submit" {
+            self.submit_command_bar(self.viewport, cx);
+        } else if let Some(kind) = action.strip_prefix("suggest:") {
+            self.adopt_kind(kind);
+        }
+        cx.notify();
     }
 
     /// `submitCommand` — the form's Enter/↵ path, shared by the keypress
@@ -3279,6 +3130,25 @@ impl CanvasView {
             self.command_bar = Some(buffer);
             cx.notify();
             return;
+        }
+        // `/agent <name> <command>` — the launcher's "+ Other" flow. Runs
+        // in command mode only; message mode keeps treating it as text.
+        if !self.command_message {
+            let first = buffer
+                .trim_start()
+                .split_whitespace()
+                .next()
+                .unwrap_or("");
+            let verb = first
+                .strip_prefix(|c: char| "/.@".contains(c))
+                .unwrap_or(first);
+            if verb.eq_ignore_ascii_case("agent") {
+                self.add_agent_line(&buffer);
+                self.command_bar = Some(String::new());
+                self.command_suggestion = 0;
+                cx.notify();
+                return;
+            }
         }
         let target = self.command_target_terminal();
         if self.command_message {
@@ -3326,15 +3196,11 @@ impl CanvasView {
         let document =
             slate_app::planner_document::PlannerDocument::open(dir.join("workspace-planner.json"))
                 .ok()?;
-        let owned;
-        let log = match &self.journal {
-            Some(log) => log,
-            None => {
-                owned = JournalLog::open(dir.join("command-journal.ndjson")).ok()?;
-                &owned
-            }
-        };
-        let items = document.folded_items(log, today).ok()?;
+        // Open the journal fresh — commits land through the submit path,
+        // which writes via its own handles, so a cached handle would fold a
+        // stale tail forever.
+        let log = JournalLog::open(journal_path()).ok()?;
+        let items = document.folded_items(&log, today).ok()?;
         Some(slate_app::planner::next_order(items.values(), day))
     }
 
@@ -3561,15 +3427,58 @@ impl CanvasView {
                             None => {
                                 self.notice("delete refused — path escapes workspace")
                             }
+                            // `file.delete` on `file:{path}` — the removal
+                            // runs inside the gate chain like the original's
+                            // apply, so a failed delete journals
+                            // intent+abort rather than landing silently.
                             Some(path) => {
-                                let result = if path.is_dir() {
-                                    std::fs::remove_dir_all(&path)
-                                } else {
-                                    std::fs::remove_file(&path)
-                                };
-                                if let Err(error) = result {
-                                    self.notice(format!("delete {}: {error}", path.display()));
-                                }
+                                let path_str = path.to_string_lossy().into_owned();
+                                let for_work = path.clone();
+                                let _ = self.commit_work(
+                                    "user",
+                                    "file.delete",
+                                    &slate_app::resources::file_resource(&path_str),
+                                    json!({ "path": path_str }),
+                                    move || {
+                                        // The apply's lstat: a missing path is
+                                        // `not_found`, a symlink is refused
+                                        // before `is_dir()` can follow it.
+                                        let meta = match std::fs::symlink_metadata(&for_work) {
+                                            Ok(meta) => meta,
+                                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                                return Err(command_failed(
+                                                    slate_app::command::ErrorCode::NotFound,
+                                                    "Target does not exist",
+                                                ));
+                                            }
+                                            Err(e) => {
+                                                return Err(command_failed(
+                                                    slate_app::command::ErrorCode::Failed,
+                                                    e.to_string(),
+                                                ));
+                                            }
+                                        };
+                                        if meta.file_type().is_symlink() {
+                                            return Err(command_failed(
+                                                slate_app::command::ErrorCode::Invalid,
+                                                "refusing to delete a symlink",
+                                            ));
+                                        }
+                                        let result = if meta.is_dir() {
+                                            std::fs::remove_dir_all(&for_work)
+                                        } else {
+                                            std::fs::remove_file(&for_work)
+                                        };
+                                        result
+                                            .map(|_| json!({ "ok": true }))
+                                            .map_err(|e| {
+                                                command_failed(
+                                                    slate_app::command::ErrorCode::Failed,
+                                                    e.to_string(),
+                                                )
+                                            })
+                                    },
+                                );
                             }
                         },
                     }
@@ -3585,7 +3494,8 @@ impl CanvasView {
                         Some(dir) => {
                             // `untitled`, `untitled-1`, … — the shell's
                             // placeholder names; rename happens after the
-                            // row exists.
+                            // row exists. Picking the name is not the
+                            // mutation, so it happens before the intent.
                             let mut candidate = dir.join("untitled");
                             for index in 1usize.. {
                                 if !candidate.exists() {
@@ -3593,37 +3503,76 @@ impl CanvasView {
                                 }
                                 candidate = dir.join(format!("untitled-{index}"));
                             }
-                            // 'wx'-style exclusivity like the shell's
-                            // file.create — no clobbering a file that
-                            // appeared between the existence check and open.
-                            let result = if kind == "dir" {
-                                std::fs::create_dir(&candidate)
+                            // `file.create`/`file.mkdir` on `file:{path}` —
+                            // the 'wx'-style exclusive create runs inside
+                            // the gate chain like the original's apply.
+                            let entry_type = if kind == "dir" {
+                                "file.mkdir"
                             } else {
-                                std::fs::OpenOptions::new()
-                                    .write(true)
-                                    .create_new(true)
-                                    .open(&candidate)
-                                    .map(|_| ())
+                                "file.create"
                             };
-                            match result {
-                                Err(error) => {
-                                    self.notice(format!("create {}: {error}", candidate.display()))
-                                }
-                                Ok(()) => {
-                                    // fix-files: the create → rename flow —
-                                    // the fresh `untitled` row opens its
-                                    // inline rename immediately, seeded
-                                    // with the placeholder name.
-                                    self.files_editing =
-                                        Some(crate::views_files::FilesEditing::Rename {
-                                            id: id.to_owned(),
-                                            path: candidate.to_string_lossy().into_owned(),
-                                            buffer: candidate
-                                                .file_name()
-                                                .map(|n| n.to_string_lossy().into_owned())
-                                                .unwrap_or_default(),
-                                        });
-                                }
+                            let path_str = candidate.to_string_lossy().into_owned();
+                            let for_work = candidate.clone();
+                            let is_dir = kind == "dir";
+                            let committed = self.commit_work(
+                                "user",
+                                entry_type,
+                                &slate_app::resources::file_resource(&path_str),
+                                json!({ "path": path_str }),
+                                move || {
+                                    // `file.mkdir` created the parents
+                                    // recursively, then the leaf atomically;
+                                    // `file.create` opened 'wx' — EEXIST is
+                                    // its own message either way.
+                                    let result = if is_dir {
+                                        if let Some(parent) = for_work.parent() {
+                                            let _ = std::fs::create_dir_all(parent);
+                                        }
+                                        std::fs::create_dir(&for_work).map_err(|e| {
+                                            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                                                "Folder already exists".to_owned()
+                                            } else {
+                                                e.to_string()
+                                            }
+                                        })
+                                    } else {
+                                        std::fs::OpenOptions::new()
+                                            .write(true)
+                                            .create_new(true)
+                                            .open(&for_work)
+                                            .map(|_| ())
+                                            .map_err(|e| {
+                                                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                                                    "File already exists".to_owned()
+                                                } else {
+                                                    e.to_string()
+                                                }
+                                            })
+                                    };
+                                    result
+                                        .map(|_| json!({ "ok": true }))
+                                        .map_err(|message| {
+                                            command_failed(
+                                                slate_app::command::ErrorCode::Failed,
+                                                message,
+                                            )
+                                        })
+                                },
+                            );
+                            if committed.is_ok() {
+                                // fix-files: the create → rename flow —
+                                // the fresh `untitled` row opens its
+                                // inline rename immediately, seeded
+                                // with the placeholder name.
+                                self.files_editing =
+                                    Some(crate::views_files::FilesEditing::Rename {
+                                        id: id.to_owned(),
+                                        path: candidate.to_string_lossy().into_owned(),
+                                        buffer: candidate
+                                            .file_name()
+                                            .map(|n| n.to_string_lossy().into_owned())
+                                            .unwrap_or_default(),
+                                    });
                             }
                         }
                     }
@@ -3659,11 +3608,47 @@ impl CanvasView {
                                 match target {
                                     None => self
                                         .notice("rename refused — path escapes workspace"),
-                                    Some(target) => match std::fs::rename(&src, &target) {
-                                        Err(error) => {
-                                            self.notice(format!("Failed to rename: {error}"))
-                                        }
-                                        Ok(()) => {
+                                    // `file.rename` on `file:{src}` —
+                                    // `{path: src, to: destination}` like
+                                    // `sendFileCommand` sent.
+                                    Some(target) => {
+                                        let src_str = src.to_string_lossy().into_owned();
+                                        let target_str = target.to_string_lossy().into_owned();
+                                        let for_work = (src.clone(), target.clone());
+                                        let committed = self.commit_work(
+                                            "user",
+                                            "file.rename",
+                                            &slate_app::resources::file_resource(&src_str),
+                                            json!({ "path": src_str, "to": target_str }),
+                                            move || {
+                                                // The apply's guards: a
+                                                // missing source is
+                                                // `not_found`, an existing
+                                                // destination is refused —
+                                                // `fs::rename` overwrites.
+                                                if !for_work.0.exists() {
+                                                    return Err(command_failed(
+                                                        slate_app::command::ErrorCode::NotFound,
+                                                        "Source file does not exist",
+                                                    ));
+                                                }
+                                                if for_work.1.exists() {
+                                                    return Err(command_failed(
+                                                        slate_app::command::ErrorCode::Failed,
+                                                        "Target file name already exists",
+                                                    ));
+                                                }
+                                                std::fs::rename(&for_work.0, &for_work.1)
+                                                    .map(|_| json!({ "ok": true }))
+                                                    .map_err(|e| {
+                                                        command_failed(
+                                                            slate_app::command::ErrorCode::Failed,
+                                                            e.to_string(),
+                                                        )
+                                                    })
+                                            },
+                                        );
+                                        if committed.is_ok() {
                                             self.notice(format!("Renamed to \"{name}\""));
                                             // The original re-viewed an
                                             // open preview at the new
@@ -3711,7 +3696,7 @@ impl CanvasView {
                                                 self.files_editing = None;
                                             }
                                         }
-                                    },
+                                    }
                                 }
                             }
                         }
@@ -4082,61 +4067,6 @@ impl CanvasView {
         }
     }
 
-    fn raise(&mut self, id: &str) {
-        let top = self
-            .canvas
-            .widgets
-            .values()
-            .map(|widget| widget.z)
-            .fold(0.0, f64::max);
-        let updated = {
-            let Some(widget) = self.canvas.widgets.get_mut(id) else {
-                return;
-            };
-            if widget.z < top {
-                widget.z = top + 1.0;
-                Some(widget.clone())
-            } else {
-                None
-            }
-        };
-        // bringToFront journaled the new z on press — a click that raises
-        // without dragging still has to reach the store.
-        if let Some(widget) = updated {
-            self.commit_widget(&widget);
-        }
-    }
-
-    /// Fit every widget into the viewport (the original's F key). The shell's
-    /// fitCameraToRect skipped maximized widgets — their stored rect is the
-    /// pre-maximize frame — and never zoomed in: `min(1, …)`.
-    fn fit(&mut self, viewport: Vec2, cx: &mut Context<Self>) {
-        let (mut min_x, mut min_y, mut max_x, mut max_y) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
-        let mut any = false;
-        for widget in self.canvas.widgets.values() {
-            if widget.maximized {
-                continue;
-            }
-            any = true;
-            min_x = min_x.min(widget.x);
-            min_y = min_y.min(widget.y);
-            max_x = max_x.max(widget.x + widget.w);
-            max_y = max_y.max(widget.y + widget.h);
-        }
-        if !any {
-            return;
-        }
-        let (bw, bh) = ((max_x - min_x).max(1.0), (max_y - min_y).max(1.0));
-        let zoom = ((viewport.x as f64 - 64.0) / bw)
-            .min((viewport.y as f64 - 64.0) / bh)
-            .min(1.0)
-            .max(canvas::MIN_ZOOM as f64);
-        self.canvas.camera.zoom = zoom;
-        self.canvas.camera.x = (viewport.x as f64 - bw * zoom) / 2.0 - min_x * zoom;
-        self.canvas.camera.y = (viewport.y as f64 - bh * zoom) / 2.0 - min_y * zoom;
-        self.commit_camera();
-        cx.notify();
-    }
 
     fn widget_kind(&self, id: &str) -> Option<String> {
         self.canvas
@@ -4146,54 +4076,16 @@ impl CanvasView {
     }
 
     /// The keyboard's "is a terminal" test — a canvas widget of a
-    /// terminal kind, or a Code view session's PTY (a manager terminal
-    /// that owns no widget) while the Code view is up.
+    /// terminal kind, or a session PTY (a manager terminal that owns no
+    /// widget).
     fn terminal_targetable(&self, id: &str) -> bool {
         is_terminal_kind(self.widget_kind(id).as_deref())
-            || (self.active_view == ActiveView::Code
-                && self
-                    .code_sessions
-                    .iter()
-                    .any(|session| session.terminal_id == id))
+            || self
+                .code_sessions
+                .iter()
+                .any(|session| session.terminal_id == id)
     }
 
-    /// `setActiveView` — the tablist's switch. Canvas transients (menus,
-    /// an open command bar, a frame focus, a pending close confirm) don't
-    /// survive the hop; leaving Code drops a session's claim on `active`
-    /// so the canvas doesn't route keys at a hidden card, and entering
-    /// Code restores the focused session's claim.
-    fn set_active_view(&mut self, view: ActiveView) {
-        self.active_view = view;
-        self.menu = None;
-        self.agent_menu = None;
-        self.arrange_menu = false;
-        self.toolbar_overflow = false;
-        self.command_bar = None;
-        self.frame_focus = None;
-        self.pending_close = None;
-        match view {
-            ActiveView::Code => {
-                if let Some(session) = self
-                    .code_focused
-                    .as_deref()
-                    .and_then(|id| self.code_sessions.iter().find(|s| s.id == id))
-                {
-                    self.active = Some(session.terminal_id.clone());
-                }
-            }
-            _ => {
-                if let Some(id) = self.active.clone() {
-                    if self
-                        .code_sessions
-                        .iter()
-                        .any(|s| s.terminal_id == id)
-                    {
-                        self.active = None;
-                    }
-                }
-            }
-        }
-    }
 
     /// The Code grid's top-left in window space — the cover's offset plus
     /// the pane's own chrome (title strip, then the launcher row).
@@ -4245,11 +4137,11 @@ impl CanvasView {
     /// body. Border 1px + the 24px card header + the body's 4px pad come
     /// off first — same accounting `terminal_cell` runs for widgets.
     fn code_cell(rect: &canvas::Rect, offset: Pos2, pointer: Pos2) -> (u16, u16) {
-        let col = ((pointer.x - offset.x - rect.left() - 5.0) / 7.64)
+        let col = ((pointer.x - offset.x - rect.left() - 5.0) / CELL_W)
             .floor()
             .max(0.0) as u16;
         let row = ((pointer.y - offset.y - rect.top() - crate::views_code::CARD_HEADER_H - 5.0)
-            / 12.0)
+            / CELL_H)
             .floor()
             .max(0.0) as u16;
         (col, row)
@@ -4343,6 +4235,45 @@ impl CanvasView {
     ) {
         match action {
             "launcher" => self.code_launcher_open = !self.code_launcher_open,
+            "add_agent" => {
+                // The "+ Other" chip — the command bar is the app's only
+                // text input, so adding a CLI is a `/agent` line there.
+                let prefix = self.settings.command_prefix();
+                let sigil = if prefix == "any" { "/" } else { prefix };
+                self.command_bar = Some(format!("{sigil}agent "));
+            }
+            "toggle_worktree" => self.code_worktree = !self.code_worktree,
+            "pin_session" => {
+                if let Some(id) = payload.get("id").and_then(Value::as_str) {
+                    if let Some(session) =
+                        self.code_sessions.iter_mut().find(|s| s.id == id)
+                    {
+                        session.pinned = !session.pinned;
+                    }
+                }
+            }
+            "settle_session" => {
+                if let Some(id) = payload.get("id").and_then(Value::as_str) {
+                    if let Some(session) =
+                        self.code_sessions.iter_mut().find(|s| s.id == id)
+                    {
+                        session.settled = true;
+                        session.pinned = false;
+                        if self.code_focused.as_deref() == Some(id) {
+                            self.code_focused = None;
+                        }
+                    }
+                }
+            }
+            "restore_session" => {
+                if let Some(id) = payload.get("id").and_then(Value::as_str) {
+                    if let Some(session) =
+                        self.code_sessions.iter_mut().find(|s| s.id == id)
+                    {
+                        session.settled = false;
+                    }
+                }
+            }
             "layout" => {
                 if let Ok(mode) = serde_json::from_value::<slate_app::code_layout::CodeLayout>(
                     payload.get("mode").cloned().unwrap_or(Value::Null),
@@ -4369,10 +4300,193 @@ impl CanvasView {
                 // the canvas widget instead. `custom` (empty command)
                 // launches a bare shell.
                 if agent == "browser" {
-                    self.notice("browser isn't a terminal — spawn the canvas widget");
+                    self.notice("browser isn't a terminal — spawn the browser widget");
                 } else {
-                    self.launch_code_session(agent, command, cx);
+                    self.launch_code_session(agent, command, None, self.code_worktree, cx);
                 }
+            }
+            "pick_folder" => {
+                // The empty state's "Change" — `workspace.pickDir` in the
+                // original: a directory chooser adopted on pick.
+                let picked = cx.prompt_for_paths(gpui::PathPromptOptions {
+                    files: false,
+                    directories: true,
+                    multiple: false,
+                    prompt: Some("Workspace folder".into()),
+                });
+                cx.spawn(async move |this, cx| {
+                    if let Ok(Ok(Some(paths))) = picked.await {
+                        if let Some(path) = paths.first() {
+                            let dir = path.to_string_lossy().into_owned();
+                            let _ = this.update(cx, |this, cx| {
+                                this.switch_workspace(dir.clone());
+                                this.notice(format!("workspace → {dir}"));
+                                cx.notify();
+                            });
+                        }
+                    }
+                })
+                .detach();
+            }
+            "toggle_agent" => {
+                if let Some(id) = payload.get("id").and_then(Value::as_str) {
+                    let id = id.to_owned();
+                    if let Some(at) = self.code_selected_agents.iter().position(|a| *a == id) {
+                        self.code_selected_agents.remove(at);
+                        if self.code_active_agent.as_deref() == Some(id.as_str()) {
+                            self.code_active_agent = self.code_selected_agents.first().cloned();
+                        }
+                    } else {
+                        self.code_selected_agents.push(id.clone());
+                        self.code_active_agent = Some(id);
+                    }
+                }
+            }
+            "set_count" => {
+                if let (Some(id), Some(count)) = (
+                    self.code_active_agent.clone(),
+                    payload.get("count").and_then(Value::as_u64),
+                ) {
+                    self.code_agent_counts.insert(id, count.max(1) as u32);
+                }
+            }
+            "launch_selected" => {
+                // `launchWorkspace` — each picked agent at its own count,
+                // fan-out in one click.
+                let picks = self.code_selected_agents.clone();
+                for id in picks {
+                    let count = self.code_agent_counts.get(&id).copied().unwrap_or(1);
+                    let command = crate::views_code::CODE_AGENTS
+                        .iter()
+                        .find(|a| a.id == id)
+                        .map(|a| a.command.to_owned())
+                        .or_else(|| {
+                            self.prefs
+                                .custom_agents
+                                .iter()
+                                .find(|a| a.id == id)
+                                .map(|a| a.command.clone())
+                        });
+                    let Some(command) = command else {
+                        continue;
+                    };
+                    for _ in 0..count {
+                        self.launch_code_session(&id, &command, None, self.code_worktree, cx);
+                    }
+                }
+                self.code_selected_agents.clear();
+                self.code_agent_counts.clear();
+                self.code_active_agent = None;
+            }
+            "resume_toggle" => {
+                if let Some(key) = payload.get("key").and_then(Value::as_str) {
+                    if !self.code_resume_selected.remove(key) {
+                        self.code_resume_selected.insert(key.to_owned());
+                    }
+                }
+            }
+            "resume_select_all" => {
+                // Ticking rows that are folded away would be a count with
+                // nothing behind it — expand so the ticks are visible.
+                let dismissed = &self.code_resume_dismissed;
+                let all_selected = self
+                    .code_conversations
+                    .iter()
+                    .filter(|c| !dismissed.contains(&slate_app::code_resume::conversation_key(c.agent_id, &c.id)))
+                    .all(|c| self.code_resume_selected.contains(&slate_app::code_resume::conversation_key(c.agent_id, &c.id)));
+                if all_selected {
+                    self.code_resume_selected.clear();
+                } else {
+                    self.code_resume_selected = self
+                        .code_conversations
+                        .iter()
+                        .filter(|c| !dismissed.contains(&slate_app::code_resume::conversation_key(c.agent_id, &c.id)))
+                        .map(|c| slate_app::code_resume::conversation_key(c.agent_id, &c.id))
+                        .collect();
+                    if self.code_resume_selected.len() > slate_app::code_resume::COLLAPSED_ROWS {
+                        self.code_resume_expanded = true;
+                    }
+                }
+            }
+            "resume_expand" => self.code_resume_expanded = !self.code_resume_expanded,
+            "resume_dismiss" => {
+                if let Some(key) = payload.get("key").and_then(Value::as_str) {
+                    self.code_resume_dismissed.insert(key.to_owned());
+                    self.code_resume_selected.remove(key);
+                    self.save_resume_dismissed();
+                }
+            }
+            "resume_dismiss_all" => {
+                self.code_resume_dismissed = self
+                    .code_conversations
+                    .iter()
+                    .map(|c| slate_app::code_resume::conversation_key(c.agent_id, &c.id))
+                    .collect();
+                self.code_resume_selected.clear();
+                self.save_resume_dismissed();
+            }
+            "resume_restore_all" => {
+                self.code_resume_dismissed.clear();
+                self.save_resume_dismissed();
+            }
+            "resume_refresh" => {
+                self.code_resume_dir = None;
+            }
+            "resume_copy" => {
+                if let Some(command) = payload.get("command").and_then(Value::as_str) {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(command.to_owned()));
+                }
+            }
+            "resume" => {
+                // `resumeConversation` — the same agent started with its
+                // own resume command, the conversation title as the card's.
+                let agent = payload
+                    .get("agent")
+                    .and_then(Value::as_str)
+                    .unwrap_or("custom");
+                let command = payload
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let title = payload
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .map(|t| t.trim().chars().take(80).collect::<String>())
+                    .filter(|t| !t.is_empty());
+                if !command.is_empty() {
+                    self.launch_code_session(agent, command, title, false, cx);
+                }
+            }
+            "resume_all" => {
+                // The bulk button: a ticked selection resumes verbatim, an
+                // empty one takes the newest `RESUME_ALL_MAX`.
+                let visible: Vec<_> = self
+                    .code_conversations
+                    .iter()
+                    .filter(|c| {
+                        !self.code_resume_dismissed.contains(
+                            &slate_app::code_resume::conversation_key(c.agent_id, &c.id),
+                        )
+                    })
+                    .cloned()
+                    .collect();
+                let remaining = 32usize.saturating_sub(self.code_sessions.len());
+                for conversation in slate_app::code_resume::conversations_to_resume(
+                    &visible,
+                    &self.code_resume_selected,
+                    remaining,
+                ) {
+                    let title = {
+                        let t = conversation.title.trim().chars().take(80).collect::<String>();
+                        if t.is_empty() {
+                            None
+                        } else {
+                            Some(t)
+                        }
+                    };
+                    self.launch_code_session(conversation.agent_id, &conversation.command, title, false, cx);
+                }
+                self.code_resume_selected.clear();
             }
             "focus_session" => {
                 if let Some(id) = payload.get("id").and_then(Value::as_str) {
@@ -4390,6 +4504,20 @@ impl CanvasView {
                     if let Some(at) = self.code_sessions.iter().position(|s| s.id == id) {
                         let session = self.code_sessions.remove(at);
                         let _ = self.manager.dispose(&session.terminal_id);
+                        // A worktree-backed session returns its tree and
+                        // `slate/<id>` branch — `git worktree remove
+                        // --force` matches t3code's discard semantics.
+                        if let Some(tree) = &session.worktree {
+                            if let Some(dir) = self.workspace_dir.clone() {
+                                let branch = format!("slate/{}", session.id);
+                                let _ = std::process::Command::new("git")
+                                    .args(["-C", &dir, "worktree", "remove", "--force", tree])
+                                    .output();
+                                let _ = std::process::Command::new("git")
+                                    .args(["-C", &dir, "branch", "-D", &branch])
+                                    .output();
+                            }
+                        }
                         // Drop the session's bookkeeping too — a stale
                         // term_cells entry suppresses the next resize, and
                         // queued commands would write into nothing.
@@ -4403,6 +4531,9 @@ impl CanvasView {
                         if self.code_focused.as_deref() == Some(id) {
                             self.code_focused = None;
                         }
+                        if self.code_sessions.is_empty() {
+                            self.code_resume_dir = None;
+                        }
                     }
                 }
             }
@@ -4415,7 +4546,63 @@ impl CanvasView {
     /// no canvas widget, the agent command queued for the first tick once
     /// the PTY reaches its read loop (the same `spawn + write_text` the
     /// canvas's agent menu runs).
-    fn launch_code_session(&mut self, agent: &str, command: &str, cx: &mut Context<Self>) {
+    /// The resume scan's dismissal list, persisted for `workspace_dir` —
+    /// the original's `writeDismissed` localStorage key.
+    fn save_resume_dismissed(&self) {
+        let Some(dir) = self.workspace_dir.clone() else { return };
+        let live: std::collections::HashSet<String> = self
+            .code_conversations
+            .iter()
+            .map(|c| slate_app::code_resume::conversation_key(c.agent_id, &c.id))
+            .collect();
+        slate_app::code_resume::save_dismissed(dir.as_str(), &self.code_resume_dismissed, &live);
+    }
+
+    /// Kick a background scan when the empty grid is showing — the
+    /// `ResumeAgents` mount in the original. `code_resume_dir` arms once
+    /// per folder; a refresh or a workspace switch re-arms it.
+    fn maybe_scan_resume(&mut self, cx: &mut Context<Self>) {
+        if !self.code_sessions.is_empty()
+            || self.code_resume_loading
+        {
+            return;
+        }
+        let Some(dir) = self.workspace_dir.clone() else { return };
+        if self.code_resume_dir.as_deref() == Some(dir.as_str()) {
+            return;
+        }
+        self.code_resume_dir = Some(dir.clone());
+        self.code_resume_loading = true;
+        cx.spawn(async move |this, cx| {
+            let scan = cx
+                .background_executor()
+                .spawn(async move { slate_app::code_resume::list(&dir, None, None) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.code_conversations = scan;
+                this.code_resume_loading = false;
+                // The folder's persisted dismissals join the fresh scan;
+                // keys for conversations that no longer exist drop out.
+                this.code_resume_dismissed = this
+                    .workspace_dir
+                    .as_deref()
+                    .map(slate_app::code_resume::load_dismissed)
+                    .unwrap_or_default();
+                this.code_resume_selected.clear();
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn launch_code_session(
+        &mut self,
+        agent: &str,
+        command: &str,
+        title: Option<String>,
+        worktree: bool,
+        cx: &mut Context<Self>,
+    ) {
         // `MAX_CODE_SESSIONS` in the shell — 32 cards was the hard cap.
         if self.code_sessions.len() >= 32 {
             self.notice("code session limit reached (32)");
@@ -4425,14 +4612,44 @@ impl CanvasView {
         self.counter += 1;
         let id = format!("code-{}", self.counter);
         let terminal_id = self.fresh_id("code-term");
-        let cwd = slate_app::workspace::ensure();
-        let live = match self.manager.spawn_with_options(
-            terminal_id.clone(),
+        // t3code's "New worktree" — the session gets
+        // `.slate-trees/<id>` on branch `slate/<id>` inside the workspace
+        // repo, so parallel agents never touch the same checkout.
+        let mut worktree_dir: Option<String> = None;
+        if worktree {
+            match self.workspace_dir.clone() {
+                Some(dir) => {
+                    let branch = format!("slate/{id}");
+                    let tree = format!("{dir}/.slate-trees/{id}");
+                    match std::process::Command::new("git")
+                        .args(["-C", &dir, "worktree", "add", &tree, "-b", &branch])
+                        .output()
+                    {
+                        Ok(out) if out.status.success() => {
+                            worktree_dir = Some(tree);
+                        }
+                        Ok(out) => {
+                            let stderr = String::from_utf8_lossy(&out.stderr);
+                            self.notice(format!(
+                                "worktree failed: {}",
+                                stderr.lines().next().unwrap_or("unknown")
+                            ));
+                        }
+                        Err(error) => self.notice(format!("worktree: {error}")),
+                    }
+                }
+                None => self.notice("worktree needs a workspace folder"),
+            }
+        }
+        let cwd = worktree_dir.clone().or_else(slate_app::workspace::ensure);
+        let live = match mount_spawn(
+            &self.manager,
+            self.workspace_dir.as_deref(),
+            &terminal_id,
             160,
             40,
             cwd,
-            slate_app::platform::shell_command(),
-            HashMap::new(),
+            None,
         ) {
             Ok(live) => live,
             Err(error) => {
@@ -4442,16 +4659,25 @@ impl CanvasView {
             }
         };
         // `session.title || agent.label` — the header reads "Claude Code",
-        // not `claude`; a custom launch is "Other CLI", not `custom`.
-        let label = crate::views_code::CODE_AGENTS
+        // not `claude`; a custom launch is "Other CLI", not `custom`. A
+        // resumed conversation wears its first-prompt title instead.
+        let agent_label = crate::views_code::CODE_AGENTS
             .iter()
             .find(|a| a.id == agent)
             .map(|a| a.label)
+            .or_else(|| {
+                self.prefs
+                    .custom_agents
+                    .iter()
+                    .find(|a| a.id == agent)
+                    .map(|a| a.label.as_str())
+            })
             .unwrap_or(agent)
             .to_owned();
+        let label = title.unwrap_or_else(|| agent_label.clone());
         // The toolbar's terminal roster and `slate tell` resolve by name —
         // a session's PTY should answer to its agent label.
-        self.manager.set_name(&terminal_id, &label);
+        self.manager.set_name(&terminal_id, &agent_label);
         self.code_sessions.push(crate::views_code::CodeSession {
             id: id.clone(),
             agent_id: agent.to_owned(),
@@ -4459,6 +4685,9 @@ impl CanvasView {
             command: command.to_owned(),
             terminal_id: terminal_id.clone(),
             alive: true,
+            pinned: false,
+            settled: false,
+            worktree: worktree_dir,
         });
         self.code_focused = Some(id);
         self.active = Some(terminal_id.clone());
@@ -4484,9 +4713,14 @@ impl CanvasView {
         if count == 0 {
             return;
         }
-        // `views_code`'s HEADER_H (34) + LAUNCHER_H (44) and the card's
+        // `views_code`'s HEADER_H + LAUNCHER_H and the card's
         // 24px header — duplicated so the pane file stays standalone.
-        let chrome = 34.0 + if self.code_launcher_open { 44.0 } else { 0.0 };
+        let chrome = crate::views_code::HEADER_H
+            + if self.code_launcher_open {
+                crate::views_code::LAUNCHER_H
+            } else {
+                0.0
+            };
         let height = (viewport.y - canvas::TITLE_BAR_HEIGHT - chrome).max(0.0);
         let area = canvas::Rect::from_min_size(
             canvas::Pos2::ZERO,
@@ -4500,7 +4734,7 @@ impl CanvasView {
         let rects =
             slate_app::code_layout::arrange(self.code_layout, area, count, focus);
         // The card header takes 24px; the terminal body pads 4px a side
-        // and its grid advances 7.64×12px — the painter's metrics.
+        // and its grid advances CELL_W×CELL_H px — the painter's metrics.
         // Collect first — the iterator borrows `code_sessions`, and the
         // debounced sync below needs `&mut self`.
         let pending: Vec<(String, u16, u16)> = self
@@ -4508,8 +4742,8 @@ impl CanvasView {
             .iter()
             .zip(rects)
             .map(|(session, rect)| {
-                let cols = ((rect.width() - 8.0) / 7.64).floor().clamp(20.0, 500.0) as u16;
-                let rows = ((rect.height() - 32.0) / 12.0)
+                let cols = ((rect.width() - 8.0) / CELL_W).floor().clamp(20.0, 500.0) as u16;
+                let rows = ((rect.height() - 32.0) / CELL_H)
                     .floor()
                     .clamp(4.0, 300.0) as u16;
                 (session.terminal_id.clone(), cols, rows)
@@ -4546,88 +4780,6 @@ impl CanvasView {
         }
     }
 
-    /// The Overview's verbs — `views_overview::overview_pane` dispatches
-    /// here (see its module doc for the payload contract).
-    pub(crate) fn overview_command(
-        &mut self,
-        action: &str,
-        payload: Value,
-        cx: &mut Context<Self>,
-    ) {
-        match action {
-            "focus_widget" => {
-                if let Some(id) = payload.get("id").and_then(Value::as_str) {
-                    // The minimap/roster press: the "focus" sidebar verb —
-                    // raise + center the camera at 1× — then show the
-                    // canvas the widget lives on.
-                    self.raise(id);
-                    self.active = Some(id.to_owned());
-                    if let Some(widget) = self.canvas.widgets.get(id).cloned() {
-                        let zoom = self.canvas.camera.zoom.max(0.2);
-                        self.canvas.camera.x = self.viewport.x as f64 / 2.0
-                            - (widget.x + widget.w / 2.0) * zoom;
-                        self.canvas.camera.y = self.viewport.y as f64 / 2.0
-                            - (widget.y + widget.h / 2.0) * zoom;
-                        self.commit_camera();
-                    }
-                    self.set_active_view(ActiveView::Canvas);
-                }
-            }
-            "open_recent" => {
-                if let Some(path) = payload.get("path").and_then(Value::as_str) {
-                    // The shell's onDirChange hydrated the new workspace's
-                    // canvas live — same swap here, no restart needed.
-                    self.switch_workspace(path.to_owned());
-                    self.notice(format!("workspace → {path}"));
-                }
-            }
-            "pick_folder" => {
-                // The original's `onPickDir` — `workspace.pickDir` opened
-                // a directory chooser and adopted the pick.
-                let picked = cx.prompt_for_paths(gpui::PathPromptOptions {
-                    files: false,
-                    directories: true,
-                    multiple: false,
-                    prompt: Some("Workspace folder".into()),
-                });
-                cx.spawn(async move |this, cx| {
-                    if let Ok(Ok(Some(paths))) = picked.await {
-                        if let Some(path) = paths.first() {
-                            let dir = path.to_string_lossy().into_owned();
-                            let _ = this.update(cx, |this, cx| {
-                                this.switch_workspace(dir.clone());
-                                this.notice(format!("workspace → {dir}"));
-                                cx.notify();
-                            });
-                        }
-                    }
-                })
-                .detach();
-            }
-            "pin_recent" | "unpin_recent" => {
-                // `pin_recent` toggles — the pane sends the verb that
-                // names the current state, both land here.
-                if let Some(path) = payload.get("path").and_then(Value::as_str) {
-                    let mut state = slate_app::workspace::WorkspaceState::load();
-                    state.pin_recent(path);
-                    state.save();
-                }
-            }
-            "forget_recent" => {
-                if let Some(path) = payload.get("path").and_then(Value::as_str) {
-                    let mut state = slate_app::workspace::WorkspaceState::load();
-                    state.forget_recent(path);
-                    state.save();
-                }
-            }
-            "rename_recent" => {
-                // The original's rename modal has no prompt surface here.
-                self.notice("rename isn't wired yet — edit workspace-state.json");
-            }
-            _ => {}
-        }
-        cx.notify();
-    }
 }
 
 /// The title case the spawn paths give every kind ("files" → "Files").
@@ -4651,54 +4803,6 @@ fn kind_title(kind: &str) -> String {
         .join(" ")
 }
 
-/// (idle, total) jiffies from /proc/stat's aggregate `cpu` line — two
-/// samples apart make a busy percentage, the same trick the Electron
-/// StatusBar's cpu probe used.
-#[cfg(unix)]
-fn proc_stat_sample() -> Option<(u64, u64)> {
-    let text = std::fs::read_to_string("/proc/stat").ok()?;
-    let line = text.lines().next()?;
-    let nums: Vec<u64> = line
-        .split_whitespace()
-        .skip(1)
-        .filter_map(|field| field.parse().ok())
-        .collect();
-    if nums.len() < 4 {
-        return None;
-    }
-    let idle = nums[3] + nums.get(4).copied().unwrap_or(0);
-    let total: u64 = nums.iter().take(8).sum();
-    Some((idle, total))
-}
-
-#[cfg(not(unix))]
-fn proc_stat_sample() -> Option<(u64, u64)> {
-    None
-}
-
-/// Local wall clock as (hour, minute, second) — libc's localtime_r on unix,
-/// UTC arithmetic elsewhere.
-fn clock_hms() -> (u32, u32, u32) {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs());
-    #[cfg(unix)]
-    {
-        unsafe {
-            let raw = secs as libc::time_t;
-            let mut tm: libc::tm = std::mem::zeroed();
-            if !libc::localtime_r(&raw, &mut tm).is_null() {
-                return (tm.tm_hour as u32, tm.tm_min as u32, tm.tm_sec as u32);
-            }
-        }
-    }
-    (
-        (secs / 3600 % 24) as u32,
-        (secs / 60 % 60) as u32,
-        (secs % 60) as u32,
-    )
-}
-
 /// Cells a terminal body of this world size displays at this zoom: the
 /// renderer scales the text with the frame, so the grid shrinks as you zoom
 /// out — same contract the Electron app had with xterm + FitAddon.
@@ -4707,44 +4811,44 @@ fn pack((r, g, b): slate_app::terminal_screen::CellRgb) -> u32 {
     ((r as u32) << 16) | ((g as u32) << 8) | b as u32
 }
 
-/// The frame's screen rect — the world rect through the camera, except a
-/// maximized widget, which is the shell's fixed overlay: the whole viewport
-/// under the title band. Hit-tests and culling all use this so a maximized
-/// frame behaves exactly where it is drawn.
-fn widget_screen_rect(widget: &Widget, view: &canvas::View, viewport: Vec2) -> canvas::Rect {
-    if widget.maximized {
-        canvas::Rect::from_min_size(
-            Pos2::new(0.0, canvas::TITLE_BAR_HEIGHT),
-            Vec2::new(viewport.x, (viewport.y - canvas::TITLE_BAR_HEIGHT).max(0.0)),
-        )
-    } else {
-        view.widget_rect(widget)
-    }
+/// The pane strip's height — the fixed tab row above the work area.
+const PANE_STRIP_H: f32 = 30.0;
+
+/// The work area's screen rect — beside the rail, under the title bar and
+/// the pane strip. The shown widget fills it; there is no camera.
+fn pane_rect(rail_w: f32, viewport: Vec2) -> canvas::Rect {
+    canvas::Rect::from_min_size(
+        Pos2::new(rail_w, canvas::TITLE_BAR_HEIGHT + PANE_STRIP_H),
+        Vec2::new(
+            (viewport.x - rail_w).max(0.0),
+            (viewport.y - canvas::TITLE_BAR_HEIGHT - PANE_STRIP_H).max(0.0),
+        ),
+    )
 }
 
 fn terminal_cells(w: f64, h: f64, zoom: f64) -> (u16, u16) {
     // The same metrics `terminal_cell` (hit-test) and the painter use —
-    // 7.64px advance / 12px row, 1px frame + 4px p_1 padding per side — so
+    // CELL_W advance / CELL_H row, 1px frame + 4px p_1 padding per side — so
     // the PTY grid fills the card the glyph layout actually draws into.
     let body_w = (w * zoom - 10.0).max(40.0) as f32;
     let body_h =
         (h * zoom - theme::geometry::HEADER_HEIGHT as f64 * zoom - 10.0).max(20.0) as f32;
-    let cols = (body_w / (7.64 * zoom as f32).max(2.0)).clamp(20.0, 500.0) as u16;
-    let rows = (body_h / (12.0 * zoom as f32).max(2.0)).clamp(4.0, 300.0) as u16;
+    let cols = (body_w / (CELL_W * zoom as f32).max(2.0)).clamp(20.0, 500.0) as u16;
+    let rows = (body_h / (CELL_H * zoom as f32).max(2.0)).clamp(4.0, 300.0) as u16;
     (cols, rows)
 }
 
 /// Pointer position → terminal cell. The rendered metrics, not the grid
-/// sizing's guesses: rows stack `h(font)` (12·zoom) apart and Departure
-/// Mono advances 0.6364em (≈7.64·zoom at 12px), so a click lands on the
+/// sizing's guesses: rows stack CELL_H·zoom apart and JetBrains Mono
+/// advances 0.6em (CELL_W·zoom at FONT_PX), so a click lands on the
 /// cell the glyph actually occupies. The 4px body padding (p_1) and 1px
 /// frame border come off the top-left first.
 fn terminal_cell(rect: canvas::Rect, zoom: f32, pointer: Pos2) -> (u16, u16) {
     let zoom = zoom.max(0.1);
     let body_x = rect.min.x + 5.0;
     let body_y = rect.min.y + 1.0 + theme::geometry::HEADER_HEIGHT * zoom + 4.0;
-    let col = ((pointer.x - body_x) / (7.64 * zoom)).floor().max(0.0);
-    let row = ((pointer.y - body_y) / (12.0 * zoom)).floor().max(0.0);
+    let col = ((pointer.x - body_x) / (CELL_W * zoom)).floor().max(0.0);
+    let row = ((pointer.y - body_y) / (CELL_H * zoom)).floor().max(0.0);
     (col.min(999.0) as u16, row.min(999.0) as u16)
 }
 
@@ -4872,30 +4976,6 @@ fn blur_wallpaper(url: &str, blur: u64, viewport: Vec2) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// A stroke's "#rrggbb" journal color as the 0xRRGGBBAA `rgba()` wants —
-/// opaque. Anything unreadable falls back to the default white.
-fn stroke_color_u32(color: &str) -> u32 {
-    let hex = color.strip_prefix('#').unwrap_or(color);
-    let rgb = u32::from_str_radix(hex, 16).unwrap_or(0xffffff);
-    (rgb << 8) | 0xff
-}
-
-/// StrokeLayer's `<polyline>`: a stroked path through the points. Under two
-/// points there is no line — the same check the SVG's render skipped.
-fn paint_polyline(window: &mut Window, points: &[Pos2], color: impl Into<Background> + Copy) {
-    if points.len() < 2 {
-        return;
-    }
-    let mut builder = PathBuilder::stroke(px(3.0));
-    builder.move_to(point(px(points[0].x), px(points[0].y)));
-    for p in &points[1..] {
-        builder.line_to(point(px(p.x), px(p.y)));
-    }
-    if let Ok(path) = builder.build() {
-        window.paint_path(path, color);
-    }
-}
-
 fn widget_body(
     widget: &Widget,
     snapshots: &[TerminalSnapshot],
@@ -4932,7 +5012,7 @@ fn widget_body(
     notes_buffer: &str,
     cx: &mut Context<CanvasView>,
 ) -> AnyElement {
-    let font = px(12.0 * zoom);
+    let font = px(FONT_PX * zoom);
     match widget.kind.as_deref() {
         Some("terminal") | None => {
             let snapshot = snapshots.iter().find(|s| s.id == widget.id);
@@ -4994,9 +5074,9 @@ fn widget_body(
             let mut body = div()
                 .size_full()
                 .p_1()
-                .font_family("Departure Mono")
+                .font_family(FONT_FAMILY)
                 .text_size(font)
-                .line_height(gpui::px(17.0 * zoom))
+                .line_height(gpui::px(CELL_H * zoom))
                 .text_color(rgb(theme::hex(theme::text::DIM)));
             let styled = snapshot.map(|s| s.styled.as_slice()).unwrap_or(&[]);
             let blank = styled
@@ -5007,7 +5087,11 @@ fn widget_body(
             } else {
                 let base_bg = theme::hex(theme::monochrome::BASE);
                 for row in styled {
-                    let mut line = div().h(font).flex().flex_row().flex_none();
+                    let mut line = div()
+                        .h(px(CELL_H * zoom))
+                        .flex()
+                        .flex_row()
+                        .flex_none();
                     if row.is_empty() {
                         line = line.child("\u{00a0}");
                     }
@@ -5042,12 +5126,12 @@ fn widget_body(
             // hue-shifted to the sand accent so it sits in the palette.
             // Cells ride the body's p_1 padding, so
             // the overlay starts at the padding edge; the cell geometry is
-            // `terminal_cell`'s inverse (7.64·zoom cols, 12·zoom rows).
+            // `terminal_cell`'s inverse (CELL_W·zoom cols, CELL_H·zoom rows).
             let mut container = div().size_full().relative().child(body);
             if let Some(snapshot) = snapshot {
                 if !snapshot.selection.is_empty() {
-                    let cell_w = px(7.64 * zoom);
-                    let cell_h = px(12.0 * zoom);
+                    let cell_w = px(CELL_W * zoom);
+                    let cell_h = px(CELL_H * zoom);
                     let mut overlay = div().absolute().left(px(4.0)).top(px(4.0));
                     for &(row, start, end) in &snapshot.selection {
                         overlay = overlay.child(
@@ -5166,10 +5250,16 @@ impl Render for CanvasView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let viewport = window.viewport_size();
         let viewport_size = Vec2::new(f32::from(viewport.width), f32::from(viewport.height));
-        let viewport_rect = canvas::Rect::from_min_size(Pos2::ZERO, viewport_size);
         self.viewport = viewport_size;
-        let view = self.view();
-        let zoom = view.zoom;
+        // The work area: beside the rail, under the title bar and the pane
+        // strip. Exactly one widget renders into it.
+        let rail_w = if self.prefs.sidebar_open {
+            theme::geometry::SIDEBAR_EXPANDED
+        } else {
+            theme::geometry::RAIL_WIDTH
+        };
+        let pane = pane_rect(rail_w, viewport_size);
+        let shown_id = self.shown_widget_id();
 
         // The StartupWordmark intro: a particle overlay paints over
         // everything for ~9.2s, driven off this render clock. Any
@@ -5182,7 +5272,15 @@ impl Render for CanvasView {
                 self.splash_started = None;
             } else {
                 let t = started.elapsed().as_secs_f32();
-                if t < SPLASH_DONE {
+                // Done once the post-ready fade has run (the 200ms hold +
+                // 900ms `.is-ready` transition, off `splash_ready_at`).
+                // A fixed clock used to end this — now it ends whenever
+                // real boot work plus the intro beat have both finished.
+                let done = self
+                    .splash_ready_at
+                    .map(|at| at.elapsed().as_secs_f32() >= 1.2)
+                    .unwrap_or(false);
+                if !done {
                     splash_t = Some(t);
                     if self.splash_points.is_empty() {
                         self.splash_points =
@@ -5196,30 +5294,25 @@ impl Render for CanvasView {
             }
         }
 
-        // PTYs follow their frame's rendered size, resized on change only.
+        // The shown terminal's PTY grid tracks the pane rect; hidden panes
+        // keep their stored grid (and their PTY size) until shown again.
         let mut sizes: Vec<(String, u16, u16)> = Vec::new();
         for widget in self.canvas.widgets.values() {
             if is_terminal_kind(widget.kind.as_deref()) {
-                // A maximized widget renders the size of the viewport below
-                // the title band, so feed the PTY its real grid rather than
-                // the saved world size.
-                let (w, h) = if widget.maximized {
-                    (
-                        (viewport_size.x / zoom) as f64,
-                        ((viewport_size.y - canvas::TITLE_BAR_HEIGHT) / zoom) as f64,
-                    )
+                let (w, h) = if shown_id.as_deref() == Some(widget.id.as_str())
+                    || widget.maximized
+                {
+                    (pane.width() as f64, pane.height() as f64)
                 } else {
                     (widget.w, widget.h)
                 };
-                let (cols, rows) = terminal_cells(w, h, zoom as f64);
+                let (cols, rows) = terminal_cells(w, h, 1.0);
                 sizes.push((widget.id.clone(), cols, rows));
             }
         }
         for (id, cols, rows) in sizes {
             self.sync_term_size(&id, cols, rows);
         }
-
-        let camera = self.canvas.camera.clone();
         let mut root = div()
             .id("slate-canvas")
             .size_full()
@@ -5229,10 +5322,6 @@ impl Render for CanvasView {
             .font_family("Plus Jakarta Sans")
             .overflow_hidden()
             .bg(rgb(theme::hex(theme::monochrome::BASE)))
-            // draw and erase both take the shell's crosshair cursor.
-            .when(self.draw_mode || self.erase_mode, |el| {
-                el.cursor_crosshair()
-            })
             .key_context("canvas")
             .track_focus(&self.focus)
             .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _window, cx| {
@@ -5240,17 +5329,16 @@ impl Render for CanvasView {
             }))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                cx.listener(|this, _event: &MouseDownEvent, window, cx| {
                     window.focus(&this.focus, cx);
                     // A click outside the input closes the command bar; the
                     // gesture itself still runs, like the shell's blur.
-                    // The two floating menus (arrange popover, toolbar
-                    // overflow) dismissed on an outside pointerdown too —
-                    // leaving them up over the canvas was a trap.
+                    // The floating menus (arrange popover, agent menu)
+                    // dismissed on an outside pointerdown too — leaving
+                    // them up over the canvas was a trap.
                     this.command_bar = None;
                     this.agent_menu = None;
                     this.arrange_menu = false;
-                    this.toolbar_overflow = false;
                     // The rename input committed on blur — clicking the
                     // canvas away from it does the same.
                     if this.renaming.is_some() {
@@ -5262,56 +5350,7 @@ impl Render for CanvasView {
                     }
                     this.active = None;
                     this.frame_focus = None;
-                    if event.modifiers.shift {
-                        // `button===0 && shiftKey` pans regardless of the
-                        // current tool — the shell's escape hatch.
-                        this.drag = Some(Drag::Pan {
-                            last: pos(event.position),
-                        });
-                    } else if this.erase_mode {
-                        // eraseAt fires on pointerdown, not just on drag —
-                        // a click erases whatever sits under the cursor.
-                        let world = canvas::View::new(&this.canvas.camera, Pos2::ZERO)
-                            .to_world(pos(event.position));
-                        let dirty = this.erase_at(world);
-                        this.drag = Some(Drag::Erase { dirty });
-                    } else if this.draw_mode {
-                        this.pending_stroke.clear();
-                        this.drag = Some(Drag::Stroke {
-                            start: pos(event.position),
-                            moved: false,
-                        });
-                    } else if this.select_mode {
-                        this.drag = Some(Drag::Select {
-                            start: pos(event.position),
-                            rect: None,
-                        });
-                    } else {
-                        this.drag = Some(Drag::Pan {
-                            last: pos(event.position),
-                        });
-                    }
                     cx.notify();
-                }),
-            )
-            .on_mouse_down(
-                MouseButton::Middle,
-                cx.listener(|this, event: &MouseDownEvent, _window, cx| {
-                    // `button===1` pans on any tool — the shell's middle-drag.
-                    this.drag = Some(Drag::Pan {
-                        last: pos(event.position),
-                    });
-                    cx.notify();
-                }),
-            )
-            .on_mouse_up(
-                MouseButton::Middle,
-                cx.listener(|this, _event: &MouseUpEvent, _window, cx| {
-                    if let Some(Drag::Pan { .. }) = this.drag.take() {
-                        this.camera_dirty_at = None;
-                        this.commit_camera();
-                        cx.notify();
-                    }
                 }),
             )
             // OS file drags: the move listener both marks the canvas a drop
@@ -5331,16 +5370,17 @@ impl Render for CanvasView {
                     window.focus(&this.focus, cx);
                     this.agent_menu = None;
                     let pointer = pos(event.position);
-                    let view_now = canvas::View::new(&this.canvas.camera, Pos2::ZERO);
-                    // The menu opens on bare canvas only — right-click inside
-                    // a widget stays with the widget.
+                    // The menu opens on the pane background only — a click
+                    // inside the shown widget stays with the widget.
                     let size = window.viewport_size();
                     let viewport = Vec2::new(f32::from(size.width), f32::from(size.height));
-                    let over_widget = this
-                        .canvas
-                        .widgets
-                        .values()
-                        .any(|w| widget_screen_rect(w, &view_now, viewport).contains(pointer));
+                    let rail_w = if this.prefs.sidebar_open {
+                        theme::geometry::SIDEBAR_EXPANDED
+                    } else {
+                        theme::geometry::RAIL_WIDTH
+                    };
+                    let over_widget = this.shown_widget_id().is_some()
+                        && pane_rect(rail_w, viewport).contains(pointer);
                     this.menu_sel = 0;
                     this.menu = (!over_widget).then_some(pointer);
                     cx.notify();
@@ -5351,13 +5391,16 @@ impl Render for CanvasView {
                 // An in-progress terminal selection follows the pointer even
                 // outside its widget — xterm keeps tracking until mouseup.
                 if let Some(sel_id) = this.selection_drag.clone() {
-                    if let Some(widget) = this.canvas.widgets.get(&sel_id) {
+                    if this.canvas.widgets.contains_key(&sel_id) {
                         let size = _window.viewport_size();
                         let viewport = Vec2::new(f32::from(size.width), f32::from(size.height));
-                        let view_now = canvas::View::new(&this.canvas.camera, Pos2::ZERO);
-                        let rect = widget_screen_rect(widget, &view_now, viewport);
-                        let zoom = this.canvas.camera.zoom as f32;
-                        let (col, row) = terminal_cell(rect, zoom, pointer);
+                        let rail_w = if this.prefs.sidebar_open {
+                            theme::geometry::SIDEBAR_EXPANDED
+                        } else {
+                            theme::geometry::RAIL_WIDTH
+                        };
+                        let rect = pane_rect(rail_w, viewport);
+                        let (col, row) = terminal_cell(rect, 1.0, pointer);
                         let _ = this.manager.selection_update(&sel_id, col, row);
                         this.refresh_selection(&sel_id);
                         cx.notify();
@@ -5406,208 +5449,6 @@ impl Render for CanvasView {
                     }
                     return;
                 }
-                match &this.drag {
-                    Some(Drag::Pan { last }) => {
-                        let dx = pointer.x - last.x;
-                        let dy = pointer.y - last.y;
-                        this.canvas.camera.x += dx as f64;
-                        this.canvas.camera.y += dy as f64;
-                        this.drag = Some(Drag::Pan { last: pointer });
-                        this.camera_dirty_at = Some(Instant::now());
-                        cx.notify();
-                    }
-                    Some(Drag::Widget {
-                        id,
-                        grab,
-                        press,
-                        moved,
-                    }) => {
-                        let id = id.clone();
-                        let grab = *grab;
-                        let press = *press;
-                        let moved = *moved;
-                        // Under 3 screen px of travel the press is a click —
-                        // the widget never moves (the original's threshold).
-                        if !moved && (pointer - press).length() < 3.0 {
-                            return;
-                        }
-                        let view_now = canvas::View::new(&this.canvas.camera, Pos2::ZERO);
-                        let world = view_now.to_world(pointer);
-                        // The header drag also keeps the top edge out of the
-                        // title band (the original's titleBarWorldY floor).
-                        let min_y = canvas::title_bar_world_y(
-                            this.canvas.camera.y,
-                            this.canvas.camera.zoom,
-                        ) as f32;
-                        // The shell's snap pass: edge/center alignment
-                        // against every other non-maximized widget plus the
-                        // origin, inside 8 screen px (8/zoom world) — Alt
-                        // turns it off for the drag.
-                        let st = (world.x - grab.x) as f64;
-                        let lt = ((world.y - grab.y) as f64).max(min_y as f64);
-                        let (mut jt, mut mt) = (st, lt);
-                        let (mut gx, mut gy) = (None, None);
-                        let drag_wh = this
-                            .canvas
-                            .widgets
-                            .get(&id)
-                            .map(|w| (w.w, w.h))
-                            .unwrap_or((0.0, 0.0));
-                        if !event.modifiers.alt {
-                            let threshold = 8.0 / this.canvas.camera.zoom.max(1e-6);
-                            let (pw, ph) = drag_wh;
-                            let (cx_s, cy_s) = (st + pw / 2.0, lt + ph / 2.0);
-                            let (mut wt, mut mtm) = (threshold, threshold);
-                            for o in this
-                                .canvas
-                                .widgets
-                                .values()
-                                .filter(|w| w.id != id && !w.maximized)
-                            {
-                                let (right, bottom) = (o.x + o.w, o.y + o.h);
-                                let (ocx, ocy) = (o.x + o.w / 2.0, o.y + o.h / 2.0);
-                                for (d, jx, gl) in [
-                                    ((st - o.x).abs(), o.x, o.x),
-                                    ((st + pw - right).abs(), right - pw, right),
-                                    ((st - right).abs(), right, right),
-                                    ((st + pw - o.x).abs(), o.x - pw, o.x),
-                                    ((cx_s - ocx).abs(), ocx - pw / 2.0, ocx),
-                                ] {
-                                    if d < wt {
-                                        wt = d;
-                                        jt = jx;
-                                        gx = Some(gl);
-                                    }
-                                }
-                                for (d, jy, gl) in [
-                                    ((lt - o.y).abs(), o.y, o.y),
-                                    ((lt + ph - bottom).abs(), bottom - ph, bottom),
-                                    ((lt - bottom).abs(), bottom, bottom),
-                                    ((lt + ph - o.y).abs(), o.y - ph, o.y),
-                                    ((cy_s - ocy).abs(), ocy - ph / 2.0, ocy),
-                                ] {
-                                    if d < mtm {
-                                        mtm = d;
-                                        mt = jy;
-                                        gy = Some(gl);
-                                    }
-                                }
-                            }
-                            if st.abs() < wt {
-                                jt = 0.0;
-                                gx = Some(0.0);
-                            }
-                            if lt.abs() < mtm {
-                                mt = 0.0;
-                                gy = Some(0.0);
-                            }
-                        }
-                        this.snap_guides = (gx.is_some() || gy.is_some()).then_some((gx, gy));
-                        if let Some(widget) = this.canvas.widgets.get_mut(&id) {
-                            widget.x = jt;
-                            widget.y = mt.max(min_y as f64);
-                        }
-                        this.drag = Some(Drag::Widget {
-                            id,
-                            grab,
-                            press,
-                            moved: true,
-                        });
-                        cx.notify();
-                    }
-                    Some(Drag::Resize {
-                        id,
-                        dir,
-                        origin,
-                        anchor,
-                    }) => {
-                        let id = id.clone();
-                        let dir = *dir;
-                        let (ox, oy, ow, oh) = *origin;
-                        let world =
-                            canvas::View::new(&this.canvas.camera, Pos2::ZERO).to_world(pointer);
-                        let (dx, dy) = ((world.x - anchor.x) as f64, (world.y - anchor.y) as f64);
-                        let min_y = canvas::title_bar_world_y(
-                            this.canvas.camera.y,
-                            this.canvas.camera.zoom,
-                        );
-                        if let Some(widget) = this.canvas.widgets.get_mut(&id) {
-                            // Size first, position second — the ordering the
-                            // Electron comments call out: deriving x/y from
-                            // the unclamped size let the anchored edge keep
-                            // travelling after a capped kind's size stopped
-                            // growing, which slid the whole widget.
-                            let (w, h) = canvas::clamp_widget_size(
-                                widget.kind.as_deref(),
-                                if dir.contains('e') {
-                                    ow + dx
-                                } else if dir.contains('w') {
-                                    ow - dx
-                                } else {
-                                    ow
-                                },
-                                if dir.contains('s') {
-                                    oh + dy
-                                } else if dir.contains('n') {
-                                    oh - dy
-                                } else {
-                                    oh
-                                },
-                            );
-                            widget.w = w;
-                            widget.h = h;
-                            widget.x = if dir.contains('w') { ox + ow - w } else { ox };
-                            widget.y = if dir.contains('n') { oy + oh - h } else { oy };
-                            // The title band stays clear while resizing.
-                            if widget.y < min_y {
-                                let bottom = widget.y + widget.h;
-                                widget.y = min_y;
-                                widget.h = (bottom - min_y).max(canvas::MIN_WIDGET_H);
-                            }
-                        }
-                        cx.notify();
-                    }
-                    Some(Drag::Stroke { start, moved }) => {
-                        let start = *start;
-                        let mut moved = *moved;
-                        let delta = pointer - start;
-                        if moved || delta.length() >= DRAW_CLICK_THRESHOLD {
-                            let view_now = canvas::View::new(&this.canvas.camera, Pos2::ZERO);
-                            if !moved {
-                                // The stroke begins where the press landed.
-                                moved = true;
-                                this.pending_stroke.push(view_now.to_world(start));
-                            }
-                            if this.pending_stroke.len() < MAX_STROKE_POINTS {
-                                this.pending_stroke.push(view_now.to_world(pointer));
-                            }
-                            this.drag = Some(Drag::Stroke { start, moved });
-                            cx.notify();
-                        }
-                    }
-                    Some(Drag::Erase { dirty }) => {
-                        // trackDrag((ev) => canvas.eraseAt(...)) — every
-                        // move cuts whatever the pointer is over.
-                        let dirty = *dirty;
-                        let view_now = canvas::View::new(&this.canvas.camera, Pos2::ZERO);
-                        let world = view_now.to_world(pointer);
-                        let dirty = this.erase_at(world) || dirty;
-                        this.drag = Some(Drag::Erase { dirty });
-                        cx.notify();
-                    }
-                    Some(Drag::Select { start, .. })
-                        if (pointer - *start).length() >= DRAW_CLICK_THRESHOLD =>
-                    {
-                        // The marquee materializes past the same 4px click
-                        // threshold strokes use.
-                        this.drag = Some(Drag::Select {
-                            start: *start,
-                            rect: Some((*start, pointer)),
-                        });
-                        cx.notify();
-                    }
-                    Some(Drag::Select { .. }) | None => {}
-                }
             }))
             .on_mouse_up(
                 MouseButton::Left,
@@ -5616,209 +5457,83 @@ impl Render for CanvasView {
                         cx.notify();
                         return;
                     }
-                    match this.drag.take() {
-                        Some(Drag::Pan { .. }) => {
-                            this.camera_dirty_at = None;
-                            this.commit_camera();
-                        }
-                        Some(Drag::Widget { id, moved, .. }) => {
-                            this.snap_guides = None;
-                            // A sub-threshold press was a click — nothing to
-                            // journal (the original only wrote real updates).
-                            if moved {
-                                if let Some(widget) = this.canvas.widgets.get(&id).cloned() {
-                                    this.commit_widget(&widget);
-                                }
-                            }
-                        }
-                        Some(Drag::Resize { id, .. }) => {
-                            if let Some(widget) = this.canvas.widgets.get(&id).cloned() {
-                                this.commit_widget(&widget);
-                            }
-                        }
-                        Some(Drag::Stroke { moved, .. }) => {
-                            let points = std::mem::take(&mut this.pending_stroke);
-                            // A click-sized gesture never began a stroke;
-                            // under two points there is no line to keep.
-                            if moved && points.len() >= 2 {
-                                this.canvas.strokes.push(slate_app::projection::Stroke {
-                                    id: format!("stroke-{}", uuid::Uuid::new_v4().simple()),
-                                    color: STROKE_COLORS[this.stroke_color].to_owned(),
-                                    points: points
-                                        .into_iter()
-                                        .map(|p| slate_app::projection::Point {
-                                            x: p.x as f64,
-                                            y: p.y as f64,
-                                        })
-                                        .collect(),
-                                });
-                                this.commit_strokes();
-                            }
-                        }
-                        Some(Drag::Erase { dirty }) => {
-                            // The whole gesture wrote one canvas.strokes
-                            // event, like the original's rAF-batched flush.
-                            if dirty {
-                                this.commit_strokes();
-                            }
-                        }
-                        Some(Drag::Select {
-                            rect: Some((a, b)), ..
-                        }) => {
-                            // Marquee → world-space hit test: every widget
-                            // the rect touches is a candidate, the topmost
-                            // one wins the raise — bringToFront, nothing else.
-                            let view_now = canvas::View::new(&this.canvas.camera, Pos2::ZERO);
-                            let wa = view_now.to_world(a);
-                            let wb = view_now.to_world(b);
-                            let (min_x, max_x) = (wa.x.min(wb.x) as f64, wa.x.max(wb.x) as f64);
-                            let (min_y, max_y) = (wa.y.min(wb.y) as f64, wa.y.max(wb.y) as f64);
-                            let topmost = this
-                                .canvas
-                                .widgets
-                                .values()
-                                .filter(|w| {
-                                    !(w.x + w.w < min_x
-                                        || w.x > max_x
-                                        || w.y + w.h < min_y
-                                        || w.y > max_y)
-                                })
-                                .max_by(|x, y| {
-                                    x.z.partial_cmp(&y.z).unwrap_or(std::cmp::Ordering::Equal)
-                                })
-                                .map(|w| w.id.clone());
-                            if let Some(id) = topmost {
-                                this.raise(&id);
-                            }
-                        }
-                        Some(Drag::Select { .. }) | None => {}
-                    }
                     cx.notify();
                 }),
             )
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, window, cx| {
                 let pointer = pos(event.position);
-                let zoom = this.canvas.camera.zoom as f32;
-                let view_now = canvas::View::new(&this.canvas.camera, Pos2::ZERO);
                 let size = window.viewport_size();
                 let viewport = Vec2::new(f32::from(size.width), f32::from(size.height));
-                // The original's wheel routing: a wheel event anywhere over a
-                // widget — header included — is swallowed by it (terminals get
-                // scrollback/mouse-report, panes scroll natively). On bare
-                // canvas Ctrl/Cmd+wheel zooms at the pointer and a plain wheel
-                // pans by deltaX+deltaY — the primary navigation gesture.
-                // ctrlKey||metaKey wheel over a terminal fell through to the
-                // canvas zoom in the original (TerminalWidget let the event
-                // bubble when a modifier was held) — zoom-at-pointer must
-                // win over scrollback there, or zoom-by-wheel is dead over
-                // the widgets that cover most of the canvas.
-                let zoom_wheel = event.modifiers.control || event.modifiers.platform;
-                let mut over_pane = false;
-                let mut widgets: Vec<&Widget> = this.canvas.widgets.values().collect();
-                widgets.sort_by(|a, b| b.maximized.cmp(&a.maximized).then(b.z.total_cmp(&a.z)));
-                let mut scrolled = false;
-                for widget in widgets {
-                    let rect = widget_screen_rect(widget, &view_now, viewport);
-                    let body_top = rect.min.y + theme::geometry::HEADER_HEIGHT * zoom;
-                    let in_rect = pointer.x >= rect.min.x
-                        && pointer.x <= rect.max.x
-                        && pointer.y >= rect.min.y
-                        && pointer.y <= rect.max.y;
-                    let in_body = in_rect && pointer.y >= body_top;
-                    if !is_terminal_kind(widget.kind.as_deref()) {
-                        if in_rect {
-                            over_pane = true;
-                            break;
-                        }
-                        continue;
-                    }
-                    if zoom_wheel {
-                        continue;
-                    }
-                    if in_rect && !in_body {
-                        // Header only — the widget owns the event, nothing
-                        // scrolls, the canvas stays put.
-                        scrolled = true;
-                        break;
-                    }
-                    if in_body {
-                        let reporting = this
-                            .snapshots
-                            .iter()
-                            .find(|s| s.id == widget.id)
-                            .map(|s| s.mouse_reporting)
-                            .unwrap_or(false);
-                        if reporting {
-                            // The program owns the wheel now — one button-64/
-                            // 65 press per event (each notch is its own X11
-                            // event), direction by sign, no release.
-                            let (dy, dx) = match event.delta {
-                                ScrollDelta::Pixels(p) => (f32::from(p.y), f32::from(p.x)),
-                                ScrollDelta::Lines(p) => (p.y, p.x),
-                            };
-                            let mods = KeyMods {
-                                shift: event.modifiers.shift,
-                                alt: event.modifiers.alt,
-                                ctrl: event.modifiers.control,
-                                mac_cmd: event.modifiers.platform,
-                            };
-                            let (col, row) = terminal_cell(rect, zoom, pointer);
-                            let kind = if dy != 0.0 {
-                                Some(if dy < 0.0 {
-                                    MouseKind::WheelDown
-                                } else {
-                                    MouseKind::WheelUp
-                                })
-                            } else if dx != 0.0 {
-                                Some(if dx < 0.0 {
-                                    MouseKind::WheelRight
-                                } else {
-                                    MouseKind::WheelLeft
-                                })
-                            } else {
-                                None
-                            };
-                            if let Some(kind) = kind {
-                                let _ = this.manager.mouse_input(&widget.id, kind, col, row, mods);
-                            }
-                        } else {
-                            let mut pixels = match event.delta {
-                                ScrollDelta::Pixels(p) => f32::from(p.y),
-                                ScrollDelta::Lines(p) => p.y * 17.0 * zoom,
-                            };
-                            // `onWheel`'s fast-scroll: altKey ×4.
-                            if event.modifiers.alt {
-                                pixels *= 4.0;
-                            }
-                            let _ = this.manager.scroll_pixels(
-                                &widget.id,
-                                pixels,
-                                17.0 * zoom.max(0.2),
-                            );
-                        }
-                        scrolled = true;
-                        break;
-                    }
+                // The shown pane owns the wheel: a terminal gets scrollback
+                // or button-64/65 reports; anything else scrolls natively.
+                let rail_w = if this.prefs.sidebar_open {
+                    theme::geometry::SIDEBAR_EXPANDED
+                } else {
+                    theme::geometry::RAIL_WIDTH
+                };
+                let rect = pane_rect(rail_w, viewport);
+                let Some(id) = this.shown_widget_id() else {
+                    return;
+                };
+                if !rect.contains(pointer) {
+                    return;
                 }
-                if !scrolled && !over_pane {
-                    let (dx, dy) = match event.delta {
-                        ScrollDelta::Pixels(p) => (f32::from(p.x) as f64, f32::from(p.y) as f64),
-                        ScrollDelta::Lines(p) => (p.x as f64 * 17.0, p.y as f64 * 17.0),
+                let Some(widget) = this.canvas.widgets.get(&id) else {
+                    return;
+                };
+                if !is_terminal_kind(widget.kind.as_deref()) {
+                    return;
+                }
+                let reporting = this
+                    .snapshots
+                    .iter()
+                    .find(|s| s.id == id)
+                    .map(|s| s.mouse_reporting)
+                    .unwrap_or(false);
+                if reporting {
+                    let (dy, dx) = match event.delta {
+                        ScrollDelta::Pixels(p) => (f32::from(p.y), f32::from(p.x)),
+                        ScrollDelta::Lines(p) => (p.y, p.x),
                     };
-                    if event.modifiers.control || event.modifiers.platform {
-                        // ctrlKey||metaKey → pointer-anchored zoom, factor
-                        // exp(-deltaY*0.001) in the original.
-                        let factor = (-dy * 0.001).exp().max(0.0) as f32;
-                        zoom_at(&mut this.canvas.camera, Pos2::ZERO, pointer, factor);
+                    let mods = KeyMods {
+                        shift: event.modifiers.shift,
+                        alt: event.modifiers.alt,
+                        ctrl: event.modifiers.control,
+                        mac_cmd: event.modifiers.platform,
+                    };
+                    let (col, row) = terminal_cell(rect, 1.0, pointer);
+                    let kind = if dy != 0.0 {
+                        Some(if dy < 0.0 {
+                            MouseKind::WheelDown
+                        } else {
+                            MouseKind::WheelUp
+                        })
+                    } else if dx != 0.0 {
+                        Some(if dx < 0.0 {
+                            MouseKind::WheelRight
+                        } else {
+                            MouseKind::WheelLeft
+                        })
                     } else {
-                        // Plain wheel pans: camera -= delta, both axes.
-                        this.canvas.camera.x -= dx;
-                        this.canvas.camera.y -= dy;
+                        None
+                    };
+                    if let Some(kind) = kind {
+                        let _ = this.manager.mouse_input(&id, kind, col, row, mods);
                     }
-                    this.camera_dirty_at = Some(Instant::now());
+                } else {
+                    let mut pixels = match event.delta {
+                        ScrollDelta::Pixels(p) => f32::from(p.y),
+                        ScrollDelta::Lines(p) => p.y * CELL_H,
+                    };
+                    // `onWheel`'s fast-scroll: altKey ×4.
+                    if event.modifiers.alt {
+                        pixels *= 4.0;
+                    }
+                    let _ = this.manager.scroll_pixels(&id, pixels, CELL_H);
                 }
                 cx.notify();
             }));
+
 
         // The wallpaper — the shell's `.wallpaper-container`: a full-bleed
         // image under everything (settings `background` holds a data:image
@@ -5901,165 +5616,41 @@ impl Render for CanvasView {
             self.wallpaper_raw = None;
         }
 
-        // ConnectionsLayer: arcs between widget top-centers, painted under
-        // the widgets like the SVG inside the world transform. A maximized
-        // endpoint hides its arcs, same as the original.
-        if !self.canvas.connections.is_empty() {
-            let mut arcs: Vec<(Pos2, Pos2, Pos2)> = Vec::new();
-            for connection in &self.canvas.connections {
-                let (Some(from), Some(to)) = (
-                    self.canvas.widgets.get(&connection.from),
-                    self.canvas.widgets.get(&connection.to),
-                ) else {
-                    continue;
-                };
-                if from.id == to.id || from.maximized || to.maximized {
-                    continue;
-                }
-                let a = view.to_screen(Pos2::new((from.x + from.w / 2.0) as f32, from.y as f32));
-                let b = view.to_screen(Pos2::new((to.x + to.w / 2.0) as f32, to.y as f32));
-                // arcPath: quadratic bezier, control point bowed upward by
-                // clamp(24..120, dist*0.22) — the world-space distance, so
-                // the bow scales with zoom like everything under transform.
-                let dist = ((to.x - from.x).powi(2) + (to.y - from.y).powi(2)).sqrt() as f32;
-                let bow = (dist * 0.22).clamp(24.0, 120.0) * zoom;
-                arcs.push((a, Pos2::new((a.x + b.x) / 2.0, (a.y + b.y) / 2.0 - bow), b));
-            }
-            if !arcs.is_empty() {
-                root = root.child(
-                    gpui::canvas(
-                        move |_, _, _| arcs,
-                        |_bounds, arcs, window, _cx| {
-                            // conn-glow under conn-thread — a wide soft pass
-                            // under a hairline, standing in for the SVG's
-                            // gaussian-blurred duplicate.
-                            for (a, mid, b) in arcs {
-                                for (width, color) in [(2.4f32, 0xdfe7ff80u32), (1.0, 0xdfe7ff57)] {
-                                    let mut builder = PathBuilder::stroke(px(width));
-                                    builder.move_to(point(px(a.x), px(a.y)));
-                                    builder.curve_to(
-                                        point(px(b.x), px(b.y)),
-                                        point(px(mid.x), px(mid.y)),
-                                    );
-                                    if let Ok(path) = builder.build() {
-                                        window.paint_path(path, rgba(color));
-                                    }
-                                }
-                            }
-                        },
-                    )
-                    .absolute()
-                    .inset_0(),
-                );
-            }
-        }
-
-        // StrokesLayer: committed strokes plus the one in progress, as
-        // 3px polylines in screen space — the original's `3/zoom` world
-        // width is exactly that.
-        {
-            let mut stroke_paths: Vec<(u32, Vec<Pos2>)> = Vec::new();
-            for stroke in &self.canvas.strokes {
-                if stroke.points.len() < 2 {
-                    continue;
-                }
-                stroke_paths.push((
-                    stroke_color_u32(&stroke.color),
-                    stroke
-                        .points
-                        .iter()
-                        .map(|p| view.to_screen(Pos2::new(p.x as f32, p.y as f32)))
-                        .collect(),
-                ));
-            }
-            let pending: Vec<Pos2> = self
-                .pending_stroke
-                .iter()
-                .map(|p| view.to_screen(*p))
-                .collect();
-            // The in-progress stroke previews in the selected swatch color,
-            // slightly translucent like the original's overlay.
-            let pending_color =
-                stroke_color_u32(STROKE_COLORS[self.stroke_color]) & 0xffffff00 | 0xcc;
-            if !stroke_paths.is_empty() || pending.len() >= 2 {
-                root = root.child(
-                    gpui::canvas(
-                        move |_, _, _| (stroke_paths, pending),
-                        move |_bounds, (strokes, pending), window, _cx| {
-                            for (color, points) in strokes {
-                                paint_polyline(window, &points, rgba(color));
-                            }
-                            paint_polyline(window, &pending, rgba(pending_color));
-                        },
-                    )
-                    .absolute()
-                    .inset_0(),
-                );
-            }
-        }
 
         // The X11 webview child can't be clipped by GPUI compositing, so
-        // browser panes get an explicit window-space clip: the viewport
-        // minus the floating title bar, left rail and status strip. While a
-        // full-window overlay (splash, settings) owns the screen the clip
-        // collapses and the element hides the child instead of bleeding
-        // over it.
-        // The rail always mounts (the shell kept `w-rail` on the canvas) —
-        // closed it narrows to 56px rather than vanishing, so the »
-        // reopen tab is always reachable.
-        let rail_w = if self.prefs.sidebar_open {
-            theme::geometry::SIDEBAR_EXPANDED
-        } else {
-            theme::geometry::RAIL_WIDTH
-        };
-        let browser_clip = if self.settings_open || splash_t.is_some() {
-            Bounds::default()
-        } else {
-            Bounds {
-                origin: point(px(rail_w), px(canvas::TITLE_BAR_HEIGHT)),
-                size: size(
-                    px((viewport_size.x - rail_w).max(0.0)),
-                    px((viewport_size.y - canvas::TITLE_BAR_HEIGHT - 24.0).max(0.0)),
-                ),
-            }
-        };
+        // the shown browser pane gets an explicit window-space clip — the
+        // work area. While a full-window overlay (splash, settings) owns
+        // the screen the clip collapses and the child hides.
+        let browser_clip = Bounds::default();
 
-        // Widgets paint in z order so the last drawn is the topmost — and a
-        // maximized widget is the shell's zIndex-200 overlay, so it always
-        // sorts after everything not maximized.
-        let mut widgets: Vec<Widget> = self.canvas.widgets.values().cloned().collect();
-        widgets.sort_by(|a, b| a.maximized.cmp(&b.maximized).then(a.z.total_cmp(&b.z)));
-        for widget in widgets {
-            let maximized = widget.maximized;
-            // The overlay fills the viewport under the title band — the
-            // original's world-unit style (-camera.x/zoom etc.) is this same
-            // rect once the transform is factored out.
-            let rect = widget_screen_rect(&widget, &view, viewport_size);
-            if !maximized && !is_visible(rect, viewport_rect) {
-                // A culled widget's element never paints, so its native
-                // webview child would keep its stale on-screen bounds —
-                // hide it here, before the skip.
+        // One widget shows at a time, filling the work area like the
+        // shell's maximized overlay did. Hidden panes keep running — but a
+        // browser's native webview child must be told to stop painting or
+        // X11 leaves it on screen.
+        for widget in self.canvas.widgets.values().cloned().collect::<Vec<Widget>>() {
+            if shown_id.as_deref() != Some(widget.id.as_str()) {
                 if widget.kind.as_deref() == Some("browser") {
                     slate_app::webview::hide(&widget.id);
                 }
                 continue;
             }
+            // The pane fills the work area — the fixed rect a maximized
+            // frame used to take.
+            let rect = pane;
+            let zoom = 1.0f32;
             let id = widget.id.clone();
             let id_for_body = widget.id.clone();
             let id_for_close = widget.id.clone();
-            let id_for_max = widget.id.clone();
             let id_for_title = widget.id.clone();
             let id_for_copy = widget.id.clone();
             let id_for_agent = widget.id.clone();
-            let can_maximize = !canvas::non_maximizable(widget.kind.as_deref());
             let is_active = self.active.as_deref() == Some(widget.id.as_str());
             let is_terminal = is_terminal_kind(widget.kind.as_deref());
             let renaming_this = self.renaming.as_deref() == Some(widget.id.as_str());
             let name_copied = self.name_copied_at.as_ref().is_some_and(|(cid, at)| {
                 cid == &widget.id && at.elapsed() < Duration::from_millis(1200)
             });
-            let cam = camera.clone();
-            let header_h = theme::geometry::HEADER_HEIGHT * zoom;
+            let header_h = theme::geometry::HEADER_HEIGHT;
 
             // WidgetFrame's `widget-header-shell`: h-34, `gap-1`,
             // `pl-2.5 pr-0` — the right-edge controls run flush.
@@ -6088,36 +5679,18 @@ impl Render for CanvasView {
                     el.border_b_1()
                         .border_color(rgb(theme::hex(theme::hairline::FAINT)))
                 })
-                .cursor_grab()
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    cx.listener(move |this, _event: &MouseDownEvent, window, cx| {
                         window.focus(&this.focus, cx);
                         // Clicking another widget commits an open rename —
                         // the shell's input blurred.
                         if this.renaming.is_some() {
                             this.commit_rename(cx);
                         }
-                        // A maximized frame does not move — same early return
-                        // as the shell's onHeaderPointerDown.
-                        if !maximized {
-                            let press = pos(event.position);
-                            let world = canvas::View::new(&cam, Pos2::ZERO).to_world(press);
-                            if let Some(widget) = this.canvas.widgets.get(&id) {
-                                let grab =
-                                    Pos2::new(world.x - widget.x as f32, world.y - widget.y as f32);
-                                this.drag = Some(Drag::Widget {
-                                    id: id.clone(),
-                                    grab,
-                                    press,
-                                    moved: false,
-                                });
-                            }
-                        }
-                        this.raise(&id);
                         this.active = Some(id.clone());
                         // Pressing the frame gave it DOM focus in the shell —
-                        // arrows now nudge this widget, not the camera.
+                        // Delete/Escape now target this pane.
                         this.frame_focus = Some(id.clone());
                         cx.stop_propagation();
                         cx.notify();
@@ -6247,9 +5820,9 @@ impl Render for CanvasView {
                             ),
                     )
                 })
-                // `ml-1 flex h-[34px]` — maximize and close run the header's
-                // full height at `w-8`, close keeping the shell's red hover
-                // and its `rounded-tr-panel` corner.
+                // `ml-1 flex h-[34px]` — the close button runs the header's
+                // full height at `w-8`, keeping the shell's red hover and
+                // its `rounded-tr-panel` corner.
                 .child(
                     div()
                         .ml(px(4.0 * zoom))
@@ -6257,48 +5830,6 @@ impl Render for CanvasView {
                         .flex_none()
                         .flex()
                         .flex_row()
-                        .child(
-                            div()
-                                .id(("slate-widget-max", widget.z as u64))
-                                .w(px(32.0 * zoom))
-                                .h_full()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .text_color(rgb(theme::hex(if can_maximize {
-                                    theme::text::DIM
-                                } else {
-                                    // NON_MAXIMIZABLE kinds get the same
-                                    // button, drawn disabled — the shell's
-                                    // text-faint/40.
-                                    theme::hairline::FAINT
-                                })))
-                                .when(can_maximize, |el| {
-                                    el.cursor_pointer().hover(|el| {
-                                        el.bg(rgb(theme::hex(theme::monochrome::RAISED)))
-                                            .text_color(rgb(theme::hex(theme::text::NORMAL)))
-                                    })
-                                })
-                                .when(!can_maximize, |el| el.cursor_not_allowed())
-                                .child(crate::assets::icon(
-                                    if maximized { "minimize-2" } else { "maximize-2" },
-                                    13.0 * zoom,
-                                    theme::hex(if can_maximize {
-                                        theme::text::DIM
-                                    } else {
-                                        theme::hairline::FAINT
-                                    }),
-                                ))
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _event, _window, cx| {
-                                        cx.stop_propagation();
-                                        if can_maximize {
-                                            this.toggle_maximize(&id_for_max, cx);
-                                        }
-                                    }),
-                                ),
-                        )
                         .child(
                             div()
                                 .id(("slate-widget-close", widget.z as u64))
@@ -6366,9 +5897,7 @@ impl Render for CanvasView {
                         // focus (frame keys stop reaching it); any other pane
                         // keeps its frame focused — it has no textarea to win.
                         this.frame_focus = (!is_terminal).then(|| id_for_body.clone());
-                        // The frame's pointer-down brought the widget to the
-                        // front regardless of where inside it landed.
-                        this.raise(&id_for_body);
+
                         if is_terminal {
                             let pointer = pos(event.position);
                             let reporting = this
@@ -6507,35 +6036,10 @@ impl Render for CanvasView {
                 )
                 .child({
                     // A sibling stacked above a browser widget would be
-                    // covered by the native webview child — X11 children
-                    // always paint above the parent's pixels. Hide the child
-                    // while a higher-z widget overlaps its page area (frame
-                    // header + 30px nav row ≈ 66px above the page); the
-                    // widget's own chrome stays live.
-                    let clip = if widget.kind.as_deref() == Some("browser") {
-                        let page = canvas::Rect::from_min_max(
-                            Pos2::new(rect.min.x, rect.min.y + 66.0 * zoom),
-                            rect.max,
-                        );
-                        let occluded = self.canvas.widgets.values().any(|o| {
-                            o.id != widget.id
-                                && (o.maximized || o.z > widget.z)
-                                && {
-                                    let r = widget_screen_rect(o, &view, viewport_size);
-                                    r.min.x < page.max.x
-                                        && r.max.x > page.min.x
-                                        && r.min.y < page.max.y
-                                        && r.max.y > page.min.y
-                                }
-                        });
-                        if occluded {
-                            Bounds::default()
-                        } else {
-                            browser_clip
-                        }
-                    } else {
-                        browser_clip
-                    };
+                    // One pane at a time means nothing can overlap the
+                    // browser's native webview child — clip to the work
+                    // area (the element hides it under overlays anyway).
+                    let clip = browser_clip;
                     let body = widget_body(
                         &widget,
                         &self.snapshots,
@@ -6664,68 +6168,137 @@ impl Render for CanvasView {
                 );
             }
 
-            // The eight resize handles the Electron frame drew — thin edges,
-            // small squares at the corners, all in unscaled screen px. A
-            // maximized frame has none (`!widget.maximized && RESIZE_HANDLES`).
-            if !maximized {
-                for dir in ["n", "s", "e", "w", "ne", "nw", "se", "sw"] {
-                    let rid = widget.id.clone();
-                    let rcam = camera.clone();
-                    let mut handle = div()
-                        .id(format!("slate-resize-{}-{dir}", widget.id))
-                        .absolute()
-                        .cursor(resize_cursor(dir))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                                cx.stop_propagation();
-                                window.focus(&this.focus, cx);
-                                let world = canvas::View::new(&rcam, Pos2::ZERO)
-                                    .to_world(pos(event.position));
-                                if let Some(w) = this.canvas.widgets.get(&rid) {
-                                    this.drag = Some(Drag::Resize {
-                                        id: rid.clone(),
-                                        dir,
-                                        origin: (w.x, w.y, w.w, w.h),
-                                        anchor: world,
-                                    });
-                                }
-                                this.raise(&rid);
-                                this.active = Some(rid.clone());
-                                this.frame_focus = Some(rid.clone());
-                                cx.notify();
-                            }),
-                        );
-                    let edge = px(8.0);
-                    let corner = px(14.0);
-                    let inset = px(12.0);
-                    handle = match dir {
-                        "n" => handle.top(px(0.0)).left(inset).right(inset).h(edge),
-                        "s" => handle.bottom(px(0.0)).left(inset).right(inset).h(edge),
-                        "e" => handle.right(px(0.0)).top(inset).bottom(inset).w(edge),
-                        "w" => handle.left(px(0.0)).top(inset).bottom(inset).w(edge),
-                        "ne" => handle.top(px(0.0)).right(px(0.0)).w(corner).h(corner),
-                        "nw" => handle.top(px(0.0)).left(px(0.0)).w(corner).h(corner),
-                        "se" => handle.bottom(px(0.0)).right(px(0.0)).w(corner).h(corner),
-                        _ => handle.bottom(px(0.0)).left(px(0.0)).w(corner).h(corner),
-                    };
-                    frame = frame.child(handle);
-                }
-            }
-
             root = root.child(frame);
         }
+
+        // The pane strip — a fixed tab row above the work area, one chip
+        // per widget in z order. Clicking shows that pane; the × on the
+        // active chip closes it like the frame's own button.
+        if !self.canvas.widgets.is_empty() {
+            let mut strip = div()
+                .id("slate-pane-strip")
+                .absolute()
+                .left(px(rail_w))
+                .right_0()
+                .top(px(canvas::TITLE_BAR_HEIGHT))
+                .h(px(PANE_STRIP_H))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_px()
+                .px_1()
+                .overflow_hidden()
+                .bg(rgba(0x0C0C0CDD))
+                .border_b_1()
+                .border_color(rgb(theme::hex(theme::hairline::FAINT)));
+            let mut ordered: Vec<Widget> =
+                self.canvas.widgets.values().cloned().collect();
+            ordered.sort_by(|a, b| a.z.total_cmp(&b.z));
+            for w in ordered {
+                let wid = w.id.clone();
+                let wid_close = w.id.clone();
+                let current = shown_id.as_deref() == Some(wid.as_str());
+                let mut tab = div()
+                    .id(format!("slate-pane-tab-{}", w.id))
+                    .h_full()
+                    .px_2()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .max_w(px(200.0))
+                    .min_w_0()
+                    .border_r_1()
+                    .border_color(rgb(theme::hex(theme::hairline::FAINT)))
+                    .cursor_pointer()
+                    .text_size(px(11.0))
+                    .font_family("Departure Mono")
+                    .text_color(rgb(theme::hex(if current {
+                        theme::text::NORMAL
+                    } else {
+                        theme::text::FAINT
+                    })))
+                    .when(current, |el| {
+                        el.bg(rgb(theme::hex(theme::monochrome::ELEVATED)))
+                    })
+                    .hover(|el| el.bg(rgb(theme::hex(theme::monochrome::RAISED))))
+                    .child(w.title.clone())
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _e, _w, cx| {
+                            cx.stop_propagation();
+                            this.active = Some(wid.clone());
+                            cx.notify();
+                        }),
+                    );
+                if current {
+                    tab = tab.child(
+                        div()
+                            .id(format!("slate-pane-tab-close-{}", w.id))
+                            .w(px(16.0))
+                            .h(px(16.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(10.0))
+                            .text_color(rgb(theme::hex(theme::text::FAINT)))
+                            .hover(|el| el.text_color(rgb(theme::hex(theme::text::NORMAL))))
+                            .child("×")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _e, _w, cx| {
+                                    cx.stop_propagation();
+                                    if is_terminal_kind(
+                                        this.widget_kind(&wid_close).as_deref(),
+                                    ) {
+                                        this.pending_close = Some(wid_close.clone());
+                                        cx.notify();
+                                    } else {
+                                        this.close_widget(&wid_close, cx);
+                                    }
+                                }),
+                            ),
+                    );
+                }
+                strip = strip.child(tab);
+            }
+            // "+" opens the same spawn menu right-click used to — the work
+            // area is always a pane now, so the menu needs a visible handle.
+            strip = strip.child(
+                div()
+                    .id("slate-pane-add")
+                    .h_full()
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .text_size(px(13.0))
+                    .text_color(rgb(theme::hex(theme::text::FAINT)))
+                    .hover(|el| el.text_color(rgb(theme::hex(theme::text::NORMAL))))
+                    .child("+")
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &MouseDownEvent, _w, cx| {
+                            cx.stop_propagation();
+                            this.menu_sel = 0;
+                            this.menu = Some(pos(event.position));
+                            cx.notify();
+                        }),
+                    ),
+            );
+            root = root.child(strip);
+        }
+
 
         // The agent picker — WidgetFrame's "Select Agent" dropdown, parked
         // under the header's right edge of the terminal that opened it.
         // Picking one types its launch command into the PTY with Enter, the
         // shell's terminal.write(command + '\r').
         if let Some(menu_id) = self.agent_menu.clone() {
-            if let Some(widget) = self.canvas.widgets.get(&menu_id) {
-                let rect = widget_screen_rect(widget, &view, viewport_size);
+            if self.canvas.widgets.contains_key(&menu_id) {
                 let menu_w = 170.0_f32;
-                let menu_x = (rect.max.x - menu_w).max(4.0);
-                let menu_y = rect.min.y + theme::geometry::HEADER_HEIGHT * zoom + 2.0;
+                let menu_x = (pane.max.x - menu_w).max(4.0);
+                let menu_y = pane.min.y + theme::geometry::HEADER_HEIGHT + 2.0;
                 let mut menu = div()
                     .id("slate-agent-menu")
                     .absolute()
@@ -6738,7 +6311,9 @@ impl Render for CanvasView {
                     .border_1()
                     .border_color(rgb(theme::hex(theme::hairline::SOFT)))
                     .py_1();
-                for (index, (agent_id, label, command)) in AGENT_LAUNCHERS.iter().enumerate() {
+                for (index, (agent_id, label, command)) in
+                    agent_launchers(&self.prefs).into_iter().enumerate()
+                {
                     let menu_id = menu_id.clone();
                     let picked = self.agent_picks.select.get(&menu_id) == Some(&index);
                     menu = menu.child(
@@ -6755,7 +6330,7 @@ impl Render for CanvasView {
                             })))
                             .cursor_pointer()
                             .hover(|s| s.bg(rgb(theme::hex(theme::monochrome::ELEVATED))))
-                            .child(*label)
+                            .child(label.clone())
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _e, _w, cx| {
@@ -6763,15 +6338,15 @@ impl Render for CanvasView {
                                     this.agent_menu = None;
                                     // `Fd` + `Wd`: persist the row and the
                                     // launched id, then type the command.
-                                    this.agent_picks.pick(&menu_id, index, agent_id);
+                                    this.agent_picks.pick(&menu_id, index, &agent_id);
                                     if let Err(error) = this.agent_picks.save() {
                                         this.notice(format!("agent pick: {error}"));
                                     }
-                                    match this.manager.write_text(&menu_id, command, true) {
+                                    match this.manager.write_text(&menu_id, &command, true) {
                                         // The shell armed its startup probe
                                         // the moment the agent command was
                                         // typed — same here.
-                                        Ok(_) => this.arm_startup_watch(&menu_id, command),
+                                        Ok(_) => this.arm_startup_watch(&menu_id, &command),
                                         Err(error) => {
                                             this.notice(format!("agent launch: {error}"))
                                         }
@@ -6883,10 +6458,9 @@ impl Render for CanvasView {
             root = root.child(menu);
         }
 
-        // The empty-canvas card — drawn only when nothing at all is on the
-        // canvas, strokes included, like the original's guard. "Add
+        // The empty-state card — drawn only when no panes are open. "Add
         // terminal" is the same addWidget path the button called.
-        if self.canvas.widgets.is_empty() && self.canvas.strokes.is_empty() {
+        if self.canvas.widgets.is_empty() {
             let viewport = self.viewport;
             root = root.child(
                 div()
@@ -6921,7 +6495,7 @@ impl Render for CanvasView {
                                     .font_family("Brygada 1918")
                                     .text_size(px(22.0))
                                     .text_color(rgb(theme::hex(theme::text::NORMAL)))
-                                    .child("Your canvas is clear".to_owned()),
+                                    .child("Nothing open yet".to_owned()),
                             )
                             .child(
                                 div()
@@ -6966,17 +6540,14 @@ impl Render for CanvasView {
                                     .text_color(rgb(theme::hex(theme::text::FAINT)))
                                     .child(kbd_chip("T"))
                                     .child(kbd_chip("N"))
-                                    .child(kbd_chip("+"))
-                                    .child(kbd_chip("-"))
-                                    .child(kbd_hint("0", " zoom", "0 resets zoom only"))
-                                    .child(kbd_hint("F", " fit", "F fits all widgets into view"))
-                                    .child(kbd_hint("Home", " view", "Home resets pan and zoom")),
+                                    .child(kbd_hint("Tab", " switch", "Tab cycles panes"))
+                                    .child(kbd_hint("Del", " close", "Del closes the active pane")),
                             ),
                     ),
             );
         }
 
-        // The workviews — Code and Overview replace `<main>` while their
+        // The workview — the Code pane covers the canvas world while its
         // tab is up: an opaque cover between the title bar and the status
         // bar, so the canvas (widgets, camera, PTYs) is untouched
         // underneath. The cover's own press/scroll handlers stop
@@ -6984,7 +6555,6 @@ impl Render for CanvasView {
         // it hides. The shell did the same by unmounting the canvas DOM;
         // keeping it mounted is cheaper (no re-layout on the way back)
         // and the cover makes the world invisible anyway.
-        if self.active_view != ActiveView::Canvas {
             // The cover sits beside the open rail — its own width is
             // viewport minus rail_w, so the workview lays out against the
             // narrowed width (a full-width grid would slide rail_w under
@@ -6993,92 +6563,49 @@ impl Render for CanvasView {
                 width: px((f32::from(viewport.width) - rail_w).max(0.0)),
                 height: viewport.height,
             };
-            if self.active_view == ActiveView::Code {
                 self.resize_code_terminals(Vec2::new(
                     f32::from(workview.width),
                     f32::from(workview.height),
                 ));
-            }
-            let pane: AnyElement = match self.active_view {
-                ActiveView::Code => crate::views_code::code_pane(
-                    &crate::views_code::CodeState {
-                        sessions: self.code_sessions.clone(),
-                        focused: self.code_focused.clone(),
-                        viewport: workview,
-                        launcher_open: self.code_launcher_open,
-                        layout: self.code_layout,
-                        workspace_name: self
-                            .workspace_dir
-                            .as_deref()
-                            .and_then(|dir| std::path::Path::new(dir).file_name())
-                            .map(|name| name.to_string_lossy().into_owned()),
-                    },
-                    &self.snapshots,
-                    cx,
-                )
-                .into_any_element(),
-                ActiveView::Overview => {
-                    let workspace = slate_app::workspace::WorkspaceState::load();
-                    let recents = workspace
-                        .to_value()
-                        .get("recent")
-                        .and_then(Value::as_array)
-                        .cloned()
-                        .unwrap_or_default()
-                        .into_iter()
-                        .filter_map(|entry| {
-                            let path = entry.get("path")?.as_str()?.to_owned();
-                            Some(crate::views_overview::OverviewRecent {
-                                name: entry
-                                    .get("name")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or_default()
-                                    .to_owned(),
-                                pinned: entry
-                                    .get("pinned")
-                                    .and_then(Value::as_bool)
-                                    .unwrap_or(false),
-                                path,
-                            })
-                        })
-                        .collect();
-                    let widgets = self
-                        .canvas
-                        .widgets
-                        .values()
-                        .map(|widget| crate::views_overview::OverviewWidget {
-                            id: widget.id.clone(),
-                            // `is_terminal_kind` treats a missing kind as a
-                            // terminal — surface the same normalization here
-                            // so kindless widgets count/paint as terminals.
-                            kind: widget
-                                .kind
-                                .clone()
-                                .filter(|k| !k.is_empty())
-                                .unwrap_or_else(|| "terminal".to_owned()),
-                            title: widget.title.clone(),
-                            x: widget.x as f32,
-                            y: widget.y as f32,
-                            w: widget.w as f32,
-                            h: widget.h as f32,
-                        })
-                        .collect();
-                    let (rows, _) = crate::views_planner::planner_items();
-                    crate::views_overview::overview_pane(
-                        &crate::views_overview::OverviewState {
-                            workspace_dir: self.workspace_dir.clone(),
-                            workspace_name: String::new(),
-                            recents,
-                            widgets,
-                            planner_open: rows.iter().filter(|row| !row.done).count(),
-                            planner_done: rows.iter().filter(|row| row.done).count(),
+            let pane: AnyElement = {
+                    // `ResumeAgents` mounts with the empty board — scan once
+                    // per folder, on the background executor.
+                    self.maybe_scan_resume(cx);
+                    crate::views_code::code_pane(
+                        &crate::views_code::CodeState {
+                            sessions: {
+                                // t3code's pinned section — pinned threads
+                                // sort to the top, order stable otherwise.
+                                let mut sessions = self.code_sessions.clone();
+                                sessions.sort_by_key(|s| !s.pinned);
+                                sessions
+                            },
+                            focused: self.code_focused.clone(),
                             viewport: workview,
+                            launcher_open: self.code_launcher_open,
+                            layout: self.code_layout,
+                            workspace_name: self
+                                .workspace_dir
+                                .as_deref()
+                                .and_then(|dir| std::path::Path::new(dir).file_name())
+                                .map(|name| name.to_string_lossy().into_owned()),
+                            workspace_dir: self.workspace_dir.clone(),
+                            conversations: self.code_conversations.clone(),
+                            resume_loading: self.code_resume_loading,
+                            resume_expanded: self.code_resume_expanded,
+                            resume_selected: self.code_resume_selected.clone(),
+                            resume_dismissed: self.code_resume_dismissed.clone(),
+                            selected_agents: self.code_selected_agents.clone(),
+                            agent_counts: self.code_agent_counts.clone(),
+                            active_agent: self.code_active_agent.clone(),
+                            custom_agents: self.prefs.custom_agents.clone(),
+                            agent_states: self.agent_states.clone(),
+                            worktree: self.code_worktree,
                         },
+                        &self.snapshots,
                         cx,
                     )
                     .into_any_element()
-                }
-                ActiveView::Canvas => unreachable!("canvas has no cover pane"),
             };
             root = root.child(
                 div()
@@ -7114,7 +6641,6 @@ impl Render for CanvasView {
                         // A code session under the pointer owns the wheel —
                         // the same scrollback / mouse-report routing the
                         // canvas's wheel handler runs for terminal widgets.
-                        if this.active_view == ActiveView::Code {
                             let pointer = pos(event.position);
                             if let Some((index, rect)) = this.code_hit(pointer) {
                                 let offset = this.code_grid_offset();
@@ -7173,17 +6699,16 @@ impl Render for CanvasView {
                                     } else {
                                         let pixels = match event.delta {
                                             ScrollDelta::Pixels(p) => f32::from(p.y),
-                                            ScrollDelta::Lines(p) => p.y * 17.0,
+                                            ScrollDelta::Lines(p) => p.y * CELL_H,
                                         };
                                         let _ = this.manager.scroll_pixels(
                                             &session.terminal_id,
                                             pixels,
-                                            17.0,
+                                            CELL_H,
                                         );
                                     }
                                 }
                             }
-                        }
                         cx.stop_propagation();
                     }))
                     // Button releases land here when the press went to a
@@ -7191,9 +6716,6 @@ impl Render for CanvasView {
                     // like the widget body's `selection_drag.is_none()`
                     // gate); held-button moves become the drag report.
                     .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, _cx| {
-                        if this.active_view != ActiveView::Code {
-                            return;
-                        }
                         let Some(button) = event.pressed_button else {
                             return;
                         };
@@ -7230,9 +6752,7 @@ impl Render for CanvasView {
                     .on_mouse_up(
                         MouseButton::Left,
                         cx.listener(|this, event: &MouseUpEvent, _window, _cx| {
-                            if this.active_view != ActiveView::Code
-                                || this.selection_drag.is_some()
-                            {
+                            if this.selection_drag.is_some() {
                                 return;
                             }
                             let pointer = pos(event.position);
@@ -7259,9 +6779,6 @@ impl Render for CanvasView {
                     .on_mouse_up(
                         MouseButton::Middle,
                         cx.listener(|this, event: &MouseUpEvent, _window, _cx| {
-                            if this.active_view != ActiveView::Code {
-                                return;
-                            }
                             let pointer = pos(event.position);
                             if let Some((index, rect)) = this.code_hit(pointer) {
                                 let session = &this.code_sessions[index];
@@ -7286,9 +6803,6 @@ impl Render for CanvasView {
                     .on_mouse_up(
                         MouseButton::Right,
                         cx.listener(|this, event: &MouseUpEvent, _window, _cx| {
-                            if this.active_view != ActiveView::Code {
-                                return;
-                            }
                             let pointer = pos(event.position);
                             if let Some((index, rect)) = this.code_hit(pointer) {
                                 let session = &this.code_sessions[index];
@@ -7312,108 +6826,11 @@ impl Render for CanvasView {
                     )
                     .child(pane),
             );
-        }
 
-        // The bottom toolbar — the Electron `Fu` strip: tool buttons, the
-        // command input with suggestions, the overflow cluster (workspace
-        // chip, mode/target, zoom, clear-strokes, settings). `command_bar`
-        // = Some(buffer) only while it owns the keyboard. Canvas chrome —
-        // the workviews hide it like the shell's inert `<main>` did.
-        if self.active_view == ActiveView::Canvas {
-            let buffer = self.command_bar.clone().unwrap_or_default();
-            let open = self.command_bar.is_some();
-            let message = self.command_message;
-            let names = self.manager.names();
-            let target_name = self
-                .command_target
-                .as_deref()
-                .map(|id| names.get(id).cloned().unwrap_or_else(|| id.to_owned()));
-            let terminals: Vec<(String, String)> = self
-                .snapshots
-                .iter()
-                .map(|snap| {
-                    (
-                        snap.id.clone(),
-                        names
-                            .get(&snap.id)
-                            .cloned()
-                            .unwrap_or_else(|| snap.id.clone()),
-                    )
-                })
-                .collect();
-            let tool = if self.draw_mode {
-                "draw"
-            } else if self.erase_mode {
-                "erase"
-            } else if self.select_mode {
-                "select"
-            } else {
-                // No tool picked = the original's Pan state.
-                "pan"
-            };
-            let workspace_name = slate_app::workspace::current()
-                .and_then(|dir| {
-                    std::path::Path::new(&dir)
-                        .file_name()
-                        .map(|name| name.to_string_lossy().into_owned())
-                })
-                .filter(|name| !name.is_empty())
-                .unwrap_or_else(|| "No folder".to_owned());
-            // `canSubmit`: a non-empty buffer plus either a live target or
-            // a parseable widget invocation in command mode.
-            let can_submit = {
-                let trimmed = buffer.trim();
-                !trimmed.is_empty()
-                    && (self.command_target_terminal().is_some()
-                        || (!message
-                            && parse_widget_invocation(
-                                trimmed,
-                                self.settings.command_prefix(),
-                            )
-                            .is_some()))
-            };
-            let state = crate::views_toolbar::ToolbarState {
-                buffer: buffer.clone(),
-                open,
-                message_mode: message,
-                target_name,
-                terminals,
-                tool: tool.to_owned(),
-                stroke_color: self.stroke_color,
-                can_submit,
-                has_strokes: !self.canvas.strokes.is_empty(),
-                overflow_open: self.toolbar_overflow,
-                zoom_percent: (self.canvas.camera.zoom * 100.0).round().max(0.0) as u32,
-                workspace_name,
-                suggestions: if message {
-                    Vec::new()
-                } else {
-                    toolbar_suggestions(&buffer, self.settings.command_prefix())
-                },
-                suggestion_sel: self.command_suggestion,
-                window_width: viewport_size.x,
-                enabled: true,
-            };
-            root = root.child(
-                div()
-                    .id("slate-toolbar-row")
-                    .absolute()
-                    // `fixed bottom-6` — 24px off the window's bottom edge,
-                    // 2px above the 22px status strip. Centered on the
-                    // canvas area, not the window: the open sidebar floats
-                    // over the left rail_w and would drag the optical
-                    // center left with it.
-                    .bottom(px(24.0))
-                    .left(px(rail_w))
-                    .right_0()
-                    .flex()
-                    .justify_center()
-                    // No press handler here: the shell's `fixed` bar only
-                    // captures its own box, so clicks beside the pill must
-                    // reach the canvas's own press handler untouched.
-                    .child(crate::views_toolbar::toolbar_pane(&state, cx)),
-            );
-        }
+        // The command bar — a summon-only overlay now, not the Electron
+        // strip: it renders only while `command_bar` owns the keyboard
+        // (`/`, `.`, `@` open it, Escape drops it) and carries just the
+        // input echo, `↵`, and the suggestion listbox.
 
         // The close-terminal confirm — the shell's `confirm("Close terminal?
         // The running process will be terminated.", {danger, title: "Close
@@ -7540,27 +6957,6 @@ impl Render for CanvasView {
             );
         }
 
-        // The select-tool marquee — a screen-space rect for as long as the
-        // drag is live (the shell drew the same overlay in pointer coords).
-        if let Some(Drag::Select {
-            rect: Some((a, b)), ..
-        }) = &self.drag
-        {
-            let (x, y) = (a.x.min(b.x), a.y.min(b.y));
-            let (w, h) = ((a.x - b.x).abs(), (a.y - b.y).abs());
-            root = root.child(
-                div()
-                    .absolute()
-                    .left(px(x))
-                    .top(px(y))
-                    .w(px(w))
-                    .h(px(h))
-                    .border_1()
-                    .border_color(rgb(theme::hex(theme::accent::SAND)))
-                    .bg(rgba(0xD4A37318)),
-            );
-        }
-
         // The toast — top-center, brief, like the shell's notice state.
         if let Some((text, _)) = self
             .notice
@@ -7589,102 +6985,6 @@ impl Render for CanvasView {
             );
         }
 
-        // Snap guides — the shell's accent lines through the aligned edge
-        // while a widget drag is inside the 8px threshold.
-        if let Some((gx, gy)) = self.snap_guides {
-            let accent = rgb(theme::hex(theme::accent::SAND));
-            if let Some(wx) = gx {
-                let sx = view.to_screen(Pos2::new(wx as f32, 0.0)).x;
-                root = root.child(
-                    div()
-                        .absolute()
-                        .left(px(sx))
-                        .top(px(0.0))
-                        .bottom(px(0.0))
-                        .w(px(1.0))
-                        .bg(accent),
-                );
-            }
-            if let Some(wy) = gy {
-                let sy = view.to_screen(Pos2::new(0.0, wy as f32)).y;
-                root = root.child(
-                    div()
-                        .absolute()
-                        .top(px(sy))
-                        .left(px(0.0))
-                        .right(px(0.0))
-                        .h(px(1.0))
-                        .bg(accent),
-                );
-            }
-        }
-
-        // StatusBar: the shell's 22px bottom strip — right-aligned,
-        // nothing but the threshold-coloured CPU% and the local clock
-        // (`StatusBar.tsx`: `justify-end gap-3`, `text-[10px] text-text-faint`,
-        // clock `text-text-dim`).
-        let (hh, mm, ss) = clock_hms();
-        root = root.child(
-            div()
-                .absolute()
-                .bottom(px(0.0))
-                .left(px(0.0))
-                .right(px(0.0))
-                .h(px(22.0))
-                .flex()
-                .flex_row()
-                .items_center()
-                .justify_end()
-                .gap(px(12.0))
-                .px_3()
-                .bg(rgba((theme::hex(theme::monochrome::BASE) << 8) | 0xE5))
-                .border_t_1()
-                .border_color(rgb(theme::hex(theme::hairline::SOFT)))
-                .text_size(px(10.0))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|_this, _event, _window, cx| {
-                        cx.stop_propagation();
-                    }),
-                )
-                .when_some(self.cpu_percent, |bar, pct| {
-                    // The shell's `Cpu size={11}` ahead of the percentage,
-                    // both wearing the threshold colour — #7aa2f7 blue under
-                    // the 50% warn band (`status::INFO`), not the accent.
-                    bar.child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_1()
-                            .text_color(rgb(theme::hex(if pct > 80 {
-                                theme::status::DANGER
-                            } else if pct > 50 {
-                                theme::status::WARN
-                            } else {
-                                theme::status::INFO
-                            })))
-                            .child(crate::assets::icon(
-                                "cpu",
-                                11.0,
-                                theme::hex(if pct > 80 {
-                                    theme::status::DANGER
-                                } else if pct > 50 {
-                                    theme::status::WARN
-                                } else {
-                                    theme::status::INFO
-                                }),
-                            ))
-                            .child(format!("{pct}%")),
-                    )
-                })
-                .child(
-                    div()
-                        .text_color(rgb(theme::hex(theme::text::DIM)))
-                        .child(format!("{hh:02}:{mm:02}:{ss:02}")),
-                ),
-        );
-
         // The arrange dropdown — the shell's `top-[36px] right-0 w-[210px]`
         // menu under the TitleBar's right island: label + hint rows, `✓`
         // on the active mode. The shell anchors `right-0` on the arrange
@@ -7695,9 +6995,12 @@ impl Render for CanvasView {
         if self.arrange_menu {
             let git_w =
                 crate::views_titlebar::git_chip_width(&self.git_chip, viewport_size.x, window);
-            // `!vt`: divider `mx-0.5` + w-px and the three 46px controls.
+            // `!vt`: divider `mx-0.5` + w-px and the three 46px controls —
+            // on tiling WMs the cluster collapses to the close cell alone.
             let chrome_w = if cfg!(target_os = "macos") {
                 0.0
+            } else if crate::views_titlebar::tiling_wm() {
+                46.0
             } else {
                 5.0 + 3.0 * 46.0
             };
@@ -7715,10 +7018,6 @@ impl Render for CanvasView {
                 .border_color(rgb(theme::hex(theme::hairline::SOFT)))
                 .py_1()
                 .shadow_2xl();
-            match self.active_view {
-                // `CODE_ARRANGE_ITEMS` — "Arrange terminals" lists the
-                // CodeLayout modes and picks route through onCodeLayout.
-                ActiveView::Code => {
                     for mode in slate_app::code_layout::CodeLayout::ALL {
                         let current = mode == self.code_layout;
                         popup = popup.child(
@@ -7742,29 +7041,6 @@ impl Render for CanvasView {
                             ),
                         );
                     }
-                }
-                _ => {
-                    for mode in slate_app::arrange::ArrangeMode::ALL {
-                        let current = mode == self.prefs.arrange_mode;
-                        popup = popup.child(
-                            arrange_menu_row(
-                                format!("slate-arrange-{}", mode.label().to_lowercase()),
-                                mode.label(),
-                                mode.hint(),
-                                current,
-                            )
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, _e, _w, cx| {
-                                    cx.stop_propagation();
-                                    this.arrange_menu = false;
-                                    this.apply_arrange(mode, cx);
-                                }),
-                            ),
-                        );
-                    }
-                }
-            }
             root = root.child(popup);
         }
 
@@ -7790,7 +7066,7 @@ impl Render for CanvasView {
                 .absolute()
                 .left_0()
                 .top(px(canvas::TITLE_BAR_HEIGHT))
-                .bottom(px(24.0))
+                .bottom_0()
                 .child(crate::views_sidebar::sidebar_pane(
                     &self.canvas,
                     &planner_items,
@@ -7810,7 +7086,7 @@ impl Render for CanvasView {
         // The TitleBar — the shell's fixed 40px top strip (history
         // arrows, view tabs, flip, git chip, window controls), floating
         // over the canvas exactly like the Electron layer order: canvas →
-        // chrome. Always mounted (`App.tsx:260`) — without it the Overview
+        // chrome. Always mounted (`App.tsx:260`) — without it the workspace
         // tab is unreachable whenever workspaceDir is unset.
         {
             root = root.child(
@@ -7824,7 +7100,6 @@ impl Render for CanvasView {
                         &crate::views_titlebar::TitlebarState {
                             can_undo: !self.undo_stack.is_empty(),
                             can_redo: !self.redo_stack.is_empty(),
-                            active_view: self.active_view.as_str(),
                             terminals_flipped: self.prefs.terminals_flipped,
                             git: &self.git_chip,
                             window_width: viewport_size.x,
@@ -7845,16 +7120,45 @@ impl Render for CanvasView {
         // `occlude` keeps the canvas inert underneath it; any deliberate
         // press dismisses the intro early.
         if let Some(t) = splash_t {
+            // Boot readiness, measured not assumed: each respawned PTY
+            // stays pending until a snapshot shows its first screen (a
+            // shell prompt, a restored TUI) or it exits; a missing
+            // snapshot means the engine already dropped it. The 12s cap
+            // is a wedged-PTY escape so the loader never hangs. Undelivered
+            // boot commands (still retrying) hold it too.
+            if !self.splash_pending.is_empty() {
+                let snapshots = &self.snapshots;
+                self.splash_pending.retain(|id| {
+                    if t >= 12.0 {
+                        return false;
+                    }
+                    match snapshots.iter().find(|s| &s.id == id) {
+                        Some(s) => s.alive && s.screen.trim().is_empty(),
+                        None => false,
+                    }
+                });
+            }
+            if self.splash_pending.is_empty()
+                && self.pending_commands.is_empty()
+                && self.splash_ready_at.is_none()
+            {
+                self.splash_ready_at = Some(Instant::now());
+            }
             // `.is-ready`'s fade: the screen holds opaque until 200ms after
-            // the particles finish at t=8, then eases out over 900ms.
-            let screen = 1.0 - smooth01((t - 8.2) / 0.9);
+            // ready latches, then eases out over 900ms. There is no
+            // minimum intro length — a fast boot ends fast.
+            let ready = self.splash_ready_at.is_some();
+            let fade = self
+                .splash_ready_at
+                .map(|at| at.elapsed().as_secs_f32())
+                .unwrap_or(0.0);
+            let screen = 1.0 - smooth01((fade - 0.2) / 0.9);
             let points = self.splash_points.clone();
             let (width, height) = (viewport_size.x, viewport_size.y);
             // The caption bits appear at t=2 (startup-loader-in 300ms 2s);
             // the track sweeps on a 1600ms loop until the "ready" beat at
             // t=7 leaves it full and static, like `.is-ready span`.
             let loader_in = smooth01((t - 2.0) / 0.3);
-            let ready = t >= 7.0;
             let track_w = (width * 0.6).min(280.0);
             let sweep_w = track_w * 0.3;
             let cycle = ((t - 2.0) / 1.6).max(0.0).fract();
@@ -8056,12 +7360,11 @@ impl CanvasView {
             cx.stop_propagation();
             return;
         }
-        if (self.agent_menu.is_some() || self.arrange_menu || self.toolbar_overflow)
+        if (self.agent_menu.is_some() || self.arrange_menu)
             && keystroke.key.as_str() == "escape"
         {
             self.agent_menu = None;
             self.arrange_menu = false;
-            self.toolbar_overflow = false;
             cx.notify();
             cx.stop_propagation();
             return;
@@ -8514,13 +7817,6 @@ impl CanvasView {
         // input context, so this runs even over the focused terminal (the
         // image lands in a widget, not the PTY). A workview covers the
         // canvas — the widget would land out of sight.
-        if self.active_view == ActiveView::Canvas
-            && Self::shortcut_matches(keystroke, &self.settings.image_insert_shortcut)
-        {
-            self.image_insert(cx);
-            cx.stop_propagation();
-            return;
-        }
 
         // Frame focus — the widget frame's own keydown in the shell, reached
         // after a header or handle press. Arrows nudge 1px (⇧16), Alt+arrows
@@ -8536,47 +7832,6 @@ impl CanvasView {
                 .unwrap_or(false);
             let mut handled = false;
             match keystroke.key.as_str() {
-                "left" | "right" | "up" | "down" => {
-                    if let Some(mut w) = widget {
-                        // A maximized frame ignores the keys, as the shell's
-                        // handler early-returned.
-                        if !w.maximized {
-                            let step = if mods.shift { 16.0 } else { 1.0 };
-                            let (fx, fy) = match keystroke.key.as_str() {
-                                "left" => (-1.0, 0.0),
-                                "right" => (1.0, 0.0),
-                                "up" => (0.0, -1.0),
-                                _ => (0.0, 1.0),
-                            };
-                            if mods.alt {
-                                // Alt+arrow resizes the near edge: left/up
-                                // drag their own edge, right/down extend —
-                                // clamped exactly like the pointer handles.
-                                let (nw, nh) = canvas::clamp_widget_size(
-                                    w.kind.as_deref(),
-                                    w.w + fx * step,
-                                    w.h + fy * step,
-                                );
-                                if fx < 0.0 {
-                                    w.x += w.w - nw;
-                                }
-                                if fy < 0.0 {
-                                    w.y += w.h - nh;
-                                }
-                                w.w = nw;
-                                w.h = nh;
-                            } else {
-                                w.x += fx * step;
-                                w.y += fy * step;
-                            }
-                            self.canvas.widgets.insert(id.clone(), w.clone());
-                            self.commit_widget(&w);
-                        }
-                        handled = true;
-                    } else {
-                        self.frame_focus = None;
-                    }
-                }
                 "delete" | "backspace" if !mods.control && !mods.alt && !mods.platform => {
                     if widget.is_some() {
                         if is_term {
@@ -8627,29 +7882,6 @@ impl CanvasView {
         // a Code view session's PTY counts while that view is up.
         if let Some(id) = self.active.clone() {
             if self.terminal_targetable(&id) {
-                // isGlobalZoom: Ctrl/Cmd+=, -, 0 bypass the terminal too —
-                // the shell's one shortcut a focused xterm never swallowed.
-                if (mods.control || mods.platform)
-                    && matches!(keystroke.key.as_str(), "=" | "+" | "-" | "0")
-                {
-                    let center = Pos2::new(viewport.x / 2.0, viewport.y / 2.0);
-                    match keystroke.key.as_str() {
-                        "=" | "+" => zoom_at(&mut self.canvas.camera, Pos2::ZERO, center, 1.2),
-                        "-" => zoom_at(&mut self.canvas.camera, Pos2::ZERO, center, 1.0 / 1.2),
-                        _ => {
-                            // Same `{...c, zoom: 1}` as the unfocused path —
-                            // x/y untouched, the world shifts back toward the
-                            // origin. One shortcut, one result.
-                            if self.canvas.camera.zoom != 1.0 {
-                                self.canvas.camera.zoom = 1.0;
-                            }
-                        }
-                    }
-                    self.camera_dirty_at = Some(Instant::now());
-                    cx.notify();
-                    cx.stop_propagation();
-                    return;
-                }
                 // isTerminalPasteShortcut: Ctrl+Shift+V, Ctrl+V, Alt+V, and
                 // Shift+Insert all paste — a bare Ctrl+V must NOT reach the
                 // PTY as ^V (the shell's literal-next key).
@@ -8767,11 +7999,9 @@ impl CanvasView {
         // Exception: Escape dismisses the floating layers — menus first,
         // then the Code launcher row (the original's CodeLauncher dialog
         // closed on Escape/backdrop).
-        if self.active_view != ActiveView::Canvas {
             if keystroke.key.as_str() == "escape" {
-                if self.arrange_menu || self.toolbar_overflow {
+                if self.arrange_menu {
                     self.arrange_menu = false;
-                    self.toolbar_overflow = false;
                 } else if self.code_launcher_open {
                     self.code_launcher_open = false;
                 }
@@ -8779,170 +8009,7 @@ impl CanvasView {
             cx.notify();
             cx.stop_propagation();
             return;
-        }
 
-        // `/` opens the bottom command bar — the Electron Toolbar's command
-        // input — and seeds it with the prefix pressed. `.` and `@` are the
-        // same gesture in the original's prefix set. This lives below the
-        // terminal branch so a focused terminal still receives its `/`.
-        if !mods.control && !mods.alt && !mods.platform {
-            // key_char is None under synthetic events; fall back to the
-            // keysym names for the three prefixes.
-            let prefix = keystroke
-                .key_char
-                .as_deref()
-                .or(match keystroke.key.as_str() {
-                    "slash" => Some("/"),
-                    "period" => Some("."),
-                    "at" => Some("@"),
-                    _ => None,
-                });
-            if let Some(prefix @ ("/" | "." | "@")) = prefix {
-                self.command_bar = Some(prefix.to_owned());
-                cx.notify();
-                cx.stop_propagation();
-                return;
-            }
-        }
-
-        // Canvas-level shortcuts, same keys the Electron shell advertised.
-        let key = keystroke.key.as_str();
-        match key {
-            "escape" => {
-                if self.arrange_menu || self.toolbar_overflow {
-                    // The menus' window-level Escape listener — a floating
-                    // layer closes before any canvas state is touched.
-                    self.arrange_menu = false;
-                    self.toolbar_overflow = false;
-                } else if self.draw_mode || self.erase_mode || !self.select_mode {
-                    // Back to the resting tool — the shell never has a
-                    // no-tool state, so Escape lands on select, not pan.
-                    self.draw_mode = false;
-                    self.erase_mode = false;
-                    self.select_mode = true;
-                    self.pending_stroke.clear();
-                } else if let Some(id) = self
-                    .canvas
-                    .widgets
-                    .values()
-                    .find(|widget| widget.maximized)
-                    .map(|widget| widget.id.clone())
-                {
-                    // Escape restores a maximized widget — unless a terminal
-                    // held the key, which is why this sits below the terminal
-                    // branch just like the shell's xterm guard.
-                    self.toggle_maximize(&id, cx);
-                } else if self.active.is_some() {
-                    // A non-terminal widget (or a stale active id) releases
-                    // focus on Escape — terminals keep it (their Escape went
-                    // to the PTY above).
-                    self.active = None;
-                } else {
-                    return;
-                }
-            }
-            "d" if !mods.control && !mods.alt && !mods.platform => {
-                if mods.shift {
-                    // ⇧D is the toolbar's "Clear all drawings".
-                    if !self.canvas.strokes.is_empty() {
-                        self.canvas.strokes.clear();
-                        self.commit_strokes();
-                    }
-                } else {
-                    self.draw_mode = !self.draw_mode;
-                    // `tool` was one state — draw, erase and select never
-                    // coexist.
-                    self.erase_mode = false;
-                    self.select_mode = false;
-                    if !self.draw_mode {
-                        self.pending_stroke.clear();
-                    }
-                }
-            }
-            "e" if !mods.control && !mods.alt && !mods.platform && !mods.shift => {
-                // The toolbar's Eraser tool — drags cut strokes under the
-                // pointer. Mutually exclusive with draw, as `tool` was.
-                self.erase_mode = !self.erase_mode;
-                if self.erase_mode {
-                    self.draw_mode = false;
-                    self.select_mode = false;
-                    self.pending_stroke.clear();
-                }
-            }
-            "s" if !mods.control && !mods.alt && !mods.platform && !mods.shift => {
-                // The toolbar's Select tool — empty-canvas drags draw a
-                // marquee; the topmost widget inside it comes to the front.
-                self.select_mode = !self.select_mode;
-                if self.select_mode {
-                    self.draw_mode = false;
-                    self.erase_mode = false;
-                    self.pending_stroke.clear();
-                }
-            }
-            "c" if !mods.control
-                && !mods.alt
-                && !mods.platform
-                && !mods.shift
-                && self.draw_mode =>
-            {
-                // Cycle the toolbar's swatch row; the next stroke takes it.
-                self.stroke_color = (self.stroke_color + 1) % STROKE_COLORS.len();
-            }
-            "x" if !mods.control && !mods.alt && !mods.platform && mods.shift && self.draw_mode => {
-                // The toolbar's "Erase entire drawing" (confirm dialog in
-                // the shell; ⇧D already clears unconditionally here, so ⇧X
-                // matches it).
-                if !self.canvas.strokes.is_empty() {
-                    self.canvas.strokes.clear();
-                    self.commit_strokes();
-                }
-            }
-            "t" | "T" | "n" | "N" if !mods.control && !mods.alt && !mods.platform => {
-                // The shell bound both letters to `orcspace:new-terminal`.
-                self.spawn_terminal(viewport, cx);
-            }
-            "+" | "=" => {
-                let center = Pos2::new(viewport.x / 2.0, viewport.y / 2.0);
-                zoom_at(&mut self.canvas.camera, Pos2::ZERO, center, 1.2);
-                self.camera_dirty_at = Some(Instant::now());
-            }
-            "-" => {
-                let center = Pos2::new(viewport.x / 2.0, viewport.y / 2.0);
-                zoom_at(&mut self.canvas.camera, Pos2::ZERO, center, 1.0 / 1.2);
-                self.camera_dirty_at = Some(Instant::now());
-            }
-            "0" => {
-                // `{...c, zoom: 1}` — the original reset zoom literally and
-                // left x/y alone; the world under the pointer does not stay
-                // anchored, it shifts back toward the origin.
-                if self.canvas.camera.zoom != 1.0 {
-                    self.canvas.camera.zoom = 1.0;
-                    self.camera_dirty_at = Some(Instant::now());
-                }
-            }
-            "f" | "F" | "а" | "А" if !mods.control && !mods.alt && !mods.platform => {
-                // Cyrillic а is the same physical key — the shell aliased it.
-                self.fit(viewport, cx);
-            }
-            "home" => {
-                self.canvas.camera = Default::default();
-                self.camera_dirty_at = Some(Instant::now());
-            }
-            "left" | "right" | "up" | "down" => {
-                let step = if mods.shift { 10.0 } else { 50.0 };
-                let (dx, dy) = match key {
-                    "left" => (step, 0.0),
-                    "right" => (-step, 0.0),
-                    "up" => (0.0, step),
-                    _ => (0.0, -step),
-                };
-                self.canvas.camera.x += dx;
-                self.canvas.camera.y += dy;
-                self.camera_dirty_at = Some(Instant::now());
-            }
-            _ => return,
-        }
-        cx.notify();
     }
 
     // fix-files: release the files pane's keyboard owner — the original's

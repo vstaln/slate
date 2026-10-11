@@ -55,6 +55,20 @@ impl JournalLock {
     }
 }
 
+/// One `journal.append` call — the fields `flow.apply` set per phase. The
+/// three phases share the writer: `intent` carries the payload only, `commit`
+/// adds `commandId` and `version`, `abort` replaces both with `error`.
+pub struct AppendSpec<'a> {
+    pub phase: &'a str,
+    pub actor: &'a str,
+    pub entry_type: &'a str,
+    pub target: &'a str,
+    pub payload: Option<Value>,
+    pub version: Option<i64>,
+    pub command_id: Option<&'a str>,
+    pub error: Option<String>,
+}
+
 impl JournalLog {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, String> {
         let path = path.as_ref().to_owned();
@@ -157,6 +171,23 @@ impl JournalLog {
         target: &str,
         payload: Value,
     ) -> Result<JournalEntry, String> {
+        self.append(&AppendSpec {
+            phase: "commit",
+            actor,
+            entry_type,
+            target,
+            payload: Some(payload),
+            version: None,
+            command_id: None,
+            error: None,
+        })
+    }
+
+    /// Appends one entry of any phase — the `journal.append` the command flow
+    /// wrapped every mutation in: `intent` before the work, `commit` after it
+    /// lands, `abort` when it fails in between. Callers writing only a commit
+    /// keep `commit()`; the submit gate chain uses this.
+    pub fn append(&mut self, spec: &AppendSpec<'_>) -> Result<JournalEntry, String> {
         // Serialize the open→append critical section across processes — the
         // view, the control socket and any CLI all write through this fn. The
         // tail-adoption below only sees writers that already finished, so
@@ -169,7 +200,7 @@ impl JournalLog {
         // the payload wins (null included — that is the no-workspace slot);
         // an absent field means the writer is the app itself or its own
         // CLI, so the app's current workspace owns the commit.
-        let workspace_dir = match payload.get("workspaceDir") {
+        let workspace_dir = match spec.payload.as_ref().and_then(|p| p.get("workspaceDir")) {
             Some(value) => value.as_str().map(str::to_owned),
             None => crate::workspace::current(),
         };
@@ -188,14 +219,14 @@ impl JournalLog {
                 .checked_add(1)
                 .ok_or("Journal sequence exhausted")?,
             at: now_ms(),
-            phase: "commit".into(),
-            actor_id: actor.into(),
-            command_id: None,
-            entry_type: entry_type.into(),
-            target: target.into(),
-            payload: Some(payload),
-            version: None,
-            error: None,
+            phase: spec.phase.into(),
+            actor_id: spec.actor.into(),
+            command_id: spec.command_id.map(str::to_owned),
+            entry_type: spec.entry_type.into(),
+            target: spec.target.into(),
+            payload: spec.payload.clone(),
+            version: spec.version,
+            error: spec.error.clone(),
             prev_hash: Some(self.head.clone()),
             hash: None,
             workspace_dir,

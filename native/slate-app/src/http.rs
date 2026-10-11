@@ -232,12 +232,18 @@ pub trait RouteEnv: Send {
         target: &str,
         caller: Option<&str>,
     ) -> Result<String, CommandError>;
+    /// `terminals.resolveWriteTarget` — an empty/`new` target floats to the
+    /// preferred running terminal, then the most recently spawned live one.
+    /// `None` when nothing is running.
+    fn resolve_write_target(&mut self, requested: &str) -> Option<String>;
     /// The next free `term-*` id — `terminal.create` journals the id before
     /// the PTY exists, so the route has to mint it ahead of the spawn.
-    fn fresh_terminal_id(&mut self) -> String;
+    fn next_terminal_id(&mut self, prefix: &str) -> String;
     /// Open a fresh shell under `id` — the dispatch path's `terminals.reserve`.
     /// The canvas's orphan-adoption turns it into a widget on the next tick.
     fn spawn_terminal(&mut self, id: &str, title: &str, cwd: &str) -> Result<(), String>;
+    /// `terminals.isRunning` — the PTY reached its read loop.
+    fn terminal_running(&mut self, id: &str) -> bool;
     /// A line of text into the PTY with confirmed delivery; `press_enter`
     /// submits it. `Err` means the terminal is not reading input.
     fn write_terminal(&mut self, id: &str, text: &str, press_enter: bool) -> Result<(), String>;
@@ -252,6 +258,22 @@ pub trait RouteEnv: Send {
     fn data_dir(&self) -> std::path::PathBuf;
     /// The socket path the app listens on, for the `/snapshot` presence block.
     fn socket_path(&self) -> Option<String>;
+    /// `versionOf(target)` — the version the store registries would report for
+    /// this target right now: the folded object's `version` for the schemes
+    /// that track one, 0 for everything else (terminal/git/file have no
+    /// registry — `flow.registerVersions` never named them).
+    fn target_version(&mut self, target: &str) -> u64;
+    /// The server's cross-request idempotency cache — `submit` consults it
+    /// before the gates so a retry is answered, not re-run.
+    fn idempotency(
+        &mut self,
+    ) -> std::sync::MutexGuard<'_, crate::idempotency::IdempotencyCache>;
+    /// `rateLimiter.tryConsume(actorId)` — `submit()` throttled
+    /// non-privileged actors after the idempotency check and before any gate.
+    /// HTTP agents are never privileged (the original reserved `user` and
+    /// `system` for internal callers), so every submit consumes budget.
+    /// `false` = over the limit → 429.
+    fn rate_limit(&mut self, actor: &str, now: i64) -> bool;
 }
 
 /// Borrow the environment or answer like the half-wired TypeScript did —
@@ -284,26 +306,651 @@ fn accepted(entry: &crate::journal::JournalEntry, status: u16, data: Value) -> R
     )
 }
 
-/// `submit(...)` for a journal-backed command: append the entry and hand it
-/// back so the caller can fold the new state into its reply.
-fn journal_commit(
+/// The `registerDefinition` flags that decide which gates a journaled command
+/// answers to — `(requires_lock, ignore_version)` per command type, from the
+/// TypeScript registrations. Anything unlisted takes the registration
+/// defaults: locked, versioned.
+fn command_flags(entry_type: &str) -> (bool, bool) {
+    match entry_type {
+        // requiresLock: false — git reads and the terminal hot path.
+        "git.refresh" | "git.branches" | "git.log" | "terminal.input" | "terminal.resize" => {
+            (false, true)
+        }
+        // ignoreVersion — creates, recolors, and the terminal/git/
+        // orchestration verbs whose targets no version registry tracks.
+        "widget.create" | "canvas.camera" | "canvas.import" | "terminal.create"
+        | "terminal.spawn" | "terminal.write" | "terminal.attach" | "terminal.dispose"
+        | "plan.create" | "note.create" | "note.recolor" | "git.commit" | "git.checkout"
+        | "git.create-branch" | "run.create" | "run.close" | "orctask.create"
+        | "dispatch.start" | "dispatch.settle" | "dispatch.account" | "orc.send" | "orc.ack"
+        | "gate.create" | "gate.resolve" | "file.write" | "file.create" | "file.mkdir"
+        | "file.delete" | "file.rename" => (true, true),
+        _ => (true, false),
+    }
+}
+
+/// `resolveResultVersion` — the `version` a commit entry stamps. Updates and
+/// canvas writes record the target's *post*-write version (its registry was
+/// bumped by the handler), creates record the fresh object's 1, deletes record
+/// the version the object died at, and schemes no registry tracked (terminal,
+/// git, file) record 0.
+fn resolved_commit_version(entry_type: &str, current_version: u64) -> i64 {
+    match entry_type {
+        "plan.create" | "widget.create" | "note.create" | "run.create" | "orctask.create"
+        | "dispatch.start" | "gate.create" => 1,
+        "plan.delete" | "note.delete" | "widget.remove" => current_version as i64,
+        // Mail rides the run's resource but settles nothing there — the
+        // run's version is unchanged, so the commit records it as read.
+        "orc.send" | "orc.ack" | "note.recolor" => current_version as i64,
+        t if t.starts_with("terminal.") || t.starts_with("git.") || t.starts_with("file.") => 0,
+        _ => current_version as i64 + 1,
+    }
+}
+
+/// The orchestration store's version registries — `registerVersions('run' |
+/// 'orctask' | 'dispatch' | 'gate', …)` in the TypeScript. They live in
+/// `deps.orchestration`, not the journal, so the gate reads them there; a
+/// missing entity reports 0 like an unwritten registry key did.
+fn orchestration_target_version(
+    store: &crate::orchestration::OrchestrationStore,
+    target: &str,
+) -> Option<u64> {
+    let parsed = crate::resources::parse_resource(target)?;
+    if parsed.id == "new" {
+        return Some(0);
+    }
+    Some(match parsed.scheme.as_str() {
+        "run" => store.require_run(&parsed.id).map(|r| r.version).unwrap_or(0),
+        "orctask" => store.require_task(&parsed.id).map(|t| t.version).unwrap_or(0),
+        "dispatch" => store
+            .require_dispatch(&parsed.id)
+            .map(|d| d.version)
+            .unwrap_or(0),
+        "gate" => store.require_gate(&parsed.id).map(|g| g.version).unwrap_or(0),
+        _ => return None,
+    })
+}
+
+/// `flow.versionOf(target)` rebuilt from the journal fold — the same answer
+/// the store registries gave the gate, since both seed from committed entries.
+/// Schemes without a store (`terminal`, `git`, `file`) answer 0; the
+/// orchestration schemes answer from `orchestration_target_version` instead.
+pub fn folded_target_version(
+    entries: &[crate::journal::JournalEntry],
+    data_dir: &std::path::Path,
+    target: &str,
+) -> u64 {
+    let Some(parsed) = crate::resources::parse_resource(target) else {
+        return 0;
+    };
+    // `*:new` is the create target — nothing exists at it yet.
+    if parsed.id == "new" {
+        return 0;
+    }
+    match parsed.scheme.as_str() {
+        "plan" => crate::planner::fold(
+            entries,
+            crate::planner::PlannerState::default(),
+            &crate::planner::today_local(),
+        )
+        .ok()
+        .and_then(|items| items.get(&parsed.id).map(|item| item.version as u64))
+        .unwrap_or(0),
+        "widget" => crate::projection::fold(
+            entries,
+            crate::projection::CanvasState::default(),
+            crate::projection::Clock(deps_now_f64()),
+        )
+        .widgets
+        .get(&parsed.id)
+        .map(|widget| widget.version as u64)
+        .unwrap_or(0),
+        // Every `canvas:*` target seeds the one registry id — CANVAS_TARGET_ID.
+        "canvas" => crate::projection::fold(
+            entries,
+            crate::projection::CanvasState::default(),
+            crate::projection::Clock(deps_now_f64()),
+        )
+        .version as u64,
+        "note" => notes_document(data_dir)
+            .get("items")
+            .and_then(Value::as_array)
+            .and_then(|items| {
+                items.iter().find(|item| {
+                    item.get("id").and_then(Value::as_str) == Some(parsed.id.as_str())
+                })
+            })
+            .and_then(|item| item.get("version").and_then(Value::as_u64))
+            .unwrap_or(0),
+        _ => 0,
+    }
+}
+
+static COMMAND_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `cmd-${now}-${counter}` — the id every submitted command mints whether it
+/// needs one or not.
+fn mint_command_id(now: i64) -> String {
+    let counter = COMMAND_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    format!("cmd-{now}-{counter}")
+}
+
+/// The cached answer an idempotent replay returns. Successes synthesize the
+/// commit entry plus the `data` the first run's handler returned — the
+/// TypeScript cached the whole `CommandResult`, so a retry reads back what
+/// the first caller saw. Failures carry the exact response the first
+/// attempt produced, since `flow.submit` cached resolved rejections too.
+fn idempotent_replay(
+    actor: &str,
+    entry_type: &str,
+    target: &str,
+    cached: &Value,
+) -> Result<(crate::journal::JournalEntry, Value), Response> {
+    if cached.get("ok").and_then(Value::as_bool) == Some(false) {
+        let status = cached.get("status").and_then(Value::as_u64).unwrap_or(400) as u16;
+        let body = cached.get("body").cloned().unwrap_or_else(|| {
+            json!({ "error": "command failed", "code": "failed" })
+        });
+        return Err(Response::json(status, body));
+    }
+    Ok((
+        crate::journal::JournalEntry {
+            seq: cached.get("seq").and_then(Value::as_u64).unwrap_or(0),
+            at: cached.get("at").and_then(Value::as_u64).unwrap_or(0),
+            phase: "commit".into(),
+            actor_id: actor.to_owned(),
+            command_id: None,
+            entry_type: entry_type.to_owned(),
+            target: target.to_owned(),
+            payload: None,
+            version: cached.get("version").and_then(Value::as_i64),
+            error: None,
+            prev_hash: None,
+            hash: None,
+            workspace_dir: None,
+        },
+        cached.get("data").cloned().unwrap_or(Value::Null),
+    ))
+}
+
+/// The result payload an idempotency record keeps — the CommandResult shape
+/// `flow.submit`'s `track` stored (`{ok, seq, version, data, …}` on success,
+/// `{ok:false, code, message, …}` on failure; `set` adds `cached`).
+fn idempotent_record(
+    entry_type: &str,
+    command_id: &str,
+    outcome: &Result<(crate::journal::JournalEntry, Value), Response>,
+) -> Value {
+    match outcome {
+        Ok((entry, data)) => json!({
+            "ok": true,
+            "seq": entry.seq,
+            "at": entry.at,
+            "version": entry.version,
+            "commandId": command_id,
+            "data": data,
+        }),
+        Err(response) => json!({
+            "ok": false,
+            "commandId": command_id,
+            "type": entry_type,
+            "status": response.status,
+            "body": response.body,
+        }),
+    }
+}
+
+/// `handler.extraLocks` — the TypeScript registered one: `file.rename`
+/// declares `file:{to}` so the destination contends for locks the same as
+/// the source. Non-local or empty `to` values declare nothing, exactly as
+/// `isLocalPath(destination)` filtered them there.
+fn extra_lock_targets(entry_type: &str, payload: &Value) -> Vec<String> {
+    if entry_type != "file.rename" {
+        return Vec::new();
+    }
+    let Some(to) = payload.get("to").and_then(Value::as_str).map(str::trim) else {
+        return Vec::new();
+    };
+    if to.is_empty() || !crate::resources::is_local_path(to) {
+        return Vec::new();
+    }
+    vec![crate::resources::file_resource(to)]
+}
+
+/// `apply`'s `finally` lock release, as a function so the flag can move
+/// freely between borrow and assignment.
+fn release_implicit(
+    env: &mut dyn RouteEnv,
+    target: &str,
+    actor: &str,
+    now: i64,
+    took: bool,
+) {
+    if took {
+        let _ = env.locks().release(target, actor, now);
+    }
+}
+
+/// The front half of `flow.apply` — `assertUnlockedFor`,
+/// `takeImplicitLockFor`, `assertVersionGate`, then the `intent` append —
+/// run under one environment borrow. Returns `(current_version,
+/// took_implicit_lock, implicit_extra_locks)`; on failure every acquired
+/// lock is already released, as `apply`'s `finally` did.
+fn submit_gate(
+    env: &mut dyn RouteEnv,
+    entry_type: &str,
+    target: &str,
+    actor: &str,
+    requires_lock: bool,
+    ignore_version: bool,
+    base_version: Option<f64>,
+    payload: &Value,
+    now: i64,
+    store_version: Option<u64>,
+) -> Result<(u64, bool, Vec<String>), Response> {
+    let mut implicit_lock = false;
+    let mut implicit_extras: Vec<String> = Vec::new();
+
+    if requires_lock {
+        // `handler.extraLocks` — the one definer in the TypeScript was
+        // `file.rename`, locking the destination the same as the source so a
+        // lock held on `file:{to}` can't be renamed over invisibly.
+        let extras = extra_lock_targets(entry_type, payload);
+        {
+            let mut locks = env.locks();
+            // `assertUnlockedFor` checked the target and the extras together
+            // before `takeImplicitLockFor` acquired any of them — a conflict
+            // anywhere refuses the command without a partial acquisition.
+            for resource in std::iter::once(target).chain(extras.iter().map(String::as_str)) {
+                if let Some(lock) = if locks.is_locked_by_other(resource, actor, now) {
+                    locks.holder(resource, now)
+                } else {
+                    None
+                } {
+                    drop(locks);
+                    return Err(Response::from_error(&CommandError::with_details(
+                        ErrorCode::Locked,
+                        format!("{resource} is locked by {}", lock.actor_id),
+                        json!({
+                            "lock": {
+                                "resource": lock.resource,
+                                "actorId": lock.actor_id,
+                                "expiresAt": lock.expires_at,
+                            }
+                        }),
+                    )));
+                }
+            }
+            for resource in std::iter::once(target).chain(extras.iter().map(String::as_str)) {
+                if locks.is_held_by(resource, actor, now) {
+                    continue;
+                }
+                match locks.acquire(
+                    crate::locks::AcquireInput {
+                        resource,
+                        actor_id: actor,
+                        ttl_ms: None,
+                        reason: Some(entry_type.to_owned()),
+                        implicit: true,
+                    },
+                    now,
+                ) {
+                    Ok(_) => {
+                        if resource == target {
+                            implicit_lock = true;
+                        } else {
+                            implicit_extras.push(resource.to_owned());
+                        }
+                    }
+                    Err(error) => {
+                        drop(locks);
+                        for held in &implicit_extras {
+                            let _ = env.locks().release(held, actor, now);
+                        }
+                        release_implicit(env, target, actor, now, implicit_lock);
+                        return Err(Response::from_error(&error));
+                    }
+                }
+            }
+        }
+    }
+
+    let current_version = store_version.unwrap_or_else(|| env.target_version(target));
+    // `typeof body.baseVersion === 'number'` — every numeric spelling gates,
+    // including ones that can never match a version.
+    if !ignore_version && base_version.is_some_and(|base| base != current_version as f64) {
+        for held in &implicit_extras {
+            let _ = env.locks().release(held, actor, now);
+        }
+        release_implicit(env, target, actor, now, implicit_lock);
+        return Err(Response::from_error(&CommandError::with_details(
+            ErrorCode::Conflict,
+            format!(
+                "{target} moved on: expected version {}, found {current_version}",
+                base_version.unwrap_or_default()
+            ),
+            json!({
+                "target": target,
+                "expected": base_version,
+                "actual": current_version,
+            }),
+        )));
+    }
+
+    if let Err(message) = env.journal().and_then(|mut log| {
+        log.append(&crate::journal_log::AppendSpec {
+            phase: "intent",
+            actor,
+            entry_type,
+            target,
+            payload: Some(payload.clone()),
+            version: None,
+            command_id: None,
+            error: None,
+        })
+    }) {
+        for held in &implicit_extras {
+            let _ = env.locks().release(held, actor, now);
+        }
+        release_implicit(env, target, actor, now, implicit_lock);
+        return Err(Response::from_error(&CommandError::new(
+            ErrorCode::Failed,
+            message,
+        )));
+    }
+    Ok((current_version, implicit_lock, implicit_extras))
+}
+
+/// A command past the gates: intent is in the journal, the implicit lock is
+/// held, and the handler's work is all that stands between it and the commit
+/// (or `abort`). Owned data only, so an async caller can carry it across an
+/// `await` — the axum handlers run their handler inside `spawn_blocking`.
+pub struct PendingSubmit {
+    entry_type: String,
+    target: String,
+    actor: String,
+    now: i64,
+    command_id: String,
+    idempotency_key: Option<String>,
+    tracked_key: bool,
+    implicit_lock: bool,
+    implicit_extras: Vec<String>,
+    /// The payload the commit will carry — work may edit it in place (the
+    /// TypeScript's handlers mutated `cmd.payload`, e.g. `p.id = id`).
+    pub payload: Value,
+    version: i64,
+}
+
+/// The two ways `submit_begin` can come back: a cached replay to return
+/// verbatim, or a command that cleared the gates and needs its handler run.
+/// The replayed `Ok` pairs the synthesized commit entry with the `data` the
+/// first run returned — the cached `CommandResult` carried it.
+pub enum Submit {
+    Replay(Result<(crate::journal::JournalEntry, Value), Response>),
+    Run(PendingSubmit),
+}
+
+/// `controlServer.submit` → the front half of `flow.apply`: lock heartbeat,
+/// idempotent replay/track, lock gate, `baseVersion` gate, intent append.
+/// Split from `submit_finish` so a handler that must `.await` its effect
+/// (the axum terminal routes) can run the work between the two halves
+/// without holding a borrow of `deps`.
+///
+/// `actor`, `base_version`, and `idempotency_key` are explicit rather than
+/// pulled from a `Request` — the engine's typed axum handlers call this
+/// without dressing their request up as one first.
+pub fn submit_begin(
+    deps: &mut RouteDeps<'_>,
+    actor: &str,
+    base_version: Option<f64>,
+    idempotency_key: Option<String>,
+    entry_type: &str,
+    target: &str,
+    payload: Value,
+    what: &str,
+) -> Result<Submit, Response> {
+    let (requires_lock, ignore_version) = command_flags(entry_type);
+    let now = deps.now;
+    let command_id = mint_command_id(now);
+
+    // `registerVersions('run'|'orctask'|'dispatch'|'gate')` read the
+    // orchestration store — reachable on `deps` before the env borrow opens.
+    let store_version = orchestration_target_version(deps.orchestration, target);
+
+    let env = environment(deps, what, "a journaled command needs the running app")?;
+
+    // `locks.heartbeat(agentId)` — every submit renews the caller's held
+    // locks before anything else looks at them.
+    env.locks().heartbeat(actor, None, now);
+
+    // `idempotency.get` — a retry carrying a known key is answered from
+    // the cache before admission control, exactly like flow.submit.
+    let mut tracked_key = false;
+    if let Some(key) = &idempotency_key {
+        let mut cached = env.idempotency().get(key, now);
+        // The TypeScript joined the in-flight promise; a synchronous
+        // route can only poll for the pending command to settle.
+        for _ in 0..80 {
+            match cached {
+                Some(crate::idempotency::Entry::Pending) => {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                    cached = env.idempotency().get(key, now);
+                }
+                _ => break,
+            }
+        }
+        if let Some(crate::idempotency::Entry::Done(cached)) = cached {
+            return Ok(Submit::Replay(idempotent_replay(
+                actor, entry_type, target, &cached,
+            )));
+        }
+    }
+
+    // `rateLimiter.tryConsume` — after the replay check, before the command
+    // is tracked or gated, exactly where submit() spent budget.
+    if !env.rate_limit(actor, now) {
+        return Err(Response::from_error(&CommandError::new(
+            ErrorCode::RateLimited,
+            "429 Rate limit exceeded for actor",
+        )));
+    }
+
+    if let Some(key) = &idempotency_key {
+        // `idempotency.track` — mark the key in flight so a concurrent
+        // retry sees Pending rather than starting a second run.
+        env.idempotency().track(key, now);
+        tracked_key = true;
+    }
+
+    let (current_version, implicit_lock, implicit_extras) = match submit_gate(
+        env,
+        entry_type,
+        target,
+        actor,
+        requires_lock,
+        ignore_version,
+        base_version,
+        &payload,
+        now,
+        store_version,
+    ) {
+        Ok(gate) => gate,
+        Err(response) => {
+            if tracked_key {
+                if let Some(key) = &idempotency_key {
+                    env.idempotency().set(
+                        key,
+                        idempotent_record(entry_type, &command_id, &Err(response.clone())),
+                        now,
+                    );
+                }
+            }
+            return Err(response);
+        }
+    };
+
+    Ok(Submit::Run(PendingSubmit {
+        entry_type: entry_type.to_owned(),
+        target: target.to_owned(),
+        actor: actor.to_owned(),
+        now,
+        command_id,
+        idempotency_key,
+        tracked_key,
+        implicit_lock,
+        implicit_extras,
+        version: resolved_commit_version(entry_type, current_version),
+        payload,
+    }))
+}
+
+/// The back half of `flow.apply`: commit on success, `abort` on a post-intent
+/// failure, implicit-lock release and the idempotent record either way —
+/// apply()'s `finally` in the TypeScript. `result` is the handler's answer —
+/// its `data` — so the commit, the caller's response, and the idempotent
+/// record all carry the same thing.
+pub fn submit_finish(
+    deps: &mut RouteDeps<'_>,
+    pending: PendingSubmit,
+    result: Result<Value, Response>,
+    what: &str,
+) -> Result<(crate::journal::JournalEntry, Value), Response> {
+    let outcome = result.and_then(|data| {
+        environment(deps, what, "a journaled command needs the running app").and_then(|env| {
+            env.journal()
+                .and_then(|mut log| {
+                    log.append(&crate::journal_log::AppendSpec {
+                        phase: "commit",
+                        actor: &pending.actor,
+                        entry_type: &pending.entry_type,
+                        target: &pending.target,
+                        payload: Some(pending.payload.clone()),
+                        version: Some(pending.version),
+                        command_id: Some(pending.command_id.as_str()),
+                        error: None,
+                    })
+                })
+                .map(|entry| (entry, data))
+                .map_err(|message| {
+                    Response::from_error(&CommandError::new(ErrorCode::Failed, message))
+                })
+        })
+    });
+
+    // The `finally` half of apply(): a post-intent failure appends `abort`,
+    // the implicit lock releases regardless, and the resolved result —
+    // rejection included — is what an idempotent retry replays.
+    let env = match environment(deps, what, "a journaled command needs the running app") {
+        Ok(env) => env,
+        Err(_) => {
+            return outcome;
+        }
+    };
+    if let Err(response) = &outcome {
+        let _ = env.journal().and_then(|mut log| {
+            log.append(&crate::journal_log::AppendSpec {
+                phase: "abort",
+                actor: &pending.actor,
+                entry_type: &pending.entry_type,
+                target: &pending.target,
+                payload: None,
+                version: None,
+                command_id: None,
+                error: Some(match response.body.get("error") {
+                    Some(Value::String(message)) => message.clone(),
+                    _ => "command failed".to_owned(),
+                }),
+            })
+        });
+    }
+    for held in &pending.implicit_extras {
+        let _ = env.locks().release(held, &pending.actor, pending.now);
+    }
+    release_implicit(
+        env,
+        &pending.target,
+        &pending.actor,
+        pending.now,
+        pending.implicit_lock,
+    );
+    if pending.tracked_key {
+        if let Some(key) = &pending.idempotency_key {
+            env.idempotency().set(
+                key,
+                idempotent_record(&pending.entry_type, &pending.command_id, &outcome),
+                pending.now,
+            );
+        }
+    }
+    outcome
+}
+
+/// `controlServer.submit` → `flow.apply`, minus the pieces this port does not
+/// carry (the in-process queue, the speculative overlay). The gate order is
+/// the contract the TypeScript fixed: the caller's locks heartbeat first, an
+/// idempotent replay is answered before any gate, a held lock beats a stale
+/// `baseVersion`, the intent lands before the work, and a post-intent failure
+/// leaves an `abort` behind.
+///
+/// `work` is the handler half — for journal-fold mutations it just returns
+/// the `data` (the commit entry *is* the write); for effects like a git
+/// invocation it runs between intent and commit exactly as the original's
+/// handler did. Its second argument is the payload the commit will carry:
+/// the TypeScript journaled `cmd.payload` after `apply()` had run, so a
+/// handler that mints an id (`p.id = id` in `widget.create`) writes it into
+/// the commit even though the intent above recorded the original. The
+/// returned `Value` is both the response's `data` and what an idempotent
+/// replay reads back.
+fn submit_command(
     deps: &mut RouteDeps<'_>,
     request: &Request,
     entry_type: &str,
     target: &str,
     payload: Value,
     what: &str,
-) -> Result<crate::journal::JournalEntry, Response> {
-    let env = environment(
+    work: impl FnOnce(&mut RouteDeps<'_>, &mut Value) -> Result<Value, Response>,
+) -> Result<(crate::journal::JournalEntry, Value), Response> {
+    let base_version = request.body.get("baseVersion").and_then(Value::as_f64);
+    let idempotency_key = request
+        .body
+        .get("idempotencyKey")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let actor = actor(request).to_owned();
+    match submit_begin(
         deps,
+        &actor,
+        base_version,
+        idempotency_key,
+        entry_type,
+        target,
+        payload,
         what,
-        "mutating journal-backed state needs the running app",
-    )?;
-    let mut log = env
-        .journal()
-        .map_err(|message| Response::from_error(&CommandError::new(ErrorCode::Failed, message)))?;
-    log.commit(actor(request), entry_type, target, payload)
-        .map_err(|message| Response::from_error(&CommandError::new(ErrorCode::Failed, message)))
+    )? {
+        Submit::Replay(result) => result,
+        Submit::Run(mut pending) => {
+            let result = work(deps, &mut pending.payload);
+            submit_finish(deps, pending, result, what)
+        }
+    }
+}
+
+/// One journaled route arm: submit through the gates, run `work`, answer
+/// `accepted` — the `reply(await submit(…), status)` shape, collapsed.
+fn submitted(
+    deps: &mut RouteDeps<'_>,
+    request: &Request,
+    entry_type: &str,
+    target: &str,
+    payload: Value,
+    what: &str,
+    status: u16,
+    work: impl FnOnce(&mut RouteDeps<'_>, &mut Value) -> Result<Value, Response>,
+) -> Response {
+    match submit_command(deps, request, entry_type, target, payload, what, work) {
+        Ok((entry, data)) => accepted(&entry, status, data),
+        Err(response) => response,
+    }
 }
 
 /// Routes one request. `None` means no route matched — the caller answers 404,
@@ -350,16 +997,29 @@ fn route_domains(request: &Request, deps: &mut RouteDeps<'_>) -> Option<Response
     let head = segments.first().map(String::as_str);
 
     match head {
-        None | Some("health") if method == "GET" => Some(Response::json(
-            200,
-            json!({
-                "ok": true,
-                "app": "slate",
-                "server": "slate-control",
-                "version": deps.app_version,
-                "workspaceDir": deps.workspace_dir,
-            }),
-        )),
+        // The shell's /health advertises the live surface: `terminals` is
+        // the count `terminal list` would return and `commands` is every
+        // journaled command type this build accepts — a CLI learns the
+        // whole verb surface from one unauthenticated-adjacent read.
+        None | Some("health") if method == "GET" => {
+            let terminals = deps
+                .env
+                .as_deref_mut()
+                .map(|env| env.terminals().len())
+                .unwrap_or(0);
+            Some(Response::json(
+                200,
+                json!({
+                    "ok": true,
+                    "app": "slate",
+                    "server": "slate-control",
+                    "version": deps.app_version,
+                    "workspaceDir": deps.workspace_dir,
+                    "terminals": terminals,
+                    "commands": COMMAND_TYPES,
+                }),
+            ))
+        }
         Some("orchestration") => orchestration_route(request, &segments, deps),
         Some("snapshot") if method == "GET" => Some(snapshot_route(request, deps)),
         Some("journal") if method == "GET" => Some(journal_route(request, deps)),
@@ -390,6 +1050,39 @@ fn route_domains(request: &Request, deps: &mut RouteDeps<'_>) -> Option<Response
         )),
         _ => None,
     }
+}
+
+/// `imageList` + `importImages` — the body's `images[]` merged with a lone
+/// `image`, trimmed, emptied entries dropped, capped at 8, then every path
+/// copied into the media store. The TypeScript ran this before `submit`, so
+/// a bad path answers 400 without an intent entry ever landing.
+fn import_body_images(
+    deps: &mut RouteDeps<'_>,
+    request: &Request,
+    what: &str,
+) -> Result<Vec<String>, Response> {
+    let paths: Vec<String> = request
+        .strings("images")
+        .into_iter()
+        .chain(request.text("image").map(str::to_owned))
+        .map(|p| p.trim().to_owned())
+        .filter(|p| !p.is_empty())
+        .take(8)
+        .collect();
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let media_dir = environment(deps, what, "attachments import into the media store")?
+        .data_dir()
+        .join("media");
+    paths
+        .iter()
+        .map(|p| {
+            crate::attachments::import_image(std::path::Path::new(p), &media_dir)
+                .map(|path| path.to_string_lossy().into_owned())
+                .map_err(invalid)
+        })
+        .collect()
 }
 
 fn orchestration_route(
@@ -542,370 +1235,477 @@ fn orchestration_route(
 
         // --- writes ---------------------------------------------------------
         ("POST", Some("runs"), None, _) => {
-            let objective = request.text("objective").unwrap_or("");
-            let coordinator = request.agent_id.as_deref().unwrap_or("api");
-            Some(match store.create_run(objective, coordinator, deps.now) {
-                Ok(run) => Response::accepted(201, run.version, 0, run_json(&run)),
-                Err(error) => Response::from_error(&error),
-            })
+            // `submit(body, 'run.create', 'run:new', body)` — the store write
+            // is the handler's apply, so it runs between intent and commit.
+            let coordinator = request.agent_id.as_deref().unwrap_or("api").to_owned();
+            Some(submitted(
+                deps,
+                request,
+                "run.create",
+                "run:new",
+                request.body.clone(),
+                "POST /orchestration/runs",
+                201,
+                |deps, payload| {
+                    deps.orchestration
+                        .create_run(
+                            payload.get("objective").and_then(Value::as_str).unwrap_or(""),
+                            &coordinator,
+                            deps.now,
+                        )
+                        .map(|run| run_json(&run))
+                        .map_err(|error| Response::from_error(&error))
+                },
+            ))
         }
-        ("POST", Some("runs"), Some(id), Some("close")) => {
-            Some(match store.close_run(id, deps.now) {
-                Ok(run) => Response::accepted(200, run.version, 0, run_json(&run)),
-                Err(error) => Response::from_error(&error),
-            })
-        }
+        ("POST", Some("runs"), Some(id), Some("close")) => Some(submitted(
+            deps,
+            request,
+            "run.close",
+            &format!("run:{id}"),
+            json!({}),
+            "POST /orchestration/runs/{id}/close",
+            200,
+            |deps, _| {
+                deps.orchestration
+                    .close_run(id, deps.now)
+                    .map(|run| run_json(&run))
+                    .map_err(|error| Response::from_error(&error))
+            },
+        )),
 
         ("POST", Some("tasks"), None, _) => {
-            let run_id = match store.resolve_run_id(request.text("runId")) {
-                Ok(id) => id,
-                Err(error) => return Some(Response::from_error(&error)),
+            // `submit(body, 'orctask.create', 'orctask:new', {...body, images})`
+            // — images were media-imported before the submit, so a bad path
+            // 400s with no intent entry.
+            let mut payload = request.body.clone();
+            if !payload.is_object() {
+                payload = json!({});
+            }
+            let images = match import_body_images(deps, request, "POST /orchestration/tasks") {
+                Ok(images) => images,
+                Err(response) => return Some(response),
             };
-            let created_by = request.agent_id.as_deref().unwrap_or("api");
-            Some(
-                match store.create_task(
-                    &run_id,
-                    request.text("title"),
-                    request.text("spec").unwrap_or(""),
-                    &request.strings("deps"),
-                    &request.strings("images"),
-                    created_by,
-                    deps.now,
-                ) {
-                    Ok(task) => Response::accepted(201, task.version, 0, task_json(&task)),
-                    Err(error) => Response::from_error(&error),
+            payload["images"] = json!(images);
+            let created_by = request.agent_id.as_deref().unwrap_or("api").to_owned();
+            Some(submitted(
+                deps,
+                request,
+                "orctask.create",
+                "orctask:new",
+                payload,
+                "POST /orchestration/tasks",
+                201,
+                |deps, payload| {
+                    let run_id = deps
+                        .orchestration
+                        .resolve_run_id(payload.get("runId").and_then(Value::as_str))
+                        .map_err(|error| Response::from_error(&error))?;
+                    let deps_list: Vec<String> = payload
+                        .get("deps")
+                        .and_then(Value::as_array)
+                        .map(|items| {
+                            items.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect()
+                        })
+                        .unwrap_or_default();
+                    let images_list: Vec<String> = payload
+                        .get("images")
+                        .and_then(Value::as_array)
+                        .map(|items| {
+                            items.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect()
+                        })
+                        .unwrap_or_default();
+                    deps.orchestration
+                        .create_task(
+                            &run_id,
+                            payload.get("title").and_then(Value::as_str),
+                            payload.get("spec").and_then(Value::as_str).unwrap_or(""),
+                            &deps_list,
+                            &images_list,
+                            &created_by,
+                            deps.now,
+                        )
+                        .map(|task| task_json(&task))
+                        .map_err(|error| Response::from_error(&error))
                 },
-            )
+            ))
         }
-        ("PATCH", Some("tasks"), Some(id), _) => Some(
-            match store.update_task(
-                id,
-                request.text("status"),
-                request.text("title"),
-                request.text("spec"),
-                deps.now,
-            ) {
-                Ok(task) => Response::accepted(200, task.version, 0, task_json(&task)),
-                Err(error) => Response::from_error(&error),
+        ("PATCH", Some("tasks"), Some(id), _) => Some(submitted(
+            deps,
+            request,
+            "orctask.update",
+            &format!("orctask:{id}"),
+            request.body.clone(),
+            "PATCH /orchestration/tasks/{id}",
+            200,
+            |deps, payload| {
+                let title = payload.get("title").and_then(Value::as_str).map(str::to_owned);
+                let spec = payload.get("spec").and_then(Value::as_str).map(str::to_owned);
+                let status = payload.get("status").and_then(Value::as_str).map(str::to_owned);
+                deps.orchestration
+                    .update_task(id, status.as_deref(), title.as_deref(), spec.as_deref(), deps.now)
+                    .map(|task| task_json(&task))
+                    .map_err(|error| Response::from_error(&error))
             },
-        ),
+        )),
 
         ("POST", Some("dispatches"), None, _) => {
             // Faithful port of the shell's `dispatch.start` command: resolve or
             // open a terminal, record the dispatch, launch the agent command,
             // sniff for an immediate launch failure, inject the preamble, and
-            // mail the coordinator a dispatch notice. Store access goes through
-            // `deps.orchestration` inline and env through `environment(deps)` —
-            // alternating statement borrows, never held across each other.
-            let task_id = request.text("taskId").unwrap_or("").to_owned();
-            if task_id.is_empty() {
-                return Some(invalid("taskId is required"));
-            }
-            let agent = request.text("agent").unwrap_or("").to_owned();
-            let agent = if agent.is_empty() {
-                "claude".to_owned()
-            } else {
-                agent
-            };
-            if agent.len() > 64
-                || !agent
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
-            {
-                return Some(invalid("agent must be 1-64 chars of [A-Za-z0-9_.-]"));
-            }
-            let task = match deps.orchestration.require_task(&task_id) {
-                Ok(task) => task.clone(),
-                Err(error) => return Some(Response::from_error(&error)),
-            };
-            let run = match deps.orchestration.require_run(&task.run_id) {
-                Ok(run) => run.clone(),
-                Err(error) => return Some(Response::from_error(&error)),
-            };
-
-            let mut opened = false;
-            let terminal_id = match request
-                .text("terminalId")
-                .map(str::trim)
-                .filter(|t| !t.is_empty())
-            {
-                Some(target) => {
-                    let id = match environment(
-                        deps,
-                        "POST /orchestration/dispatches",
-                        "dispatches open terminals",
-                    ) {
-                        Ok(env) => {
-                            match env.resolve_terminal(target, request.agent_id.as_deref()) {
-                                Ok(id) => id,
-                                Err(error) => return Some(Response::from_error(&error)),
-                            }
-                        }
-                        Err(response) => return Some(response),
-                    };
-                    if let Some(busy) = deps.orchestration.dispatch_for_terminal(&id) {
-                        return Some(Response::from_error(&CommandError::new(
-                            ErrorCode::Conflict,
-                            format!("terminal \"{id}\" is already running dispatch {}", busy.id),
-                        )));
-                    }
-                    id
-                }
-                None => {
-                    // `terminals.reserve` — a fresh shell the canvas adopts
-                    // into a widget on its next tick.
-                    let title = format!("{agent}: {}", task.title);
-                    let cwd = deps.workspace_dir.unwrap_or_default().to_owned();
-                    match environment(
-                        deps,
-                        "POST /orchestration/dispatches",
-                        "dispatches open terminals",
-                    ) {
-                        Ok(env) => {
-                            let id = env.fresh_terminal_id();
-                            match env.spawn_terminal(&id, &title, &cwd) {
-                                Ok(()) => {
-                                    opened = true;
-                                    id
-                                }
-                                Err(error) => {
-                                    return Some(Response::from_error(&CommandError::new(
-                                        ErrorCode::Failed,
-                                        error,
-                                    )))
-                                }
-                            }
-                        }
-                        Err(response) => return Some(response),
-                    }
-                }
-            };
-
-            macro_rules! cleanup {
-                () => {
-                    if opened {
-                        if let Ok(env) = environment(
-                            deps,
-                            "POST /orchestration/dispatches",
-                            "dispatches open terminals",
-                        ) {
-                            let _ = env.dispose_terminal(&terminal_id);
-                        }
-                    }
-                };
-            }
-
-            // A fresh shell needs a beat to reach its read loop — the shell's
-            // `waitUntilRunning` window, shortened by the write ack.
-            if opened {
-                std::thread::sleep(std::time::Duration::from_millis(400));
-            }
-
-            let dispatch = match deps.orchestration.create_dispatch(
-                &task_id,
-                &terminal_id,
-                &agent,
-                "",
-                deps.now,
-            ) {
-                Ok(dispatch) => dispatch,
-                Err(error) => {
-                    cleanup!();
-                    return Some(Response::from_error(&error));
-                }
-            };
-            let preamble = build_preamble(&run, &task, &dispatch.id, &agent);
-            let _ = deps
-                .orchestration
-                .set_dispatch_preamble(&dispatch.id, &preamble);
-
-            let mut injected = false;
-            let inject = request
-                .field("inject")
-                .and_then(Value::as_bool)
-                .unwrap_or(true);
-            if inject {
-                if opened {
-                    // Launch the agent CLI in the fresh shell, give it a
-                    // moment, and sniff the tail for a launch failure — the
-                    // shell's `submitShellLine` + `terminalShowsLaunchFailure`.
-                    let start = request.text("command").unwrap_or(&agent).to_owned();
-                    let started = match environment(
-                        deps,
-                        "POST /orchestration/dispatches",
-                        "dispatches open terminals",
-                    ) {
-                        Ok(env) => env.write_terminal(&terminal_id, &start, true).is_ok(),
-                        Err(response) => {
-                            // The shell settles a doomed dispatch `failed`
-                            // before cleaning up its fresh terminal.
-                            let _ = deps.orchestration.settle_dispatch(
-                                &dispatch.id,
-                                "failed",
-                                None,
-                                deps.now,
-                            );
-                            cleanup!();
-                            return Some(response);
-                        }
-                    };
-                    if !started {
-                        let _ = deps.orchestration.settle_dispatch(
-                            &dispatch.id,
-                            "failed",
-                            None,
-                            deps.now,
-                        );
-                        cleanup!();
-                        return Some(Response::from_error(&CommandError::new(
-                            ErrorCode::Failed,
-                            format!("could not start {start} in terminal {terminal_id}"),
-                        )));
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(2500));
-                    let tail = match environment(
-                        deps,
-                        "POST /orchestration/dispatches",
-                        "dispatches open terminals",
-                    ) {
-                        Ok(env) => env.tail_terminal(&terminal_id, 16_000).unwrap_or_default(),
-                        Err(_) => String::new(),
-                    };
-                    if terminal_shows_launch_failure(&tail, &start) {
-                        let _ = deps.orchestration.settle_dispatch(
-                            &dispatch.id,
-                            "failed",
-                            None,
-                            deps.now,
-                        );
-                        cleanup!();
-                        return Some(Response::from_error(&CommandError::new(
-                            ErrorCode::Failed,
-                            format!("{start} is not available in terminal {terminal_id}"),
-                        )));
-                    }
-                }
-                // One-line inject, chunked like the shell's submitPtyMessage;
-                // Enter lands only on the last chunk.
-                let single = preamble.replace(['\r', '\n'], " ");
-                let mut ok = true;
-                for (i, chunk) in single
-                    .as_bytes()
-                    .chunks(8000)
-                    .map(String::from_utf8_lossy)
-                    .enumerate()
-                {
-                    let last = (i + 1) * 8000 >= single.len();
-                    let sent = match environment(
-                        deps,
-                        "POST /orchestration/dispatches",
-                        "dispatches open terminals",
-                    ) {
-                        Ok(env) => env.write_terminal(&terminal_id, &chunk, last).is_ok(),
-                        Err(_) => false,
-                    };
-                    if !sent {
-                        ok = false;
-                        break;
-                    }
-                }
-                injected = ok;
-            }
-
-            let _ = deps.orchestration.send(
-                &run.id,
-                "dispatch",
-                request.agent_id.as_deref().unwrap_or("api"),
-                &terminal_id,
-                &format!("dispatch {}", task.id),
-                &format!("{} → {} ({})\n\n{}", task.id, terminal_id, agent, task.spec),
-                Some(&task.id),
-                Some(&dispatch.id),
-                None,
-                None,
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                deps.now,
-            );
-
-            Some(Response::accepted(
+            // mail the coordinator a dispatch notice. All of it is the apply —
+            // a failed spawn or injection now leaves intent+abort rather than
+            // a bare 400 with no record.
+            let agent_id = request.agent_id.as_deref().unwrap_or("api").to_owned();
+            Some(submitted(
+                deps,
+                request,
+                "dispatch.start",
+                "dispatch:new",
+                request.body.clone(),
+                "POST /orchestration/dispatches",
                 201,
-                dispatch.version,
-                0,
-                json!({
-                    "dispatch": dispatch_json(&dispatch),
-                    "dispatchId": dispatch.id,
-                    "taskId": task.id,
-                    "terminalId": terminal_id,
-                    "agent": agent,
-                    "injected": injected,
-                }),
+                |deps, _| {
+                    let task_id = request.text("taskId").unwrap_or("").to_owned();
+                    if task_id.is_empty() {
+                        return Err(invalid("taskId is required"));
+                    }
+                    let agent = request.text("agent").unwrap_or("").to_owned();
+                    let agent = if agent.is_empty() {
+                        "claude".to_owned()
+                    } else {
+                        agent
+                    };
+                    if agent.len() > 64
+                        || !agent
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+                    {
+                        return Err(invalid("agent must be 1-64 chars of [A-Za-z0-9_.-]"));
+                    }
+                    let task = match deps.orchestration.require_task(&task_id) {
+                        Ok(task) => task.clone(),
+                        Err(error) => return Err(Response::from_error(&error)),
+                    };
+                    let run = match deps.orchestration.require_run(&task.run_id) {
+                        Ok(run) => run.clone(),
+                        Err(error) => return Err(Response::from_error(&error)),
+                    };
+
+                    let mut opened = false;
+                    let terminal_id = match request
+                        .text("terminalId")
+                        .map(str::trim)
+                        .filter(|t| !t.is_empty())
+                    {
+                        Some(target) => {
+                            let id = match environment(
+                                deps,
+                                "POST /orchestration/dispatches",
+                                "dispatches open terminals",
+                            ) {
+                                Ok(env) => {
+                                    match env.resolve_terminal(target, request.agent_id.as_deref()) {
+                                        Ok(id) => id,
+                                        Err(error) => return Err(Response::from_error(&error)),
+                                    }
+                                }
+                                Err(response) => return Err(response),
+                            };
+                            if let Some(busy) = deps.orchestration.dispatch_for_terminal(&id) {
+                                return Err(Response::from_error(&CommandError::new(
+                                    ErrorCode::Conflict,
+                                    format!(
+                                        "terminal \"{id}\" is already running dispatch {}",
+                                        busy.id
+                                    ),
+                                )));
+                            }
+                            id
+                        }
+                        None => {
+                            // `terminals.reserve` — a fresh shell the canvas adopts
+                            // into a widget on its next tick.
+                            let title = format!("{agent}: {}", task.title);
+                            let cwd = deps.workspace_dir.unwrap_or_default().to_owned();
+                            match environment(
+                                deps,
+                                "POST /orchestration/dispatches",
+                                "dispatches open terminals",
+                            ) {
+                                Ok(env) => {
+                                    let id = env.next_terminal_id("agent");
+                                    match env.spawn_terminal(&id, &title, &cwd) {
+                                        Ok(()) => {
+                                            opened = true;
+                                            id
+                                        }
+                                        Err(error) => {
+                                            return Err(Response::from_error(&CommandError::new(
+                                                ErrorCode::Failed,
+                                                error,
+                                            )))
+                                        }
+                                    }
+                                }
+                                Err(response) => return Err(response),
+                            }
+                        }
+                    };
+
+                    macro_rules! cleanup {
+                        () => {
+                            if opened {
+                                if let Ok(env) = environment(
+                                    deps,
+                                    "POST /orchestration/dispatches",
+                                    "dispatches open terminals",
+                                ) {
+                                    let _ = env.dispose_terminal(&terminal_id);
+                                }
+                            }
+                        };
+                    }
+
+                    // A fresh shell needs a beat to reach its read loop — the shell's
+                    // `waitUntilRunning` window, shortened by the write ack.
+                    if opened {
+                        std::thread::sleep(std::time::Duration::from_millis(400));
+                    }
+
+                    let dispatch = match deps.orchestration.create_dispatch(
+                        &task_id,
+                        &terminal_id,
+                        &agent,
+                        "",
+                        deps.now,
+                    ) {
+                        Ok(dispatch) => dispatch,
+                        Err(error) => {
+                            cleanup!();
+                            return Err(Response::from_error(&error));
+                        }
+                    };
+                    let preamble = build_preamble(&run, &task, &dispatch.id, &agent);
+                    let _ = deps
+                        .orchestration
+                        .set_dispatch_preamble(&dispatch.id, &preamble);
+
+                    let mut injected = false;
+                    let inject = request
+                        .field("inject")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true);
+                    if inject {
+                        if opened {
+                            // Launch the agent CLI in the fresh shell, give it a
+                            // moment, and sniff the tail for a launch failure — the
+                            // shell's `submitShellLine` + `terminalShowsLaunchFailure`.
+                            let start = request.text("command").unwrap_or(&agent).to_owned();
+                            let started = match environment(
+                                deps,
+                                "POST /orchestration/dispatches",
+                                "dispatches open terminals",
+                            ) {
+                                Ok(env) => env.write_terminal(&terminal_id, &start, true).is_ok(),
+                                Err(response) => {
+                                    // The shell settles a doomed dispatch `failed`
+                                    // before cleaning up its fresh terminal.
+                                    let _ = deps.orchestration.settle_dispatch(
+                                        &dispatch.id,
+                                        "failed",
+                                        None,
+                                        deps.now,
+                                    );
+                                    cleanup!();
+                                    return Err(response);
+                                }
+                            };
+                            if !started {
+                                let _ = deps.orchestration.settle_dispatch(
+                                    &dispatch.id,
+                                    "failed",
+                                    None,
+                                    deps.now,
+                                );
+                                cleanup!();
+                                return Err(Response::from_error(&CommandError::new(
+                                    ErrorCode::Failed,
+                                    format!("could not start {start} in terminal {terminal_id}"),
+                                )));
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(2500));
+                            let tail = match environment(
+                                deps,
+                                "POST /orchestration/dispatches",
+                                "dispatches open terminals",
+                            ) {
+                                Ok(env) => {
+                                    env.tail_terminal(&terminal_id, 16_000).unwrap_or_default()
+                                }
+                                Err(_) => String::new(),
+                            };
+                            if terminal_shows_launch_failure(&tail, &start) {
+                                let _ = deps.orchestration.settle_dispatch(
+                                    &dispatch.id,
+                                    "failed",
+                                    None,
+                                    deps.now,
+                                );
+                                cleanup!();
+                                return Err(Response::from_error(&CommandError::new(
+                                    ErrorCode::Failed,
+                                    format!("{start} is not available in terminal {terminal_id}"),
+                                )));
+                            }
+                        }
+                        // One-line inject, chunked like the shell's submitPtyMessage;
+                        // Enter lands only on the last chunk.
+                        let single = preamble.replace(['\r', '\n'], " ");
+                        let mut ok = true;
+                        for (i, chunk) in single
+                            .as_bytes()
+                            .chunks(8000)
+                            .map(String::from_utf8_lossy)
+                            .enumerate()
+                        {
+                            let last = (i + 1) * 8000 >= single.len();
+                            let sent = match environment(
+                                deps,
+                                "POST /orchestration/dispatches",
+                                "dispatches open terminals",
+                            ) {
+                                Ok(env) => env.write_terminal(&terminal_id, &chunk, last).is_ok(),
+                                Err(_) => false,
+                            };
+                            if !sent {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        injected = ok;
+                    }
+
+                    let _ = deps.orchestration.send(
+                        &run.id,
+                        "dispatch",
+                        &agent_id,
+                        &terminal_id,
+                        &format!("dispatch {}", task.id),
+                        &format!("{} → {} ({})\n\n{}", task.id, terminal_id, agent, task.spec),
+                        Some(&task.id),
+                        Some(&dispatch.id),
+                        None,
+                        None,
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        deps.now,
+                    );
+
+                    Ok(json!({
+                        "dispatch": dispatch_json(&dispatch),
+                        "dispatchId": dispatch.id,
+                        "taskId": task.id,
+                        "terminalId": terminal_id,
+                        "agent": agent,
+                        "injected": injected,
+                    }))
+                },
             ))
         }
         ("POST", Some("dispatches"), Some(id), Some("settle")) => {
-            let outcome = request.text("outcome").unwrap_or("");
-            if !OUTCOMES.contains(&outcome) {
-                return Some(invalid(format!(
-                    "outcome must be one of {}",
-                    OUTCOMES.join(", ")
-                )));
-            }
+            let outcome = request.text("outcome").unwrap_or("").to_owned();
             let files = request
                 .field("filesModified")
                 .map(|_| request.strings("filesModified"));
-            Some(
-                match deps
-                    .orchestration
-                    .settle_dispatch(id, outcome, files.clone(), deps.now)
-                {
-                    Ok((dispatch, task, promoted)) => {
-                        // API-driven settles mail the coordinator the same
-                        // worker_done the CLI path does — a watcher polling mail
-                        // must see either shape of completion.
-                        let actor = request.agent_id.as_deref().unwrap_or("api");
-                        let to = request.text("to").unwrap_or("@coordinator");
-                        let _ = deps.orchestration.send(
-                            &dispatch.run_id,
-                            "worker_done",
-                            actor,
-                            to,
-                            &format!("worker_done {}", task.id),
-                            &format!("dispatch {} settled as {outcome} via API", dispatch.id),
-                            Some(&task.id),
-                            Some(&dispatch.id),
-                            None,
-                            Some(outcome),
-                            files.unwrap_or_default(),
-                            Vec::new(),
-                            Vec::new(),
-                            deps.now,
-                        );
-                        Response::accepted(
-                            200,
-                            dispatch.version,
-                            0,
+            Some(match submit_command(
+                deps,
+                request,
+                "dispatch.settle",
+                &format!("dispatch:{id}"),
+                request.body.clone(),
+                "POST /orchestration/dispatches/{id}/settle",
+                |deps, _| {
+                    if !OUTCOMES.contains(&outcome.as_str()) {
+                        return Err(invalid(format!(
+                            "outcome must be one of {}",
+                            OUTCOMES.join(", ")
+                        )));
+                    }
+                    deps.orchestration
+                        .settle_dispatch(id, &outcome, files.clone(), deps.now)
+                        .map(|(dispatch, task, promoted)| {
                             json!({
                                 "dispatchId": dispatch.id,
                                 "taskId": task.id,
                                 "status": task.status,
                                 "promoted": promoted,
-                            }),
-                        )
-                    }
-                    Err(error) => Response::from_error(&error),
+                            })
+                        })
+                        .map_err(|error| Response::from_error(&error))
                 },
-            )
+            ) {
+                Ok((entry, data)) => {
+                    // The TypeScript mailed the coordinator its worker_done
+                    // *after* the submit answered ok — post-commit, not
+                    // inside apply.
+                    let actor = request.agent_id.as_deref().unwrap_or("api").to_owned();
+                    let to = request.text("to").unwrap_or("@coordinator").to_owned();
+                    let now = deps.now;
+                    if let Some(dispatch_id) = data.get("dispatchId").and_then(Value::as_str) {
+                        if let Ok(dispatch) = deps.orchestration.require_dispatch(dispatch_id) {
+                            let (run_id, task_id, dispatch_id) = (
+                                dispatch.run_id.clone(),
+                                dispatch.task_id.clone(),
+                                dispatch.id.clone(),
+                            );
+                            let _ = deps.orchestration.send(
+                                &run_id,
+                                "worker_done",
+                                &actor,
+                                &to,
+                                &format!("worker_done {task_id}"),
+                                &format!("dispatch {dispatch_id} settled as {outcome} via API"),
+                                Some(&task_id),
+                                Some(&dispatch_id),
+                                None,
+                                Some(&outcome),
+                                files.clone().unwrap_or_default(),
+                                Vec::new(),
+                                Vec::new(),
+                                now,
+                            );
+                        }
+                    }
+                    accepted(&entry, 200, data)
+                }
+                Err(response) => response,
+            })
         }
         ("POST", Some("dispatches"), Some(id), Some("account")) => {
-            let Some(state) = request.text("state") else {
-                return Some(invalid("state is required"));
-            };
-            Some(match store.set_dispatch_state(id, state) {
-                Ok(dispatch) => {
-                    // `released && closeTerminal` also kills the worker's
-                    // shell — the original disposed the PTY and journaled
-                    // `widget.remove` so the canvas tile goes with it.
+            // The original's apply validated `state` and — for a released
+            // dispatch with closeTerminal — disposed the shell and removed
+            // its widget, all inside apply, so a bad state leaves intent+abort.
+            Some(submitted(
+                deps,
+                request,
+                "dispatch.account",
+                &format!("dispatch:{id}"),
+                request.body.clone(),
+                "POST /orchestration/dispatches/{id}/account",
+                200,
+                |deps, _| {
+                    let Some(state) = request.text("state") else {
+                        return Err(invalid("state must be retained|released"));
+                    };
+                    if state != "retained" && state != "released" {
+                        return Err(invalid("state must be retained|released"));
+                    }
+                    let dispatch = deps
+                        .orchestration
+                        .set_dispatch_state(id, state)
+                        .map_err(|error| Response::from_error(&error))?;
                     let close_terminal = request
                         .field("closeTerminal")
                         .and_then(Value::as_bool)
@@ -917,222 +1717,306 @@ fn orchestration_route(
                             "dispatch accounting closes terminals",
                         ) {
                             let _ = env.dispose_terminal(&dispatch.terminal_id);
-                            if let Ok(mut journal) = env.journal() {
-                                let known = crate::projection::fold(
-                                    journal.entries(),
-                                    crate::projection::CanvasState::default(),
-                                    crate::projection::Clock(deps_now_f64()),
-                                )
-                                .widgets
-                                .contains_key(&dispatch.terminal_id);
-                                if known {
-                                    let _ = journal.commit(
-                                        actor(request),
-                                        "widget.remove",
-                                        &format!("widget:{}", dispatch.terminal_id),
-                                        json!({}),
-                                    );
-                                }
-                            }
+                        }
+                        // `requestWidgetRemoval` — the renderer answered with
+                        // its own gated `widget.remove`. Different resource
+                        // than this command's `dispatch:` target, so a nested
+                        // submit acquires cleanly.
+                        let known = environment(
+                            deps,
+                            "POST /orchestration/dispatches/:id/account",
+                            "reading the canvas refolds the journal",
+                        )
+                        .ok()
+                        .and_then(|env| folded_canvas(env).ok())
+                        .is_some_and(|canvas| {
+                            canvas.widgets.contains_key(&dispatch.terminal_id)
+                        });
+                        if known {
+                            let terminal_id = dispatch.terminal_id.clone();
+                            let _ = submit_command(
+                                deps,
+                                request,
+                                "widget.remove",
+                                &format!("widget:{terminal_id}"),
+                                json!({}),
+                                "POST /orchestration/dispatches/:id/account",
+                                move |_, _| Ok(json!({ "id": terminal_id })),
+                            );
                         }
                     }
-                    Response::accepted(
-                        200,
-                        dispatch.version,
-                        0,
-                        json!({ "id": dispatch.id, "state": dispatch.state }),
-                    )
-                }
-                Err(error) => Response::from_error(&error),
-            })
+                    Ok(json!({ "id": dispatch.id, "state": dispatch.state }))
+                },
+            ))
         }
 
         ("POST", Some("messages"), None, _) => {
-            let message_type = request.text("type").unwrap_or("note");
-            if !MESSAGE_TYPES.contains(&message_type) {
-                return Some(invalid(format!(
-                    "type must be one of {}",
-                    MESSAGE_TYPES.join(", ")
-                )));
+            // `submit(body, 'orc.send', runTarget(body.runId), {…body, images})`
+            // — the media import ran before submit, everything else is the
+            // apply, so a bad type or a wrong-run dispatch leaves intent+abort.
+            let mut payload = request.body.clone();
+            if !payload.is_object() {
+                payload = json!({});
             }
-            let dispatch_id = request
-                .text("dispatchId")
-                .map(str::trim)
-                .filter(|id| !id.is_empty());
-            let dispatch = match dispatch_id {
-                Some(id) => match store.require_dispatch(id) {
-                    Ok(dispatch) => Some(dispatch.clone()),
-                    Err(error) => return Some(Response::from_error(&error)),
-                },
-                None => None,
+            let images = match import_body_images(deps, request, "POST /orchestration/messages") {
+                Ok(images) => images,
+                Err(response) => return Some(response),
             };
-            let run_id = match request.text("runId") {
-                Some(id) if !id.trim().is_empty() => match store.resolve_run_id(Some(id)) {
-                    Ok(id) => id,
-                    Err(error) => return Some(Response::from_error(&error)),
-                },
-                _ => match dispatch.as_ref() {
-                    Some(dispatch) => dispatch.run_id.clone(),
-                    None => match store.resolve_run_id(None) {
-                        Ok(id) => id,
-                        Err(error) => return Some(Response::from_error(&error)),
-                    },
-                },
+            payload["images"] = json!(images);
+            // `runTarget` — absent runId targets `run:new`; a present one
+            // must spell an id the resource grammar accepts.
+            let run_target = match request.text("runId").map(str::trim).filter(|s| !s.is_empty())
+            {
+                Some(id) => format!("run:{id}"),
+                None => "run:new".to_owned(),
             };
-            if let Some(dispatch) = dispatch.as_ref() {
-                if dispatch.run_id != run_id {
-                    return Some(invalid(format!(
-                        "dispatch \"{}\" belongs to run \"{}\"",
-                        dispatch.id, dispatch.run_id
-                    )));
-                }
-                if request
-                    .text("taskId")
-                    .is_some_and(|task_id| task_id != dispatch.task_id.as_str())
-                {
-                    return Some(invalid(format!(
-                        "dispatch \"{}\" belongs to task \"{}\"",
-                        dispatch.id, dispatch.task_id
-                    )));
-                }
-            }
-            if let Some(reply_to) = request.text("replyTo") {
-                if deps.orchestration.message_by_id(reply_to).is_none() {
-                    return Some(not_found(format!("no message \"{reply_to}\" to reply to")));
-                }
-            }
-            let settled = if message_type == "worker_done" {
-                let Some(dispatch) = dispatch.as_ref() else {
-                    return Some(invalid("worker_done needs --dispatch-id"));
-                };
-                let outcome = request.text("outcome").unwrap_or("");
-                if !OUTCOMES.contains(&outcome) {
-                    return Some(invalid(format!(
-                        "worker_done needs --outcome {}",
-                        OUTCOMES.join("|")
-                    )));
-                }
-                let files = request
-                    .field("filesModified")
-                    .map(|_| request.strings("filesModified"));
-                match deps
-                    .orchestration
-                    .settle_dispatch(&dispatch.id, outcome, files, deps.now)
-                {
-                    Ok((dispatch, task, promoted)) => Some(json!({
-                        "dispatchId": dispatch.id,
-                        "taskId": task.id,
-                        "status": task.status,
-                        "promoted": promoted,
-                    })),
-                    Err(error) => return Some(Response::from_error(&error)),
-                }
-            } else {
-                None
-            };
-            let from = request.agent_id.as_deref().unwrap_or("api");
-            // The shell's `resolveRecipient`: empty → @coordinator, the
-            // handles pass through, `@<agent>` must name a running dispatch's
-            // agent, and a bare worker reference resolves to its terminal id.
-            // Without this `slate done` mail landed on `""` and never reached
-            // the coordinator it was addressed to.
-            let to = {
-                let raw = request.text("to").unwrap_or("").trim().to_owned();
-                let resolved = if raw.is_empty() {
-                    Ok("@coordinator".to_owned())
-                } else if matches!(raw.as_str(), "*" | "@all" | "@idle" | "@coordinator") {
-                    Ok(raw)
-                } else if let Some(agent) = raw.strip_prefix('@') {
-                    let agent = agent.to_owned();
-                    let running = deps
-                        .orchestration
-                        .list_dispatches(Some(&run_id), None, Some("running"))
-                        .into_iter()
-                        .any(|d| d.agent.eq_ignore_ascii_case(&agent));
-                    if running {
-                        Ok(raw)
-                    } else {
-                        Err(CommandError::new(
-                            ErrorCode::NotFound,
-                            format!("no running dispatch for agent \"{agent}\""),
-                        ))
+            let agent_id = request.agent_id.as_deref().unwrap_or("api").to_owned();
+            Some(submitted(
+                deps,
+                request,
+                "orc.send",
+                &run_target,
+                payload,
+                "POST /orchestration/messages",
+                201,
+                |deps, payload| {
+                    // The payload carries the media-store paths the route
+                    // imported — `request.images` holds the raw sources.
+                    let images: Vec<String> = payload
+                        .get("images")
+                        .and_then(Value::as_array)
+                        .map(|items| {
+                            items.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect()
+                        })
+                        .unwrap_or_default();
+                    let message_type = request.text("type").unwrap_or("note");
+                    if !MESSAGE_TYPES.contains(&message_type) {
+                        return Err(invalid(format!(
+                            "type must be one of {}",
+                            MESSAGE_TYPES.join(", ")
+                        )));
                     }
-                } else {
-                    let looked_up =
-                        match environment(deps, "/orchestration/messages", "worker lookup") {
-                            Ok(env) => env.resolve_terminal(&raw, request.agent_id.as_deref()).ok(),
-                            Err(response) => return Some(response),
+                    let dispatch_id = request
+                        .text("dispatchId")
+                        .map(str::trim)
+                        .filter(|id| !id.is_empty());
+                    let dispatch = match dispatch_id {
+                        Some(id) => match deps.orchestration.require_dispatch(id) {
+                            Ok(dispatch) => Some(dispatch.clone()),
+                            Err(error) => return Err(Response::from_error(&error)),
+                        },
+                        None => None,
+                    };
+                    let run_id = match request.text("runId") {
+                        Some(id) if !id.trim().is_empty() => {
+                            match deps.orchestration.resolve_run_id(Some(id)) {
+                                Ok(id) => id,
+                                Err(error) => return Err(Response::from_error(&error)),
+                            }
+                        }
+                        _ => match dispatch.as_ref() {
+                            Some(dispatch) => dispatch.run_id.clone(),
+                            None => match deps.orchestration.resolve_run_id(None) {
+                                Ok(id) => id,
+                                Err(error) => return Err(Response::from_error(&error)),
+                            },
+                        },
+                    };
+                    if let Some(dispatch) = dispatch.as_ref() {
+                        if dispatch.run_id != run_id {
+                            return Err(invalid(format!(
+                                "dispatch \"{}\" belongs to run \"{}\"",
+                                dispatch.id, dispatch.run_id
+                            )));
+                        }
+                        if request
+                            .text("taskId")
+                            .is_some_and(|task_id| task_id != dispatch.task_id.as_str())
+                        {
+                            return Err(invalid(format!(
+                                "dispatch \"{}\" belongs to task \"{}\"",
+                                dispatch.id, dispatch.task_id
+                            )));
+                        }
+                    }
+                    if let Some(reply_to) = request.text("replyTo") {
+                        if deps.orchestration.message_by_id(reply_to).is_none() {
+                            return Err(not_found(format!("no message \"{reply_to}\" to reply to")));
+                        }
+                    }
+                    let settled = if message_type == "worker_done" {
+                        let Some(dispatch) = dispatch.as_ref() else {
+                            return Err(invalid("worker_done needs --dispatch-id"));
                         };
-                    // A recipient that is not a terminal, a name, or a
-                    // prefix still passes through as an actor id — the
-                    // store accepts opaque ids (api, cli, …).
-                    Ok(looked_up.unwrap_or(raw))
-                };
-                match resolved {
-                    Ok(to) => to,
-                    Err(error) => return Some(Response::from_error(&error)),
-                }
-            };
-            let message = match deps.orchestration.send(
-                &run_id,
-                message_type,
-                from,
-                &to,
-                request.text("subject").unwrap_or(""),
-                request.text("body").unwrap_or(""),
-                request.text("taskId"),
-                dispatch_id,
-                request.text("replyTo"),
-                request.text("outcome"),
-                request.strings("filesModified"),
-                request.strings("images"),
-                request.strings("options"),
-                deps.now,
-            ) {
-                Ok(message) => message,
-                Err(error) => return Some(Response::from_error(&error)),
-            };
-            let mut data = message_json(&message);
-            if let (Some(settled), Value::Object(fields)) = (settled, &mut data) {
-                fields.insert("settled".to_owned(), settled);
-            }
-            Some(Response::accepted(201, 1, 0, data))
+                        let outcome = request.text("outcome").unwrap_or("");
+                        if !OUTCOMES.contains(&outcome) {
+                            return Err(invalid(format!(
+                                "worker_done needs --outcome {}",
+                                OUTCOMES.join("|")
+                            )));
+                        }
+                        let files = request
+                            .field("filesModified")
+                            .map(|_| request.strings("filesModified"));
+                        match deps
+                            .orchestration
+                            .settle_dispatch(&dispatch.id, outcome, files, deps.now)
+                        {
+                            Ok((dispatch, task, promoted)) => Some(json!({
+                                "dispatchId": dispatch.id,
+                                "taskId": task.id,
+                                "status": task.status,
+                                "promoted": promoted,
+                            })),
+                            Err(error) => return Err(Response::from_error(&error)),
+                        }
+                    } else {
+                        None
+                    };
+                    // The shell's `resolveRecipient`: empty → @coordinator, the
+                    // handles pass through, `@<agent>` must name a running dispatch's
+                    // agent, and a bare worker reference resolves to its terminal id.
+                    // Without this `slate done` mail landed on `""` and never reached
+                    // the coordinator it was addressed to.
+                    let to = {
+                        let raw = request.text("to").unwrap_or("").trim().to_owned();
+                        let resolved = if raw.is_empty() {
+                            Ok("@coordinator".to_owned())
+                        } else if matches!(raw.as_str(), "*" | "@all" | "@idle" | "@coordinator")
+                        {
+                            Ok(raw)
+                        } else if let Some(agent) = raw.strip_prefix('@') {
+                            let agent = agent.to_owned();
+                            let running = deps
+                                .orchestration
+                                .list_dispatches(Some(&run_id), None, Some("running"))
+                                .into_iter()
+                                .any(|d| d.agent.eq_ignore_ascii_case(&agent));
+                            if running {
+                                Ok(raw)
+                            } else {
+                                Err(CommandError::new(
+                                    ErrorCode::NotFound,
+                                    format!("no running dispatch for agent \"{agent}\""),
+                                ))
+                            }
+                        } else {
+                            let looked_up = match environment(
+                                deps,
+                                "/orchestration/messages",
+                                "worker lookup",
+                            ) {
+                                Ok(env) => {
+                                    env.resolve_terminal(&raw, request.agent_id.as_deref()).ok()
+                                }
+                                Err(response) => return Err(response),
+                            };
+                            // A recipient that is not a terminal, a name, or a
+                            // prefix still passes through as an actor id — the
+                            // store accepts opaque ids (api, cli, …).
+                            Ok(looked_up.unwrap_or(raw))
+                        };
+                        match resolved {
+                            Ok(to) => to,
+                            Err(error) => return Err(Response::from_error(&error)),
+                        }
+                    };
+                    let message = match deps.orchestration.send(
+                        &run_id,
+                        message_type,
+                        &agent_id,
+                        &to,
+                        request.text("subject").unwrap_or(""),
+                        request.text("body").unwrap_or(""),
+                        request.text("taskId"),
+                        dispatch_id,
+                        request.text("replyTo"),
+                        request.text("outcome"),
+                        request.strings("filesModified"),
+                        images,
+                        request.strings("options"),
+                        deps.now,
+                    ) {
+                        Ok(message) => message,
+                        Err(error) => return Err(Response::from_error(&error)),
+                    };
+                    let mut data = message_json(&message);
+                    if let (Some(settled), Value::Object(fields)) = (settled, &mut data) {
+                        fields.insert("settled".to_owned(), settled);
+                    }
+                    Ok(data)
+                },
+            ))
         }
         ("POST", Some("messages"), Some(id), Some("ack")) => {
-            let actor = request.agent_id.as_deref().unwrap_or("api");
-            Some(match store.ack(id, actor) {
-                Ok(message) => Response::accepted(200, 1, 0, message_json(&message)),
-                Err(error) => Response::from_error(&error),
-            })
+            // `orc.ack` — payload `{messageId}` on the run's target.
+            let run_target = match request.text("runId").map(str::trim).filter(|s| !s.is_empty())
+            {
+                Some(run) => format!("run:{run}"),
+                None => "run:new".to_owned(),
+            };
+            let actor = request.agent_id.as_deref().unwrap_or("api").to_owned();
+            Some(submitted(
+                deps,
+                request,
+                "orc.ack",
+                &run_target,
+                json!({ "messageId": id }),
+                "POST /orchestration/messages/{id}/ack",
+                200,
+                |deps, _| {
+                    deps.orchestration
+                        .ack(id, &actor)
+                        .map(|message| message_json(&message))
+                        .map_err(|error| Response::from_error(&error))
+                },
+            ))
         }
 
         ("POST", Some("gates"), None, _) => {
-            let run_id = match store.resolve_run_id(request.text("runId")) {
-                Ok(id) => id,
-                Err(error) => return Some(Response::from_error(&error)),
-            };
-            let created_by = request.agent_id.as_deref().unwrap_or("api");
-            Some(
-                match store.create_gate(
-                    &run_id,
-                    request.text("question").unwrap_or(""),
-                    &request.strings("options"),
-                    created_by,
-                    request.text("taskId"),
-                    deps.now,
-                ) {
-                    Ok(gate) => Response::accepted(201, gate.version, 0, gate_json(&gate)),
-                    Err(error) => Response::from_error(&error),
+            let created_by = request.agent_id.as_deref().unwrap_or("api").to_owned();
+            Some(submitted(
+                deps,
+                request,
+                "gate.create",
+                "gate:new",
+                request.body.clone(),
+                "POST /orchestration/gates",
+                201,
+                |deps, _| {
+                    let run_id = deps
+                        .orchestration
+                        .resolve_run_id(request.text("runId"))
+                        .map_err(|error| Response::from_error(&error))?;
+                    deps.orchestration
+                        .create_gate(
+                            &run_id,
+                            request.text("question").unwrap_or(""),
+                            &request.strings("options"),
+                            &created_by,
+                            request.text("taskId"),
+                            deps.now,
+                        )
+                        .map(|gate| gate_json(&gate))
+                        .map_err(|error| Response::from_error(&error))
                 },
-            )
+            ))
         }
-        ("POST", Some("gates"), Some(id), Some("resolve")) => {
-            let resolution = request.text("resolution").unwrap_or("");
-            Some(match store.resolve_gate(id, resolution, deps.now) {
-                Ok(gate) => Response::accepted(200, gate.version, 0, gate_json(&gate)),
-                Err(error) => Response::from_error(&error),
-            })
-        }
+        ("POST", Some("gates"), Some(id), Some("resolve")) => Some(submitted(
+            deps,
+            request,
+            "gate.resolve",
+            &format!("gate:{id}"),
+            request.body.clone(),
+            "POST /orchestration/gates/{id}/resolve",
+            200,
+            |deps, _| {
+                deps.orchestration
+                    .resolve_gate(id, request.text("resolution").unwrap_or(""), deps.now)
+                    .map(|gate| gate_json(&gate))
+                    .map_err(|error| Response::from_error(&error))
+            },
+        )),
 
         ("POST", Some("reset"), None, _) => {
             // Rebuilt through the store's own document so the private maps and
@@ -1536,31 +2420,43 @@ fn git_route(request: &Request, segments: &[String], deps: &mut RouteDeps<'_>) -
     match (method, second) {
         ("GET", Some("status")) => Response::json(200, git_status(deps)),
         ("POST", Some("commit")) => {
-            let message = request
-                .text("message")
-                .map(str::trim)
-                .unwrap_or_default()
-                .replace("\r\n", "\n")
-                .replace('\r', "\n");
-            if message.is_empty() {
-                return invalid("a commit message is required");
-            }
-            let commit = git(deps, &["add", "-A"])
-                .and_then(|_| git(deps, &["commit", "-m", &message]))
-                .and_then(|_| git(deps, &["rev-parse", "HEAD"]));
-            match commit {
-                Ok(hash) => Response::json(
-                    200,
-                    json!({
-                        "ok": true,
-                        "data": {
+            // `commitAll` was the handler — the message check and the git
+            // invocation sit in `work` between intent and commit on
+            // `git:repo`, so a rejected commit leaves intent+abort and a held
+            // `git:repo` lock refuses it outright.
+            let (entry, committed) = match submit_command(
+                deps,
+                request,
+                "git.commit",
+                "git:repo",
+                json!({ "message": request.text("message") }),
+                "POST /git/commit",
+                |deps, _| {
+                    let message = request
+                        .text("message")
+                        .map(str::trim)
+                        .unwrap_or_default()
+                        .replace("\r\n", "\n")
+                        .replace('\r', "\n");
+                    if message.is_empty() {
+                        return Err(invalid("a commit message is required"));
+                    }
+                    match git(deps, &["add", "-A"])
+                        .and_then(|_| git(deps, &["commit", "-m", &message]))
+                        .and_then(|_| git(deps, &["rev-parse", "HEAD"]))
+                    {
+                        Ok(hash) => Ok(json!({
                             "hash": hash.trim().chars().take(8).collect::<String>(),
                             "message": message,
-                        }
-                    }),
-                ),
-                Err(error) => Response::from_error(&error),
-            }
+                        })),
+                        Err(error) => Err(Response::from_error(&error)),
+                    }
+                },
+            ) {
+                Ok(pair) => pair,
+                Err(response) => return response,
+            };
+            accepted(&entry, 200, committed)
         }
         ("GET", Some("branches")) => {
             let current = git(deps, &["rev-parse", "--abbrev-ref", "HEAD"])
@@ -1662,95 +2558,121 @@ fn git_route(request: &Request, segments: &[String], deps: &mut RouteDeps<'_>) -
             }
         }
         ("POST", Some("checkout")) => {
+            // `checkoutRef` was the handler — the ref check, the repo gate and
+            // the dirty-tree conflict all ran inside apply, so they sit in
+            // `work` and a refusal leaves intent+abort on `git:repo`.
             let reference = request.text("ref").unwrap_or("").trim().to_owned();
-            if let Err(error) = assert_safe_ref(&reference) {
-                return Response::from_error(&error);
-            }
-            let status = git_status(deps);
-            if !status["repo"].as_bool().unwrap_or(false) {
-                return Response::from_error(&CommandError::new(
-                    ErrorCode::Failed,
-                    "not a git repository",
-                ));
-            }
-            if git_dirty(&status) {
-                return Response::from_error(&CommandError::new(
-                    ErrorCode::Conflict,
-                    "uncommitted tracked changes — commit or discard them before switching",
-                ));
-            }
-            match git(deps, &["checkout", &reference]) {
-                Ok(_) => {
-                    let branch = git(deps, &["rev-parse", "--abbrev-ref", "HEAD"])
-                        .unwrap_or_default()
-                        .trim()
-                        .replace('\r', "")
-                        .to_owned();
-                    let hash = git(deps, &["rev-parse", "HEAD"])
-                        .unwrap_or_default()
-                        .trim()
-                        .replace('\r', "")
-                        .chars()
-                        .take(8)
-                        .collect::<String>();
-                    Response::json(
-                        200,
-                        json!({"ok": true, "data": {"branch": branch, "hash": hash}}),
-                    )
-                }
-                Err(error) => Response::from_error(&error),
-            }
+            let (entry, checked_out) = match submit_command(
+                deps,
+                request,
+                "git.checkout",
+                "git:repo",
+                json!({ "ref": reference }),
+                "POST /git/checkout",
+                |deps, _| {
+                    if let Err(error) = assert_safe_ref(&reference) {
+                        return Err(Response::from_error(&error));
+                    }
+                    let status = git_status(deps);
+                    if !status["repo"].as_bool().unwrap_or(false) {
+                        return Err(Response::from_error(&CommandError::new(
+                            ErrorCode::Failed,
+                            "not a git repository",
+                        )));
+                    }
+                    if git_dirty(&status) {
+                        return Err(Response::from_error(&CommandError::new(
+                            ErrorCode::Conflict,
+                            "uncommitted tracked changes — commit or discard them before switching",
+                        )));
+                    }
+                    match git(deps, &["checkout", &reference]) {
+                        Ok(_) => {
+                            let branch = git(deps, &["rev-parse", "--abbrev-ref", "HEAD"])
+                                .unwrap_or_default()
+                                .trim()
+                                .replace('\r', "")
+                                .to_owned();
+                            let hash = git(deps, &["rev-parse", "HEAD"])
+                                .unwrap_or_default()
+                                .trim()
+                                .replace('\r', "")
+                                .chars()
+                                .take(8)
+                                .collect::<String>();
+                            Ok(json!({"branch": branch, "hash": hash}))
+                        }
+                        Err(error) => Err(Response::from_error(&error)),
+                    }
+                },
+            ) {
+                Ok(pair) => pair,
+                Err(response) => return response,
+            };
+            accepted(&entry, 200, checked_out)
         }
         ("POST", Some("create-branch")) => {
             let name = request.text("name").unwrap_or("").trim().to_owned();
-            if name.is_empty() {
-                return invalid("a branch name is required");
-            }
-            if name.len() > 256 {
-                return invalid("branch name is too long");
-            }
-            if git(deps, &["check-ref-format", "--branch", &name]).is_err() {
-                return invalid("invalid branch name");
-            }
             let start_point = request.text("startPoint").unwrap_or("").trim().to_owned();
-            if !start_point.is_empty() {
-                if let Err(error) = assert_safe_ref(&start_point) {
-                    return Response::from_error(&error);
-                }
-            }
-            let status = git_status(deps);
-            if !status["repo"].as_bool().unwrap_or(false) {
-                return Response::from_error(&CommandError::new(
-                    ErrorCode::Failed,
-                    "not a git repository",
-                ));
-            }
-            if git_dirty(&status) {
-                return Response::from_error(&CommandError::new(
-                    ErrorCode::Conflict,
-                    "uncommitted tracked changes — commit or discard them before switching",
-                ));
-            }
-            let mut args = vec!["checkout", "-b", name.as_str()];
-            if !start_point.is_empty() {
-                args.push(start_point.as_str());
-            }
-            match git(deps, &args) {
-                Ok(_) => {
-                    let hash = git(deps, &["rev-parse", "HEAD"])
-                        .unwrap_or_default()
-                        .trim()
-                        .replace('\r', "")
-                        .chars()
-                        .take(8)
-                        .collect::<String>();
-                    Response::json(
-                        200,
-                        json!({"ok": true, "data": {"branch": name, "hash": hash}}),
-                    )
-                }
-                Err(error) => Response::from_error(&error),
-            }
+            let (entry, branched) = match submit_command(
+                deps,
+                request,
+                "git.create-branch",
+                "git:repo",
+                json!({ "name": name, "startPoint": start_point }),
+                "POST /git/create-branch",
+                |deps, _| {
+                    // `createBranch`'s validation all ran inside apply.
+                    if name.is_empty() {
+                        return Err(invalid("a branch name is required"));
+                    }
+                    if name.len() > 256 {
+                        return Err(invalid("branch name is too long"));
+                    }
+                    if git(deps, &["check-ref-format", "--branch", &name]).is_err() {
+                        return Err(invalid("invalid branch name"));
+                    }
+                    if !start_point.is_empty() {
+                        if let Err(error) = assert_safe_ref(&start_point) {
+                            return Err(Response::from_error(&error));
+                        }
+                    }
+                    let status = git_status(deps);
+                    if !status["repo"].as_bool().unwrap_or(false) {
+                        return Err(Response::from_error(&CommandError::new(
+                            ErrorCode::Failed,
+                            "not a git repository",
+                        )));
+                    }
+                    if git_dirty(&status) {
+                        return Err(Response::from_error(&CommandError::new(
+                            ErrorCode::Conflict,
+                            "uncommitted tracked changes — commit or discard them before switching",
+                        )));
+                    }
+                    let mut args = vec!["checkout", "-b", name.as_str()];
+                    if !start_point.is_empty() {
+                        args.push(start_point.as_str());
+                    }
+                    match git(deps, &args) {
+                        Ok(_) => {
+                            let hash = git(deps, &["rev-parse", "HEAD"])
+                                .unwrap_or_default()
+                                .trim()
+                                .replace('\r', "")
+                                .chars()
+                                .take(8)
+                                .collect::<String>();
+                            Ok(json!({"branch": name, "hash": hash}))
+                        }
+                        Err(error) => Err(Response::from_error(&error)),
+                    }
+                },
+            ) {
+                Ok(pair) => pair,
+                Err(response) => return response,
+            };
+            accepted(&entry, 200, branched)
         }
         _ => not_found("no such git route"),
     }
@@ -1813,8 +2735,9 @@ fn deps_now_f64() -> f64 {
 }
 
 /// A journaled widget as `/widgets` reports it — the field list the
-/// TypeScript's `listWidgets` projection produced.
-fn widget_row(widget: &crate::projection::Widget) -> Value {
+/// TypeScript's `listWidgets` projection produced. Pub so the engine's axum
+/// handlers can return the same row `patchWidget` handed back.
+pub fn widget_row(widget: &crate::projection::Widget) -> Value {
     let mut row = json!({
         "id": widget.id,
         "title": widget.title,
@@ -1834,6 +2757,110 @@ fn widget_row(widget: &crate::projection::Widget) -> Value {
         row["imageName"] = json!(name);
     }
     row
+}
+
+/// `widget.create`'s apply — shared by `POST /widgets` and the `/canvas/media`
+/// import route, both of which submitted the same command. Mints the id,
+/// stamps it on the commit payload (`p.id = id`), applies the registry
+/// defaults, and returns the stored widget — the row the fold produces.
+fn widget_create_apply(deps: &mut RouteDeps<'_>, payload: &mut Value) -> Result<Value, Response> {
+    let kind = payload.get("kind").and_then(Value::as_str).map(str::to_owned);
+    let generated = format!(
+        "{}-{}-{}",
+        kind.as_deref().unwrap_or("widget"),
+        deps.now,
+        &uuid::Uuid::new_v4().simple().to_string()[..5]
+    );
+    let id = payload
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+        .unwrap_or(generated);
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-'))
+    {
+        return Err(invalid("widget id must be 1–128 chars of [A-Za-z0-9._:-]"));
+    }
+    let env = environment(deps, "POST /widgets", "creating a widget commits to the journal")?;
+    let canvas = folded_canvas(env)?;
+    if canvas.widgets.contains_key(&id) {
+        return Err(Response::from_error(&CommandError::new(
+            ErrorCode::Conflict,
+            format!("widget {id} already exists"),
+        )));
+    }
+    payload["id"] = json!(id.clone());
+    // `(p.title?.trim() || widgetType(p.kind)?.label || id).slice(0, 120)` —
+    // the TypeScript title ladder.
+    let fallback = kind
+        .as_deref()
+        .map(|kind| {
+            let mut chars = kind.chars();
+            chars
+                .next()
+                .map(|c| c.to_uppercase().collect::<String>() + chars.as_str())
+                .unwrap_or_else(|| kind.to_owned())
+        })
+        .unwrap_or_else(|| id.clone());
+    let title = payload
+        .get("title")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .unwrap_or(&fallback)
+        .chars()
+        .take(120)
+        .collect::<String>();
+    payload["title"] = json!(title);
+    // `widgetType(kind)?.defaultSize ?? 520×360` — the registry's five
+    // entries; every other kind falls through to the fallback.
+    let (default_w, default_h) = match kind.as_deref() {
+        Some("terminal") => (620.0, 380.0),
+        Some("planner") => (420.0, 520.0),
+        Some("files") => (580.0, 480.0),
+        Some("browser") => (720.0, 480.0),
+        Some("orchestration") => (520.0, 560.0),
+        _ => (520.0, 360.0),
+    };
+    for (key, default) in [
+        ("x", 0.0),
+        ("y", 0.0),
+        ("w", default_w),
+        ("h", default_h),
+        ("z", 1.0),
+    ] {
+        if payload.get(key).and_then(Value::as_f64).is_none() {
+            payload[key] = json!(default);
+        }
+    }
+    if payload.get("maximized").is_none() {
+        payload["maximized"] = json!(false);
+    }
+    // `putWidget` returned the stored widget — build the same row the fold
+    // will produce (version 1 on a create).
+    let mut widget = json!({
+        "id": id,
+        "title": payload["title"],
+        "kind": payload.get("kind").cloned().unwrap_or(Value::Null),
+        "version": 1,
+        "x": payload["x"],
+        "y": payload["y"],
+        "w": payload["w"],
+        "h": payload["h"],
+        "z": payload["z"],
+        "maximized": payload["maximized"],
+    });
+    for key in ["imagePath", "imageName"] {
+        if let Some(value) = payload.get(key) {
+            widget[key] = value.clone();
+        }
+    }
+    Ok(widget)
 }
 
 fn widgets_route(request: &Request, segments: &[String], deps: &mut RouteDeps<'_>) -> Response {
@@ -1865,186 +2892,128 @@ fn widgets_route(request: &Request, segments: &[String], deps: &mut RouteDeps<'_
             );
             Response::json(200, json!({ "widgets": widgets }))
         }
-        // `widget.create` — the payload is journaled verbatim after the
-        // id/kind checks the TypeScript handler ran.
+        // `widget.create` — the TypeScript journaled the raw body as intent
+        // and the handler's stamped payload as the commit, so the id minting,
+        // the existence check and the registry defaults all live in `work`:
+        // a bad id or a taken name leaves intent+abort, as `apply()` did.
+        // The body is journaled verbatim — `agentId` included.
         ("POST", None) => {
             let mut payload = request.body.clone();
             if !payload.is_object() {
                 payload = json!({});
             }
-            let kind = payload
-                .get("kind")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-            let generated = format!(
-                "{}-{}-{}",
-                kind.as_deref().unwrap_or("widget"),
-                deps.now,
-                &uuid::Uuid::new_v4().simple().to_string()[..5]
-            );
-            let id = payload
-                .get("id")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|id| !id.is_empty())
-                .map(str::to_owned)
-                .unwrap_or(generated);
-            if id.is_empty()
-                || id.len() > 128
-                || !id
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-'))
-            {
-                return invalid("widget id must be 1–128 chars of [A-Za-z0-9._:-]");
-            }
-            {
-                let env = match environment(
-                    deps,
-                    "POST /widgets",
-                    "creating a widget commits to the journal",
-                ) {
-                    Ok(env) => env,
-                    Err(response) => return response,
-                };
-                let canvas = match folded_canvas(env) {
-                    Ok(canvas) => canvas,
-                    Err(response) => return response,
-                };
-                if canvas.widgets.contains_key(&id) {
-                    return Response::from_error(&CommandError::new(
-                        ErrorCode::Conflict,
-                        format!("widget {id} already exists"),
-                    ));
-                }
-            }
-            // Same defaulting as `widget.create`'s apply: a kind default size,
-            // title from the kind label, z stacking above the top widget.
-            if payload.get("id").is_none() {
-                payload["id"] = json!(id);
-            }
-            if payload.get("title").and_then(Value::as_str).is_none() {
-                let label = kind
-                    .as_deref()
-                    .map(|kind| {
-                        let mut chars = kind.chars();
-                        chars
-                            .next()
-                            .map(|c| c.to_uppercase().collect::<String>() + chars.as_str())
-                            .unwrap_or_else(|| kind.to_owned())
-                    })
-                    .unwrap_or_else(|| id.clone());
-                payload["title"] = json!(label);
-            }
-            // `widgetType(kind)?.defaultSize ?? 520×360` — the registry's
-            // five entries; every other kind falls through to the fallback.
-            let (default_w, default_h) = match kind.as_deref() {
-                Some("terminal") => (620.0, 380.0),
-                Some("planner") => (420.0, 520.0),
-                Some("files") => (580.0, 480.0),
-                Some("browser") => (720.0, 480.0),
-                Some("orchestration") => (520.0, 560.0),
-                _ => (520.0, 360.0),
-            };
-            for (key, default) in [
-                ("x", 0.0),
-                ("y", 0.0),
-                ("w", default_w),
-                ("h", default_h),
-                ("z", 1.0),
-            ] {
-                if payload.get(key).and_then(Value::as_f64).is_none() {
-                    payload[key] = json!(default);
-                }
-            }
-            if payload.get("maximized").is_none() {
-                payload["maximized"] = json!(false);
-            }
-            // The TypeScript target was `widget:new` — the reducer takes the
-            // id from the payload then, which is what we just defaulted.
-            match journal_commit(
+            match submit_command(
                 deps,
                 request,
                 "widget.create",
                 "widget:new",
                 payload,
                 "POST /widgets",
+                widget_create_apply,
             ) {
-                Ok(entry) => {
-                    let env = match environment(
-                        deps,
-                        "POST /widgets",
-                        "reading the new widget refolds the journal",
-                    ) {
-                        Ok(env) => env,
-                        Err(_) => return accepted(&entry, 201, json!({ "id": id })),
-                    };
-                    let canvas = folded_canvas(env).unwrap_or_default();
-                    let widget = canvas
-                        .widgets
-                        .get(&id)
-                        .map(widget_row)
-                        .unwrap_or_else(|| json!({ "id": id }));
-                    accepted(&entry, 201, widget)
-                }
+                Ok((entry, widget)) => accepted(&entry, 201, widget),
                 Err(response) => response,
             }
         }
         // controlServer.ts routes `POST /widgets/terminal` to the same
         // `terminal.create` submit as `POST /terminal` — title trimmed to
-        // 200 chars, cwd to 1024, both optional. The journal entry lands
-        // before the spawn so a failed PTY still records the attempt.
+        // 200 chars, cwd to 1024, both optional. The spawn is the handler:
+        // a failed PTY leaves intent+abort, not a bogus commit.
         ("POST", Some("terminal")) => {
             let title = request
                 .text("title")
                 .map(|text| text.trim().chars().take(200).collect::<String>())
                 .filter(|text| !text.is_empty());
+            // `body.cwd.slice(0, 1024)` — raw, not workspace-resolved at the
+            // route; the apply's `p.cwd || defaultCwd()` resolved it.
             let cwd = request
                 .text("cwd")
-                .map(|text| text.chars().take(1024).collect::<String>())
-                .filter(|text| !text.is_empty())
-                .or_else(|| deps.workspace_dir.map(str::to_owned))
-                .unwrap_or_default();
-            let env = match environment(
-                deps,
-                "POST /widgets/terminal",
-                "spawning a terminal needs the running app",
-            ) {
-                Ok(env) => env,
-                Err(response) => return response,
-            };
-            let id = env.fresh_terminal_id();
-            let entry = match journal_commit(
+                .map(|text| text.chars().take(1024).collect::<String>());
+            // `undefined` keys did not serialize — a missing title/cwd leaves
+            // no key in the journaled payload rather than a null.
+            let mut create_payload = json!({ "agentOwned": true });
+            if let Some(title) = &title {
+                create_payload["title"] = json!(title);
+            }
+            if let Some(cwd) = &cwd {
+                create_payload["cwd"] = json!(cwd);
+            }
+            // `{id, title, cwd, ready}` — the original handler's return is
+            // the response's `data`, so `work` hands it back.
+            return match submit_command(
                 deps,
                 request,
                 "terminal.create",
                 "terminal:new",
-                json!({
-                    "id": id,
-                    "title": title,
-                    "cwd": cwd,
-                    "agentOwned": true,
-                }),
+                create_payload,
                 "POST /widgets/terminal",
+                |deps, _payload| {
+                    // `terminals.reserve` ran inside the apply — the mount's
+                    // own `terminal.spawn` entry arrives later, when the widget
+                    // adopts the running shell.
+                    let id = environment(
+                        deps,
+                        "POST /widgets/terminal",
+                        "spawning a terminal needs the running app",
+                    )?
+                    .next_terminal_id("agent");
+                    environment(
+                        deps,
+                        "POST /widgets/terminal",
+                        "spawning a terminal needs the running app",
+                    )
+                    .and_then(|env| {
+                        env.spawn_terminal(
+                            &id,
+                            title.as_deref().unwrap_or(&id),
+                            cwd.as_deref().unwrap_or(""),
+                        )
+                        .map_err(|error| {
+                            Response::from_error(&CommandError::new(
+                                ErrorCode::Failed,
+                                error,
+                            ))
+                        })
+                    })?;
+                    // `waitUntilRunning(10_000)` — a shell that never reaches
+                    // its read loop gets disposed and the command fails.
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                    loop {
+                        let running = environment(
+                            deps,
+                            "POST /widgets/terminal",
+                            "spawning a terminal needs the running app",
+                        )
+                        .map(|env| env.terminal_running(&id))?;
+                        if running {
+                            break;
+                        }
+                        if std::time::Instant::now() >= deadline {
+                            if let Ok(env) = environment(
+                                deps,
+                                "POST /widgets/terminal",
+                                "spawning a terminal needs the running app",
+                            ) {
+                                let _ = env.dispose_terminal(&id);
+                            }
+                            return Err(Response::from_error(&CommandError::new(
+                                ErrorCode::Failed,
+                                "the Slate window did not open a terminal for this request",
+                            )));
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                    Ok(json!({
+                        "id": id,
+                        "title": title.clone().unwrap_or_else(|| id.clone()),
+                        "cwd": cwd.clone().unwrap_or_default(),
+                        "ready": true,
+                    }))
+                },
             ) {
-                Ok(entry) => entry,
-                Err(response) => return response,
+                Ok((entry, data)) => accepted(&entry, 200, data),
+                Err(response) => response,
             };
-            let env = match environment(
-                deps,
-                "POST /widgets/terminal",
-                "spawning a terminal needs the running app",
-            ) {
-                Ok(env) => env,
-                Err(response) => return response,
-            };
-            if let Err(error) = env.spawn_terminal(&id, title.as_deref().unwrap_or(&id), &cwd) {
-                return Response::from_error(&CommandError::new(ErrorCode::Failed, error));
-            }
-            accepted(
-                &entry,
-                200,
-                json!({ "id": id, "title": title.unwrap_or_else(|| id.clone()), "cwd": cwd, "ready": true }),
-            )
         }
         // `widget.update` — the title-trimming and terminal-setTitle the
         // original's apply() ran.
@@ -2057,6 +3026,10 @@ fn widgets_route(request: &Request, segments: &[String], deps: &mut RouteDeps<'_
             {
                 return invalid("invalid id");
             }
+            // The intent and the commit both journaled `body` verbatim —
+            // `agentId`, the un-trimmed title, everything. The apply worked
+            // on a normalized copy ({…p, title trimmed or deleted}), so the
+            // clean-up happens on the response row, not the journaled payload.
             let mut payload = request.body.clone();
             if !payload.is_object() {
                 payload = json!({});
@@ -2066,63 +3039,92 @@ fn widgets_route(request: &Request, segments: &[String], deps: &mut RouteDeps<'_
                 .and_then(Value::as_str)
                 .map(|title| title.trim().chars().take(200).collect::<String>())
                 .filter(|title| !title.is_empty());
-            match &clean_title {
-                Some(title) => payload["title"] = json!(title),
-                None => {
-                    if let Some(map) = payload.as_object_mut() {
-                        map.remove("title");
+            // `widget:new` + a title renamed whatever the write target
+            // floated to — the focused terminal's widget — when no widget
+            // was literally named `new`. The original redirected inside the
+            // apply and still journaled `widget:new`; here the submit
+            // happens on the resolved target so the fold actually applies
+            // the rename (the original's replay silently lost it) — the
+            // observable behavior is identical, the record better.
+            let mut target_id = raw.to_owned();
+            if target_id == "new" && clean_title.is_some() {
+                if let Ok(env) = environment(
+                    deps,
+                    "PATCH /widgets/{id}",
+                    "updating a widget commits to the journal",
+                ) {
+                    if let Ok(canvas) = folded_canvas(&mut *env) {
+                        if !canvas.widgets.contains_key("new") {
+                            if let Some(preferred) = env.resolve_write_target("") {
+                                if canvas.widgets.contains_key(&preferred) {
+                                    target_id = preferred;
+                                }
+                            }
+                        }
                     }
                 }
             }
-            let env = match environment(
-                deps,
-                "PATCH /widgets/{id}",
-                "updating a widget commits to the journal",
-            ) {
-                Ok(env) => env,
-                Err(response) => return response,
-            };
-            let canvas = match folded_canvas(env) {
-                Ok(canvas) => canvas,
-                Err(response) => return response,
-            };
-            let Some(existing) = canvas.widgets.get(raw) else {
-                return not_found(format!("widget {raw} not found"));
-            };
-            let is_terminal = existing.kind.as_deref() == Some("terminal");
-            let entry = match journal_commit(
+            // `patchWidget`'s not_found and the `terminals.setTitle` side
+            // effect both ran inside apply — inside `work`, so a stale id
+            // leaves intent+abort rather than no entry at all. `work`
+            // returns the merged row `patchWidget` answered with: the commit
+            // hasn't landed yet, so it's built from the existing widget the
+            // same way the fold will rebuild it.
+            return match submit_command(
                 deps,
                 request,
                 "widget.update",
-                &format!("widget:{raw}"),
+                &format!("widget:{target_id}"),
                 payload,
                 "PATCH /widgets/{id}",
+                |deps, _| {
+                    let env = environment(
+                        deps,
+                        "PATCH /widgets/{id}",
+                        "updating a widget commits to the journal",
+                    )?;
+                    let canvas = folded_canvas(env)?;
+                    let Some(existing) = canvas.widgets.get(&target_id) else {
+                        return Err(not_found(format!("widget {target_id} not found")));
+                    };
+                    // `updated.kind === 'terminal' || !updated.kind` — the
+                    // setTitle condition in the original's apply.
+                    if existing.kind.as_deref().map_or(true, |k| k == "terminal") {
+                        if let (Some(title), Some(env)) =
+                            (clean_title.as_ref(), deps.env.as_deref_mut())
+                        {
+                            env.set_terminal_title(&target_id, title);
+                        }
+                    }
+                    // `{…payload, title: cleanTitle | deleted}` — the copy the
+                    // apply handed `patchWidget`, not the journaled raw body.
+                    let mut patch = request.body.clone();
+                    if !patch.is_object() {
+                        patch = json!({});
+                    }
+                    match &clean_title {
+                        Some(title) => patch["title"] = json!(title),
+                        None => {
+                            if let Some(map) = patch.as_object_mut() {
+                                map.remove("title");
+                            }
+                        }
+                    }
+                    let mut merged = widget_row(existing);
+                    if let (Some(row), Some(patch)) =
+                        (merged.as_object_mut(), patch.as_object())
+                    {
+                        for (key, value) in patch {
+                            row.insert(key.clone(), value.clone());
+                        }
+                    }
+                    merged["version"] = json!(existing.version + 1.0);
+                    Ok(merged)
+                },
             ) {
-                Ok(entry) => entry,
-                Err(response) => return response,
+                Ok((entry, widget)) => accepted(&entry, 200, widget),
+                Err(response) => response,
             };
-            // `terminals.setTitle` side effect: renaming a shell's widget
-            // renames the shell too.
-            if is_terminal {
-                if let (Some(title), Some(env)) = (clean_title, deps.env.as_deref_mut()) {
-                    env.set_terminal_title(raw, &title);
-                }
-            }
-            let env = match environment(
-                deps,
-                "PATCH /widgets/{id}",
-                "reading the updated widget refolds the journal",
-            ) {
-                Ok(env) => env,
-                Err(_) => return accepted(&entry, 200, json!({ "id": raw })),
-            };
-            let canvas = folded_canvas(env).unwrap_or_default();
-            let widget = canvas
-                .widgets
-                .get(raw)
-                .map(widget_row)
-                .unwrap_or_else(|| json!({ "id": raw }));
-            accepted(&entry, 200, widget)
         }
         // `widget.remove` for widgets, `terminal.dispose` for shells — the
         // original chose by `terminals.has(id)`, so a name that only resolves
@@ -2145,48 +3147,50 @@ fn widgets_route(request: &Request, segments: &[String], deps: &mut RouteDeps<'_
                 Err(response) => return response,
             };
             if is_terminal {
-                match environment(
-                    deps,
-                    "DELETE /widgets/{id}",
-                    "disposing a shell needs the PTY table",
-                ) {
-                    Ok(env) => {
-                        if let Err(message) = env.dispose_terminal(raw) {
-                            return Response::from_error(&CommandError::new(
-                                ErrorCode::Failed,
-                                message,
-                            ));
-                        }
-                    }
-                    Err(response) => return response,
-                }
-                // `failTerminalDispatches` — settle anything still running on
-                // the dead shell, exactly as the explicit route does.
-                let live: Vec<String> = deps
-                    .orchestration
-                    .list_dispatches(None, None, Some(raw))
-                    .iter()
-                    .filter(|dispatch| dispatch.state == "running")
-                    .map(|dispatch| dispatch.id.clone())
-                    .collect();
-                let now = deps.now;
-                for dispatch_id in live {
-                    let _ = deps
-                        .orchestration
-                        .settle_dispatch(&dispatch_id, "failed", None, now);
-                }
-                // The TypeScript journaled `terminal.dispose` first; the
-                // widget.remove that follows retires the tile the shell sat
-                // in, when the journal knew one.
-                match journal_commit(
+                // `terminal.dispose`'s apply killed the PTY, forgot the
+                // snapshot and failed the shell's live dispatches — all
+                // inside `work`, so a dead PTY leaves intent+abort.
+                match submit_command(
                     deps,
                     request,
                     "terminal.dispose",
                     &format!("terminal:{raw}"),
                     json!({}),
                     "DELETE /widgets/{id}",
+                    |deps, _| {
+                        let env = environment(
+                            deps,
+                            "DELETE /widgets/{id}",
+                            "disposing a shell needs the PTY table",
+                        )?;
+                        if let Err(message) = env.dispose_terminal(raw) {
+                            return Err(Response::from_error(&CommandError::new(
+                                ErrorCode::Failed,
+                                message,
+                            )));
+                        }
+                        // `failTerminalDispatches` — settle anything still
+                        // running on the dead shell.
+                        let live: Vec<String> = deps
+                            .orchestration
+                            .list_dispatches(None, None, Some(raw))
+                            .iter()
+                            .filter(|dispatch| dispatch.state == "running")
+                            .map(|dispatch| dispatch.id.clone())
+                            .collect();
+                        let now = deps.now;
+                        for dispatch_id in live {
+                            let _ = deps
+                                .orchestration
+                                .settle_dispatch(&dispatch_id, "failed", None, now);
+                        }
+                        Ok(json!({ "id": raw }))
+                    },
                 ) {
-                    Ok(entry) => {
+                    Ok((entry, data)) => {
+                        // `requestWidgetRemoval` — the shell asked the
+                        // renderer to retire the tile; natively the fold is
+                        // the widget list, so the remove is journaled here.
                         let on_canvas = environment(
                             deps,
                             "DELETE /widgets/{id}",
@@ -2196,16 +3200,17 @@ fn widgets_route(request: &Request, segments: &[String], deps: &mut RouteDeps<'_
                         .and_then(|env| folded_canvas(env).ok())
                         .is_some_and(|canvas| canvas.widgets.contains_key(raw));
                         if on_canvas {
-                            let _ = journal_commit(
+                            let _ = submit_command(
                                 deps,
                                 request,
                                 "widget.remove",
                                 &format!("widget:{raw}"),
                                 json!({}),
                                 "DELETE /widgets/{id}",
+                                |_, _| Ok(json!({ "id": raw })),
                             );
                         }
-                        return accepted(&entry, 200, json!({ "id": raw }));
+                        return accepted(&entry, 200, data);
                     }
                     Err(response) => return response,
                 }
@@ -2221,18 +3226,22 @@ fn widgets_route(request: &Request, segments: &[String], deps: &mut RouteDeps<'_
                 },
                 Err(response) => return response,
             };
-            if !on_canvas {
-                return not_found(format!("widget {raw} not found"));
-            }
-            match journal_commit(
+            match submit_command(
                 deps,
                 request,
                 "widget.remove",
                 &format!("widget:{raw}"),
                 json!({}),
                 "DELETE /widgets/{id}",
+                |_, _| {
+                    // `removeWidget` threw not_found inside apply.
+                    if !on_canvas {
+                        return Err(not_found(format!("widget {raw} not found")));
+                    }
+                    Ok(json!({ "id": raw }))
+                },
             ) {
-                Ok(entry) => accepted(&entry, 200, json!({ "id": raw })),
+                Ok((entry, data)) => accepted(&entry, 200, data),
                 Err(response) => response,
             }
         }
@@ -2247,96 +3256,77 @@ fn canvas_route(request: &Request, segments: &[String], deps: &mut RouteDeps<'_>
     let method = request.method.as_str();
     match (method, segments.get(1).map(String::as_str)) {
         ("POST", Some("camera")) => {
+            // `canvas.camera` — `submit(body, …, CANVAS_TARGET, body)` journaled
+            // the body verbatim.
             let mut payload = request.body.clone();
             if !payload.is_object() {
                 payload = json!({});
             }
-            if let Some(map) = payload.as_object_mut() {
-                map.remove("agentId");
-            }
-            match journal_commit(
+            match submit_command(
                 deps,
                 request,
                 "canvas.camera",
                 "canvas:main",
                 payload,
                 "POST /canvas/camera",
+                |_, payload| {
+                    // `setCamera` returned the sanitized camera — same
+                    // sanitize the fold runs, answered straight from the
+                    // handler.
+                    let camera = crate::projection::sanitize_camera(Some(payload));
+                    Ok(json!({
+                        "camera": {
+                            "x": camera.x,
+                            "y": camera.y,
+                            "zoom": camera.zoom,
+                        }
+                    }))
+                },
             ) {
-                Ok(entry) => {
-                    let camera = environment(
-                        deps,
-                        "POST /canvas/camera",
-                        "reading the camera refolds the journal",
-                    )
-                    .ok()
-                    .and_then(|env| folded_canvas(env).ok())
-                    .map(|canvas| {
-                        json!({
-                            "x": canvas.camera.x,
-                            "y": canvas.camera.y,
-                            "zoom": canvas.camera.zoom,
-                        })
-                    })
-                    .unwrap_or_default();
-                    accepted(&entry, 200, json!({ "camera": camera }))
-                }
+                Ok((entry, data)) => accepted(&entry, 200, data),
                 Err(response) => response,
             }
         }
         ("POST", Some("strokes")) => {
             let payload =
                 json!({ "strokes": request.body.get("strokes").cloned().unwrap_or(Value::Null) });
-            match journal_commit(
+            match submit_command(
                 deps,
                 request,
                 "canvas.strokes",
                 "canvas:main",
                 payload,
                 "POST /canvas/strokes",
+                |_, payload| {
+                    // `setStrokes` answered the sanitized list's length.
+                    let count = crate::projection::sanitize_strokes(payload.get("strokes")).len();
+                    Ok(json!({ "count": count }))
+                },
             ) {
-                Ok(entry) => {
-                    let count = folded_canvas(
-                        match environment(
-                            deps,
-                            "POST /canvas/strokes",
-                            "counting strokes refolds the journal",
-                        ) {
-                            Ok(env) => env,
-                            Err(_) => return accepted(&entry, 200, json!({ "count": 0 })),
-                        },
-                    )
-                    .map(|canvas| canvas.strokes.len())
-                    .unwrap_or(0);
-                    accepted(&entry, 200, json!({ "count": count }))
-                }
+                Ok((entry, data)) => accepted(&entry, 200, data),
                 Err(response) => response,
             }
         }
         ("POST", Some("connections")) => {
             let payload = json!({ "connections": request.body.get("connections").cloned().unwrap_or(Value::Null) });
-            match journal_commit(
+            match submit_command(
                 deps,
                 request,
                 "canvas.connections",
                 "canvas:main",
                 payload,
                 "POST /canvas/connections",
-            ) {
-                Ok(entry) => {
-                    let count = folded_canvas(
-                        match environment(
-                            deps,
-                            "POST /canvas/connections",
-                            "counting connections refolds the journal",
-                        ) {
-                            Ok(env) => env,
-                            Err(_) => return accepted(&entry, 200, json!({ "count": 0 })),
-                        },
+                |_, payload| {
+                    // `setConnections` answered the sanitized list's length.
+                    let count = crate::projection::sanitize_connections(
+                        payload.get("connections"),
+                        crate::projection::Clock(deps_now_f64()),
                     )
-                    .map(|canvas| canvas.connections.len())
-                    .unwrap_or(0);
-                    accepted(&entry, 200, json!({ "count": count }))
-                }
+                    .len();
+                    Ok(json!({ "count": count }))
+                },
+            ) {
+                Ok((entry, data)) => accepted(&entry, 200, data),
                 Err(response) => response,
             }
         }
@@ -2345,18 +3335,45 @@ fn canvas_route(request: &Request, segments: &[String], deps: &mut RouteDeps<'_>
             if !payload.is_object() {
                 payload = json!({});
             }
-            if let Some(map) = payload.as_object_mut() {
-                map.remove("agentId");
-            }
-            match journal_commit(
+            match submit_command(
                 deps,
                 request,
                 "canvas.import",
                 "canvas:main",
                 payload,
                 "POST /canvas/import",
+                |_, payload| {
+                    // `importFromRenderer` answered `{applied, skipped,
+                    // removed, removedWidgets}`. The fold merges additively —
+                    // every sanitizable widget lands and nothing is removed —
+                    // so skipped counts the raws sanitize dropped.
+                    let clock = crate::projection::Clock(deps_now_f64());
+                    let incoming = payload
+                        .get("widgets")
+                        .and_then(Value::as_array)
+                        .map(Vec::len)
+                        .unwrap_or(0);
+                    let applied = payload
+                        .get("widgets")
+                        .and_then(Value::as_array)
+                        .map(|widgets| {
+                            widgets
+                                .iter()
+                                .filter(|raw| {
+                                    crate::projection::sanitize_widget(raw, clock).is_some()
+                                })
+                                .count()
+                        })
+                        .unwrap_or(0);
+                    Ok(json!({
+                        "applied": applied,
+                        "skipped": incoming.saturating_sub(applied),
+                        "removed": 0,
+                        "removedWidgets": [],
+                    }))
+                },
             ) {
-                Ok(entry) => accepted(&entry, 200, json!({ "applied": true })),
+                Ok((entry, data)) => accepted(&entry, 200, data),
                 Err(response) => response,
             }
         }
@@ -2424,11 +3441,6 @@ fn canvas_route(request: &Request, segments: &[String], deps: &mut RouteDeps<'_>
                     }
                 });
             let widget_kind = if image_widget { "image" } else { "browser" };
-            let id = format!(
-                "{widget_kind}-{}-{}",
-                deps.now,
-                &uuid::Uuid::new_v4().simple().to_string()[..5]
-            );
             let canvas = environment(deps, route, "placing the widget refolds the journal")
                 .ok()
                 .and_then(|env| folded_canvas(env).ok());
@@ -2465,8 +3477,10 @@ fn canvas_route(request: &Request, segments: &[String], deps: &mut RouteDeps<'_>
             // `mediaKindOf` — the route's five-bucket kind, which the
             // response and the widget's media record both report.
             let kind = crate::attachments::media_kind_of(path);
+            // The original let `widget.create`'s handler mint and stamp the
+            // id (`p.id = id`), so the intent carries no id — same here.
             let mut payload = json!({
-                "id": id, "title": title, "kind": widget_kind,
+                "title": title, "kind": widget_kind,
                 "x": x, "y": y, "w": w, "h": h, "z": z,
                 "maximized": false,
             });
@@ -2486,19 +3500,29 @@ fn canvas_route(request: &Request, segments: &[String], deps: &mut RouteDeps<'_>
                     }
                 });
             }
-            match journal_commit(deps, request, "widget.create", "widget:new", payload, route) {
-                Ok(entry) => accepted(
-                    &entry,
-                    201,
-                    json!({
-                        "id": id,
-                        "title": title,
-                        "path": imported.to_string_lossy(),
-                        "name": name,
-                        "kind": kind,
-                        "widgetKind": widget_kind,
-                    }),
-                ),
+            match submit_command(deps, request, "widget.create", "widget:new", payload, route, widget_create_apply) {
+                Ok((entry, widget)) => {
+                    let id = widget
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned();
+                    // `control:open-media` — the renderer opened the file in
+                    // the new browser widget; the fold's `state.media` block
+                    // is the native port of that handoff.
+                    accepted(
+                        &entry,
+                        201,
+                        json!({
+                            "id": id,
+                            "title": widget.get("title").cloned().unwrap_or(json!(title)),
+                            "path": imported.to_string_lossy(),
+                            "name": name,
+                            "kind": kind,
+                            "widgetKind": widget_kind,
+                        }),
+                    )
+                }
                 Err(response) => response,
             }
         }
@@ -2514,27 +3538,63 @@ fn planner_route(request: &Request, segments: &[String], deps: &mut RouteDeps<'_
     let verb = segments.get(2).map(String::as_str);
 
     /// The fold as a read model — `planner.list()` sorts by `order`.
-    fn plan_items<'e>(
+    fn plan_state<'e>(
         env: &mut (dyn RouteEnv + 'e),
-    ) -> Result<Vec<crate::planner::PlanItem>, Response> {
+    ) -> Result<crate::planner::PlannerState, Response> {
         let log = env.journal().map_err(|message| {
             Response::from_error(&CommandError::new(ErrorCode::Failed, message))
         })?;
-        let items = crate::planner::fold(
+        crate::planner::fold(
             log.entries(),
             crate::planner::PlannerState::default(),
             &crate::planner::today_local(),
         )
         .map_err(|invalid| {
             Response::from_error(&CommandError::new(ErrorCode::Failed, invalid.0))
-        })?;
-        let mut items: Vec<_> = items.values().cloned().collect();
+        })
+    }
+
+    fn plan_items<'e>(
+        env: &mut (dyn RouteEnv + 'e),
+    ) -> Result<Vec<crate::planner::PlanItem>, Response> {
+        let mut items: Vec<_> = plan_state(env)?.values().cloned().collect();
         items.sort_by(|a, b| {
             a.order
                 .partial_cmp(&b.order)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         Ok(items)
+    }
+
+    /// The commit `work` is about to journal, run through the real fold —
+    /// the handler's `data` is then exactly what the journal produces, which
+    /// is what the TypeScript's store answered inside `apply`.
+    fn preview_plan<'e>(
+        env: &mut (dyn RouteEnv + 'e),
+        entry_type: &str,
+        target: &str,
+        payload: &Value,
+        actor: &str,
+        version: i64,
+        now: i64,
+    ) -> Result<crate::planner::PlannerState, Response> {
+        let event = crate::journal::JournalEntry {
+            seq: 0,
+            at: now.max(0) as u64,
+            phase: "commit".to_owned(),
+            actor_id: actor.to_owned(),
+            command_id: None,
+            entry_type: entry_type.to_owned(),
+            target: target.to_owned(),
+            payload: Some(payload.clone()),
+            version: Some(version),
+            error: None,
+            prev_hash: None,
+            hash: None,
+            workspace_dir: None,
+        };
+        crate::planner::reduce(&plan_state(env)?, &event, &crate::planner::today_local())
+            .map_err(|bad| invalid(bad.0))
     }
 
     match (method, id, verb) {
@@ -2553,199 +3613,213 @@ fn planner_route(request: &Request, segments: &[String], deps: &mut RouteDeps<'_
             )
         }
         ("POST", None, _) => {
+            // `submit(body, 'plan.create', …)` journaled the body verbatim.
             let mut payload = request.body.clone();
             if !payload.is_object() {
                 payload = json!({});
             }
-            if let Some(map) = payload.as_object_mut() {
-                map.remove("agentId");
-            }
-            // `createItem` threw `invalid` before the commit ever landed.
-            let title = payload
-                .get("title")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .unwrap_or_default();
-            if title.is_empty() {
-                return invalid("title is required");
-            }
-            // `normalizeDay` — a malformed day aborts the request rather than
-            // entering the journal.
-            if let Some(day) = payload.get("day") {
-                if !day.is_null() {
-                    if let Err(invalid_day) =
-                        crate::planner::normalize_day(Some(day), &crate::planner::today_local())
-                    {
-                        return invalid(invalid_day.0);
-                    }
-                }
-            }
-            // `createItem` stamped `order: nextOrder(day)` — max order among
-            // same-day items + 1 — so new items sort after their day-mates.
-            {
-                let env = match environment(
-                    deps,
-                    "POST /planner",
-                    "the planner folds the journal",
-                ) {
-                    Ok(env) => env,
-                    Err(response) => return response,
-                };
-                if let Ok(items) = plan_items(env) {
-                    let day = crate::planner::safe_day(
-                        payload.get("day"),
-                        &crate::planner::today_local(),
-                    );
-                    payload["order"] =
-                        json!(crate::planner::next_order(items.iter(), day.as_deref()));
-                }
-            }
-            // The TypeScript target was `plan:new` and the reducer minted the
-            // id from the entry's stamp — keeping that means the committed
-            // row is the id the fold will know it by.
-            let requested_id = payload.get("id").and_then(Value::as_str).map(str::to_owned);
-            match journal_commit(
+            // `createItem`'s throws ran inside apply — so the title and day
+            // checks sit in `work` and leave intent+abort; the `order` stamp
+            // joins the committed payload there, like `p.id` on a widget.
+            let actor = actor(request).to_owned();
+            match submit_command(
                 deps,
                 request,
                 "plan.create",
                 "plan:new",
                 payload,
                 "POST /planner",
-            ) {
-                Ok(entry) => {
-                    let env = match environment(
-                        deps,
-                        "POST /planner",
-                        "reading the new item refolds the journal",
-                    ) {
-                        Ok(env) => env,
-                        Err(_) => return accepted(&entry, 201, json!({})),
-                    };
-                    let id =
-                        requested_id.unwrap_or_else(|| format!("plan-{}-{}", entry.at, entry.seq));
-                    let item = plan_items(env)
-                        .ok()
-                        .and_then(|items| items.into_iter().find(|item| item.id == id))
+                |deps, payload| {
+                    let title = payload
+                        .get("title")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .unwrap_or_default();
+                    if title.is_empty() {
+                        return Err(invalid("title is required"));
+                    }
+                    if let Some(day) = payload.get("day") {
+                        if !day.is_null() {
+                            if let Err(invalid_day) = crate::planner::normalize_day(
+                                Some(day),
+                                &crate::planner::today_local(),
+                            ) {
+                                return Err(invalid(invalid_day.0));
+                            }
+                        }
+                    }
+                    let now = deps.now;
+                    let env = environment(deps, "POST /planner", "the planner folds the journal")?;
+                    let state = plan_state(env)?;
+                    // The fold falls back to `plan-{at}-{seq}` — unknowable
+                    // before the commit — so `work` mints the id and stamps
+                    // it, the way `p.id = id` landed in the commit payload.
+                    if payload
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .is_none_or(str::is_empty)
+                    {
+                        payload["id"] = json!(format!(
+                            "plan-{}-{}",
+                            now,
+                            &uuid::Uuid::new_v4().simple().to_string()[..6]
+                        ));
+                    }
+                    // `order: nextOrder(day)` — max order among same-day
+                    // items + 1 — so new items sort after their day-mates.
+                    let day = crate::planner::safe_day(
+                        payload.get("day"),
+                        &crate::planner::today_local(),
+                    );
+                    payload["order"] =
+                        json!(crate::planner::next_order(state.values(), day.as_deref()));
+                    let state = preview_plan(
+                        env,
+                        "plan.create",
+                        "plan:new",
+                        payload,
+                        &actor,
+                        1,
+                        now,
+                    )?;
+                    let id = payload["id"].as_str().unwrap_or_default().to_owned();
+                    Ok(state
+                        .get(&id)
                         .map(|item| serde_json::to_value(item).unwrap_or_default())
-                        .unwrap_or_else(|| json!({ "id": id }));
-                    accepted(&entry, 201, item)
-                }
+                        .unwrap_or_else(|| json!({ "id": id })))
+                },
+            ) {
+                Ok((entry, data)) => accepted(&entry, 201, data),
                 Err(response) => response,
             }
         }
         ("POST", Some(raw), Some("toggle")) => {
-            let env = match environment(
-                deps,
-                "POST /planner/{id}/toggle",
-                "the planner folds the journal",
-            ) {
-                Ok(env) => env,
-                Err(response) => return response,
-            };
-            if !match plan_items(env) {
-                Ok(items) => items.iter().any(|item| item.id == *raw),
-                Err(_) => false,
-            } {
-                return not_found("plan item not found");
-            }
             let payload = match request.body.get("done") {
                 Some(Value::Bool(done)) => json!({ "done": done }),
                 _ => json!({}),
             };
-            match journal_commit(
+            // `toggleItem` threw not_found inside apply — inside `work`, so a
+            // stale id leaves intent+abort like the TypeScript journal did.
+            let actor = actor(request).to_owned();
+            match submit_command(
                 deps,
                 request,
                 "plan.toggle",
                 &format!("plan:{raw}"),
                 payload,
                 "POST /planner/{id}/toggle",
-            ) {
-                Ok(entry) => {
-                    let env = match environment(
+                |deps, payload| {
+                    let now = deps.now;
+                    let env = environment(
                         deps,
                         "POST /planner/{id}/toggle",
-                        "reading the item refolds the journal",
-                    ) {
-                        Ok(env) => env,
-                        Err(_) => return accepted(&entry, 200, json!({ "id": raw })),
-                    };
-                    let item = plan_items(env)
-                        .ok()
-                        .and_then(|items| items.into_iter().find(|item| item.id == *raw))
+                        "the planner folds the journal",
+                    )?;
+                    let existing = plan_state(env)?.get(raw).cloned().ok_or_else(|| {
+                        not_found("plan item not found")
+                    })?;
+                    let version = (existing.version as i64) + 1;
+                    let state = preview_plan(
+                        env,
+                        "plan.toggle",
+                        &format!("plan:{raw}"),
+                        payload,
+                        &actor,
+                        version,
+                        now,
+                    )?;
+                    Ok(state
+                        .get(raw)
                         .map(|item| serde_json::to_value(item).unwrap_or_default())
-                        .unwrap_or_else(|| json!({ "id": raw }));
-                    accepted(&entry, 200, item)
-                }
+                        .unwrap_or_else(|| json!({ "id": raw })))
+                },
+            ) {
+                Ok((entry, data)) => accepted(&entry, 200, data),
                 Err(response) => response,
             }
         }
         ("PATCH", Some(raw), _) => {
-            let env =
-                match environment(deps, "PATCH /planner/{id}", "the planner folds the journal") {
-                    Ok(env) => env,
-                    Err(response) => return response,
-                };
-            if !match plan_items(env) {
-                Ok(items) => items.iter().any(|item| item.id == *raw),
-                Err(_) => false,
-            } {
-                return not_found("plan item not found");
-            }
             let mut payload = request.body.clone();
             if !payload.is_object() {
                 payload = json!({});
             }
-            if let Some(map) = payload.as_object_mut() {
-                map.remove("agentId");
-            }
-            // `plan.update`'s day is the throwing validator — reject before
-            // the commit so a bad day never enters the journal.
-            if let Some(day) = payload.get("day") {
-                if !day.is_null() {
-                    if let Err(invalid_day) =
-                        crate::planner::normalize_day(Some(day), &crate::planner::today_local())
-                    {
-                        return invalid(invalid_day.0);
-                    }
-                }
-            }
-            match journal_commit(
+            // `updateItem` threw not_found and `normalizeDay` threw invalid —
+            // both inside apply, so both live in `work` and leave intent+abort.
+            let actor = actor(request).to_owned();
+            match submit_command(
                 deps,
                 request,
                 "plan.update",
                 &format!("plan:{raw}"),
                 payload,
                 "PATCH /planner/{id}",
-            ) {
-                Ok(entry) => {
-                    let env = match environment(
+                |deps, payload| {
+                    // `updateItem` looks the item up first — a stale id is
+                    // not_found even when the day is malformed.
+                    let now = deps.now;
+                    let env = environment(
                         deps,
                         "PATCH /planner/{id}",
-                        "reading the item refolds the journal",
-                    ) {
-                        Ok(env) => env,
-                        Err(_) => return accepted(&entry, 200, json!({ "id": raw })),
-                    };
-                    let item = plan_items(env)
-                        .ok()
-                        .and_then(|items| items.into_iter().find(|item| item.id == *raw))
+                        "the planner folds the journal",
+                    )?;
+                    let existing = plan_state(env)?.get(raw).cloned().ok_or_else(|| {
+                        not_found("plan item not found")
+                    })?;
+                    if let Some(day) = payload.get("day") {
+                        if !day.is_null() {
+                            if let Err(invalid_day) = crate::planner::normalize_day(
+                                Some(day),
+                                &crate::planner::today_local(),
+                            ) {
+                                return Err(invalid(invalid_day.0));
+                            }
+                        }
+                    }
+                    let state = preview_plan(
+                        env,
+                        "plan.update",
+                        &format!("plan:{raw}"),
+                        payload,
+                        &actor,
+                        (existing.version as i64) + 1,
+                        now,
+                    )?;
+                    Ok(state
+                        .get(raw)
                         .map(|item| serde_json::to_value(item).unwrap_or_default())
-                        .unwrap_or_else(|| json!({ "id": raw }));
-                    accepted(&entry, 200, item)
-                }
+                        .unwrap_or_else(|| json!({ "id": raw })))
+                },
+            ) {
+                Ok((entry, data)) => accepted(&entry, 200, data),
                 Err(response) => response,
             }
         }
         ("DELETE", Some(raw), _) => {
-            match journal_commit(
+            // `deleteItem` threw not_found inside apply for a stale id.
+            match submit_command(
                 deps,
                 request,
                 "plan.delete",
                 &format!("plan:{raw}"),
                 json!({}),
                 "DELETE /planner/{id}",
+                |deps, _| {
+                    let env = environment(
+                        deps,
+                        "DELETE /planner/{id}",
+                        "the planner folds the journal",
+                    )?;
+                    if !match plan_items(env) {
+                        Ok(items) => items.iter().any(|item| item.id == *raw),
+                        Err(_) => false,
+                    } {
+                        return Err(not_found("plan item not found"));
+                    }
+                    Ok(json!({ "id": raw }))
+                },
             ) {
-                Ok(entry) => accepted(&entry, 200, json!({ "id": raw })),
+                Ok((entry, data)) => accepted(&entry, 200, data),
                 Err(response) => response,
             }
         }
@@ -2915,14 +3989,12 @@ fn notes_route(request: &Request, segments: &[String], deps: &mut RouteDeps<'_>)
         Err(response) => return response,
     };
     // The TS `submit()` committed a `note.*` to the journal first and the
-    // store write was the apply. The journal entry is the audit; the file is
-    // the projection the notes pane reads — both happen here, in that order.
+    // store write was the apply — `body` verbatim, `agentId` included. The
+    // journal entry is the audit; the file is the projection the notes pane
+    // reads — both happen here, in that order.
     let mut payload = request.body.clone();
     if !payload.is_object() {
         payload = json!({});
-    }
-    if let Some(map) = payload.as_object_mut() {
-        map.remove("agentId");
     }
     match (method, id, third) {
         ("GET", None, _) => {
@@ -2946,237 +4018,254 @@ fn notes_route(request: &Request, segments: &[String], deps: &mut RouteDeps<'_>)
             )
         }
         ("POST", None, _) => {
-            let title = payload
-                .get("title")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .unwrap_or("")
-                .chars()
-                .take(200)
-                .collect::<String>();
-            if title.is_empty() {
-                return invalid("title is required");
-            }
-            let entry = match journal_commit(
+            // `createItem` was the apply: the `workspace-notes.json` write —
+            // and its `title is required` throw — sits between intent and
+            // commit, so a failure aborts rather than leaving a committed
+            // entry with no note behind it.
+            let actor_id = actor(request).to_owned();
+            let dir = data_dir.clone();
+            match submit_command(
                 deps,
                 request,
                 "note.create",
                 "note:new",
                 payload.clone(),
                 "POST /notes",
+                |_, note_payload| {
+                    let title = note_payload
+                        .get("title")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .unwrap_or("")
+                        .chars()
+                        .take(200)
+                        .collect::<String>();
+                    if title.is_empty() {
+                        return Err(invalid("title is required"));
+                    }
+                    let mut document = notes_document(&dir);
+                    let items = notes_items(&document);
+                    let order = items
+                        .iter()
+                        .filter_map(|item| item.get("order").and_then(Value::as_f64))
+                        .fold(0.0_f64, f64::max)
+                        + 1.0;
+                    let id = note_payload
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|id| !id.is_empty())
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| {
+                            format!(
+                                "note-{}-{}",
+                                now as i64,
+                                &uuid::Uuid::new_v4().simple().to_string()[..6]
+                            )
+                        });
+                    let category = normalize_category(note_payload.get("category"));
+                    let color = note_color_for(
+                        &document,
+                        category.as_deref(),
+                        normalize_color(note_payload.get("color")),
+                    );
+                    let item = json!({
+                        "id": id,
+                        "title": title,
+                        "body": note_payload.get("body").and_then(Value::as_str).unwrap_or("").chars().take(20_000).collect::<String>(),
+                        "tags": normalize_tags(note_payload.get("tags")),
+                        "category": category,
+                        "color": color,
+                        "createdBy": actor_id,
+                        "order": order,
+                        "createdAt": now,
+                        "updatedAt": now,
+                        "version": 1,
+                    });
+                    let mut items = items;
+                    items.push(item.clone());
+                    document["items"] = Value::Array(items);
+                    notes_write(&dir, &document)
+                        .map_err(|error| Response::from_error(&error))?;
+                    Ok(item)
+                },
             ) {
-                Ok(entry) => entry,
-                Err(response) => return response,
-            };
-            let mut document = notes_document(&data_dir);
-            let items = notes_items(&document);
-            let order = items
-                .iter()
-                .filter_map(|item| item.get("order").and_then(Value::as_f64))
-                .fold(0.0_f64, f64::max)
-                + 1.0;
-            let id = payload
-                .get("id")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|id| !id.is_empty())
-                .map(str::to_owned)
-                .unwrap_or_else(|| {
-                    format!(
-                        "note-{}-{}",
-                        now as i64,
-                        &uuid::Uuid::new_v4().simple().to_string()[..6]
-                    )
-                });
-            let category = normalize_category(payload.get("category"));
-            let color = note_color_for(
-                &document,
-                category.as_deref(),
-                normalize_color(payload.get("color")),
-            );
-            let item = json!({
-                "id": id,
-                "title": title,
-                "body": payload.get("body").and_then(Value::as_str).unwrap_or("").chars().take(20_000).collect::<String>(),
-                "tags": normalize_tags(payload.get("tags")),
-                "category": category,
-                "color": color,
-                "createdBy": actor(request),
-                "order": order,
-                "createdAt": now,
-                "updatedAt": now,
-                "version": 1,
-            });
-            let mut items = items;
-            items.push(item.clone());
-            document["items"] = Value::Array(items);
-            if let Err(error) = notes_write(&data_dir, &document) {
-                return Response::from_error(&error);
+                Ok((entry, data)) => accepted(&entry, 201, data),
+                Err(response) => response,
             }
-            accepted(&entry, 201, item)
         }
         ("POST", Some("recolor"), None) => {
-            let category = normalize_category(payload.get("category"));
-            let color = normalize_color(payload.get("color"));
-            let (Some(category), Some(color)) = (category, color) else {
-                return invalid("category and a #rrggbb color are required");
-            };
-            let entry = match journal_commit(
+            // `setCategoryColor` was the apply — the validation and the file
+            // write both sit in `work`, so a bad color leaves intent+abort.
+            let dir = data_dir.clone();
+            match submit_command(
                 deps,
                 request,
                 "note.recolor",
                 "note:new",
                 payload.clone(),
                 "POST /notes/recolor",
+                |_, note_payload| {
+                    let category = normalize_category(note_payload.get("category"));
+                    let color = normalize_color(note_payload.get("color"));
+                    let (Some(category), Some(color)) = (category, color) else {
+                        return Err(invalid("category and a #rrggbb color are required"));
+                    };
+                    let mut document = notes_document(&dir);
+                    if !document["categoryColors"].is_object() {
+                        document["categoryColors"] = json!({});
+                    }
+                    if let Some(map) = document["categoryColors"].as_object_mut() {
+                        map.insert(category.clone(), json!(color.clone()));
+                    }
+                    let mut items = notes_items(&document);
+                    for item in &mut items {
+                        if item.get("category").and_then(Value::as_str)
+                            == Some(category.as_str())
+                        {
+                            item["color"] = json!(&color);
+                            item["updatedAt"] = json!(now);
+                            item["version"] = json!(
+                                item.get("version").and_then(Value::as_f64).unwrap_or(1.0) + 1.0
+                            );
+                        }
+                    }
+                    document["items"] = Value::Array(items);
+                    notes_write(&dir, &document)
+                        .map_err(|error| Response::from_error(&error))?;
+                    Ok(json!({ "ok": true }))
+                },
             ) {
-                Ok(entry) => entry,
-                Err(response) => return response,
-            };
-            let mut document = notes_document(&data_dir);
-            if !document["categoryColors"].is_object() {
-                document["categoryColors"] = json!({});
-            }
-            if let Some(map) = document["categoryColors"].as_object_mut() {
-                map.insert(category.clone(), json!(color.clone()));
-            }
-            let mut items = notes_items(&document);
-            for item in &mut items {
-                if item.get("category").and_then(Value::as_str) == Some(category.as_str()) {
-                    item["color"] = json!(&color);
-                    item["updatedAt"] = json!(now);
-                    item["version"] =
-                        json!(item.get("version").and_then(Value::as_f64).unwrap_or(1.0) + 1.0);
-                }
-            }
-            document["items"] = Value::Array(items);
-            match notes_write(&data_dir, &document) {
-                Ok(()) => accepted(&entry, 200, json!({ "ok": true })),
-                Err(error) => Response::from_error(&error),
+                Ok((entry, data)) => accepted(&entry, 200, data),
+                Err(response) => response,
             }
         }
         ("PATCH", Some(raw), _) => {
-            let mut document = notes_document(&data_dir);
-            let mut items = notes_items(&document);
-            let Some(index) = items
-                .iter()
-                .position(|item| item.get("id").and_then(Value::as_str) == Some(raw))
-            else {
-                return not_found("note not found");
-            };
-            let entry = match journal_commit(
+            // `updateItem` was the apply — the not_found throw and the file
+            // write sit in `work`, so a stale id leaves intent+abort.
+            let dir = data_dir.clone();
+            match submit_command(
                 deps,
                 request,
                 "note.update",
                 &format!("note:{raw}"),
                 payload.clone(),
                 "PATCH /notes/{id}",
-            ) {
-                Ok(entry) => entry,
-                Err(response) => return response,
-            };
-            {
-                let body = &payload;
-                let item = &mut items[index];
-                if let Some(title) = body.get("title").and_then(Value::as_str) {
-                    let title: String = title.trim().chars().take(200).collect();
-                    if !title.is_empty() {
-                        item["title"] = json!(title);
-                    }
-                }
-                if let Some(text) = body.get("body").and_then(Value::as_str) {
-                    item["body"] = json!(text.chars().take(20_000).collect::<String>());
-                }
-                if body.get("tags").is_some() {
-                    item["tags"] = json!(normalize_tags(body.get("tags")));
-                }
-                let category_changed = body.get("category").is_some();
-                if category_changed {
-                    match normalize_category(body.get("category")) {
-                        Some(category) => item["category"] = json!(category),
-                        None => {
-                            if let Some(map) = item.as_object_mut() {
-                                map.remove("category");
+                |_, note_payload| {
+                    let mut document = notes_document(&dir);
+                    let mut items = notes_items(&document);
+                    let Some(index) = items
+                        .iter()
+                        .position(|item| item.get("id").and_then(Value::as_str) == Some(raw))
+                    else {
+                        return Err(not_found("note not found"));
+                    };
+                    {
+                        let body = &note_payload;
+                        let item = &mut items[index];
+                        if let Some(title) = body.get("title").and_then(Value::as_str) {
+                            let title: String = title.trim().chars().take(200).collect();
+                            if !title.is_empty() {
+                                item["title"] = json!(title);
                             }
                         }
-                    }
-                }
-                if body.get("color").is_some() {
-                    match normalize_color(body.get("color")) {
-                        Some(color) => {
-                            item["color"] = json!(&color);
-                            // An explicit color joins the category's shared
-                            // palette entry, as the TypeScript store did.
-                            if let Some(category) = item
-                                .get("category")
-                                .and_then(Value::as_str)
-                                .map(str::to_owned)
-                            {
-                                let mut colors = document
-                                    .get("categoryColors")
-                                    .and_then(Value::as_object)
-                                    .cloned()
-                                    .unwrap_or_default();
-                                colors.insert(category, json!(color));
-                                document["categoryColors"] = Value::Object(colors);
+                        if let Some(text) = body.get("body").and_then(Value::as_str) {
+                            item["body"] =
+                                json!(text.chars().take(20_000).collect::<String>());
+                        }
+                        if body.get("tags").is_some() {
+                            item["tags"] = json!(normalize_tags(body.get("tags")));
+                        }
+                        let category_changed = body.get("category").is_some();
+                        if category_changed {
+                            match normalize_category(body.get("category")) {
+                                Some(category) => item["category"] = json!(category),
+                                None => {
+                                    if let Some(map) = item.as_object_mut() {
+                                        map.remove("category");
+                                    }
+                                }
                             }
                         }
-                        None if category_changed => {
+                        if body.get("color").is_some() {
+                            match normalize_color(body.get("color")) {
+                                Some(color) => {
+                                    item["color"] = json!(&color);
+                                    // An explicit color joins the category's
+                                    // shared palette entry, as the TypeScript
+                                    // store did.
+                                    if let Some(category) = item
+                                        .get("category")
+                                        .and_then(Value::as_str)
+                                        .map(str::to_owned)
+                                    {
+                                        let mut colors = document
+                                            .get("categoryColors")
+                                            .and_then(Value::as_object)
+                                            .cloned()
+                                            .unwrap_or_default();
+                                        colors.insert(category, json!(color));
+                                        document["categoryColors"] = Value::Object(colors);
+                                    }
+                                }
+                                None if category_changed => {
+                                    item["color"] = json!(note_color_for(
+                                        &document,
+                                        item.get("category").and_then(Value::as_str),
+                                        None,
+                                    ));
+                                }
+                                None => {}
+                            }
+                        } else if category_changed {
                             item["color"] = json!(note_color_for(
                                 &document,
                                 item.get("category").and_then(Value::as_str),
                                 None,
                             ));
                         }
-                        None => {}
+                        if let Some(order) = body.get("order").and_then(Value::as_f64) {
+                            if order.is_finite() {
+                                item["order"] = json!(order);
+                            }
+                        }
+                        item["updatedAt"] = json!(now);
+                        item["version"] =
+                            json!(item.get("version").and_then(Value::as_f64).unwrap_or(1.0) + 1.0);
                     }
-                } else if category_changed {
-                    item["color"] = json!(note_color_for(
-                        &document,
-                        item.get("category").and_then(Value::as_str),
-                        None,
-                    ));
-                }
-                if let Some(order) = body.get("order").and_then(Value::as_f64) {
-                    if order.is_finite() {
-                        item["order"] = json!(order);
-                    }
-                }
-                item["updatedAt"] = json!(now);
-                item["version"] =
-                    json!(item.get("version").and_then(Value::as_f64).unwrap_or(1.0) + 1.0);
+                    let updated = items[index].clone();
+                    document["items"] = Value::Array(items);
+                    notes_write(&dir, &document).map_err(|error| Response::from_error(&error))?;
+                    Ok(updated)
+                },
+            ) {
+                Ok((entry, data)) => accepted(&entry, 200, data),
+                Err(response) => response,
             }
-            let updated = items[index].clone();
-            document["items"] = Value::Array(items);
-            if let Err(error) = notes_write(&data_dir, &document) {
-                return Response::from_error(&error);
-            }
-            accepted(&entry, 200, updated)
         }
         ("DELETE", Some(raw), _) => {
-            let exists = notes_items(&notes_document(&data_dir))
-                .iter()
-                .any(|item| item.get("id").and_then(Value::as_str) == Some(raw));
-            if !exists {
-                return not_found("note not found");
-            }
-            let entry = match journal_commit(
+            // `deleteItem` never threw not_found — a stale id still committed
+            // `note.delete` and answered `{id}` — so there is no check here,
+            // just the file write in `work`.
+            let dir = data_dir.clone();
+            match submit_command(
                 deps,
                 request,
                 "note.delete",
                 &format!("note:{raw}"),
                 json!({}),
                 "DELETE /notes/{id}",
+                |_, _| {
+                    let mut document = notes_document(&dir);
+                    let mut items = notes_items(&document);
+                    items.retain(|item| item.get("id").and_then(Value::as_str) != Some(raw));
+                    document["items"] = Value::Array(items);
+                    notes_write(&dir, &document).map_err(|error| Response::from_error(&error))?;
+                    Ok(json!({ "id": raw }))
+                },
             ) {
-                Ok(entry) => entry,
-                Err(response) => return response,
-            };
-            let mut document = notes_document(&data_dir);
-            let mut items = notes_items(&document);
-            items.retain(|item| item.get("id").and_then(Value::as_str) != Some(raw));
-            document["items"] = Value::Array(items);
-            match notes_write(&data_dir, &document) {
-                Ok(()) => accepted(&entry, 200, json!({ "id": raw })),
-                Err(error) => Response::from_error(&error),
+                Ok((entry, data)) => accepted(&entry, 200, data),
+                Err(response) => response,
             }
         }
         _ => not_found("no such notes route"),
@@ -3389,13 +4478,26 @@ fn journal_browser_state(
             dst.insert(key.clone(), value.clone());
         }
     }
-    journal_commit(
+    submit_command(
         deps,
         request,
         "widget.update",
         &format!("widget:{id}"),
-        json!({ "state": state }),
+        json!({ "state": state.clone() }),
         "/browser",
+        |deps, _| {
+            let env = environment(deps, "/browser", "browser state commits to the journal")?;
+            let canvas = folded_canvas(env)?;
+            match canvas.widgets.get(id) {
+                Some(existing) => {
+                    let mut merged = widget_row(existing);
+                    merged["state"] = state;
+                    merged["version"] = json!(existing.version + 1.0);
+                    Ok(merged)
+                }
+                None => Ok(Value::Null),
+            }
+        },
     )?;
     Ok(())
 }
@@ -3498,14 +4600,13 @@ fn browser_open(request: &Request, deps: &mut RouteDeps<'_>) -> Response {
         "x": x, "y": y, "w": 720.0, "h": 480.0, "z": z,
         "maximized": false,
     });
-    if let Err(response) = journal_commit(
+    if let Err(response) = submit_command(
         deps,
         request,
         "widget.create",
         "widget:new",
         payload,
-        "POST /browser/open",
-    ) {
+        "POST /browser/open", widget_create_apply) {
         return response;
     }
     let Some(url) = target_url else {
@@ -3788,35 +4889,55 @@ fn media_route(request: &Request, segments: &[String], deps: &mut RouteDeps<'_>)
 // --- /snapshot ---------------------------------------------------------------
 
 /// The command-type names the native build understands — `core.flow.types()`
-/// in the TypeScript. There is no registry here; this is the fixed list of
-/// journal events and store operations the server accepts.
+/// in the TypeScript, the sorted `handlers` key set. File and transient
+/// terminal verbs are registered there even though no HTTP route submits
+/// them (the renderer's IPC submit did); the catalog advertised them anyway,
+/// so the snapshot does the same.
 const COMMAND_TYPES: &[&str] = &[
-    "widget.create",
-    "widget.update",
-    "widget.remove",
     "canvas.camera",
-    "canvas.strokes",
     "canvas.connections",
     "canvas.import",
+    "canvas.strokes",
+    "dispatch.account",
+    "dispatch.settle",
+    "dispatch.start",
+    "file.create",
+    "file.delete",
+    "file.mkdir",
+    "file.rename",
+    "file.write",
+    "gate.create",
+    "gate.resolve",
+    "git.branches",
+    "git.checkout",
+    "git.commit",
+    "git.create-branch",
+    "git.log",
+    "git.refresh",
+    "note.create",
+    "note.delete",
+    "note.recolor",
+    "note.update",
+    "orc.ack",
+    "orc.send",
+    "orctask.create",
+    "orctask.update",
+    "plan.create",
+    "plan.delete",
+    "plan.toggle",
+    "plan.update",
+    "run.close",
+    "run.create",
+    "terminal.attach",
     "terminal.create",
+    "terminal.dispose",
+    "terminal.input",
+    "terminal.resize",
     "terminal.spawn",
     "terminal.write",
-    "terminal.attach",
-    "terminal.dispose",
-    "plan.create",
-    "plan.update",
-    "plan.toggle",
-    "plan.delete",
-    "note.create",
-    "note.update",
-    "note.recolor",
-    "note.delete",
-    "git.refresh",
-    "git.commit",
-    "git.branches",
-    "git.log",
-    "git.checkout",
-    "git.create-branch",
+    "widget.create",
+    "widget.remove",
+    "widget.update",
 ];
 
 /// `buildSnapshot` — presence + the world, one payload: terminals and

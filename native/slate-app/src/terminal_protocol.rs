@@ -15,6 +15,10 @@ pub enum Control {
     /// OSC 7 working-directory report — the path already decoded out of the
     /// `file://host/path` URI.
     WorkingDirectory(String),
+    /// OSC 0/1/2 window-or-icon title — the last title the program set.
+    /// Agent CLIs (claude, codex) rewrite this as they work, which is why
+    /// herdr's detector has an `osc_title` region.
+    Title(String),
     /// Kitty keyboard protocol `CSI > flags u`: push a flags entry.
     KittyPush(u8),
     /// Kitty keyboard protocol `CSI < n u`: pop n entries (default 1).
@@ -139,6 +143,15 @@ impl vte::Perform for Commands {
                 if !payload.is_empty() && payload != "?" {
                     self.controls.push(Control::Clipboard(payload.to_owned()));
                 }
+            }
+            // OSC 0/1/2 ; title — icon name / window title. All three are
+            // tracked under one `title`: what matters is the last string the
+            // program asserted, not which slot it wrote.
+            Some(b"0" | b"1" | b"2") => {
+                let Some(Ok(title)) = params.get(1).map(|p| std::str::from_utf8(p)) else {
+                    return;
+                };
+                self.controls.push(Control::Title(title.to_owned()));
             }
             // OSC 7 ; file://host/path — the program reporting its cwd.
             Some(b"7") => {

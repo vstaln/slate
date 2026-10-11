@@ -6,6 +6,7 @@
 
 pub mod actors;
 pub mod agent_picks;
+pub mod agent_state;
 pub mod arrange;
 pub mod attachments;
 pub mod browser;
@@ -13,6 +14,7 @@ pub mod canvas;
 pub mod canvas_store;
 pub mod cli;
 pub mod code_layout;
+pub mod code_resume;
 pub mod command;
 pub mod conpty_startup;
 pub mod flow;

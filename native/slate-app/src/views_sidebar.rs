@@ -476,7 +476,7 @@ fn expanded_panel(
                     .text_size(px(10.0))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(rgb(theme::hex(theme::text::FAINT)))
-                    .child("CANVAS"),
+                    .child("PANES"),
             )
             .child(
                 div()
@@ -581,7 +581,7 @@ fn expanded_panel(
                     .py(px(6.0))
                     .text_size(px(11.0))
                     .text_color(rgb(theme::hex(theme::text::FAINT)))
-                    .child("No widgets on the canvas — right-click to add one"),
+                    .child("No panes open — right-click to add one"),
             );
         }
         for widget in widgets {

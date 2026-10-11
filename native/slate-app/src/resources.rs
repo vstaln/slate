@@ -7,7 +7,7 @@
 /// The schemes the bus recognises, in the order src/main/core/types.ts lists
 /// them.
 pub const RESOURCE_SCHEMES: [&str; 14] = [
-    "widget", "note", "terminal", "file", "task", "canvas", "git", "run", "otask", "dispatch",
+    "widget", "note", "terminal", "file", "task", "canvas", "git", "run", "orctask", "dispatch",
     "gate", "plan", "search", "system",
 ];
 
@@ -82,4 +82,14 @@ pub fn file_resource(path: &str) -> String {
         unified.trim_end_matches('/').to_owned()
     };
     resource_id("file", &normalized)
+}
+
+/// `isLocalPath` — an absolute path that is not a UNC/network spelling.
+/// On POSIX `isAbsolute` is exactly "starts with `/`"; the `//` guard keeps
+/// the POSIX spelling of a UNC path out the way Node's check did.
+pub fn is_local_path(path: &str) -> bool {
+    if path.starts_with("\\\\") || path.starts_with("//") {
+        return false;
+    }
+    std::path::Path::new(path).is_absolute()
 }
