@@ -111,6 +111,7 @@ pub fn key_for(widget: &str) -> usize {
     id
 }
 
+#[cfg(slate_browser)]
 fn widget_for(id: usize) -> Option<String> {
     lock(&ID_TO_KEY).get(&id).cloned()
 }
@@ -139,10 +140,12 @@ pub fn drain_events() -> Vec<WebViewEvent> {
     std::mem::take(&mut *lock(&EVENTS))
 }
 
+#[cfg(slate_browser)]
 fn push_event(event: WebViewEvent) {
     lock(&EVENTS).push(event);
 }
 
+#[cfg(slate_browser)]
 fn update_status(id: usize, f: impl FnOnce(&mut WebViewStatus)) {
     let mut status = lock(&STATUS);
     f(status.entry(id).or_default());
@@ -315,14 +318,18 @@ static BUSY_WIDGETS: std::sync::LazyLock<Mutex<std::collections::HashSet<String>
 
 /// requestId → responder, the `pending` map the GTK-thread eval callback
 /// resolves. Values are the eval's raw JSON string or a ready-made error.
+#[cfg(slate_browser)]
 type EvalResponder = std::sync::mpsc::Sender<Result<String, String>>;
 
+#[cfg(slate_browser)]
 static EVAL_PENDING: std::sync::LazyLock<Mutex<HashMap<u64, EvalResponder>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+#[cfg(slate_browser)]
 static NEXT_EVAL_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// `MAX_RESPONSE_BYTES` — a page bigger than this answers with the same
 /// "request a smaller snapshot" message the renderer enforced.
+#[cfg(slate_browser)]
 const MAX_RESPONSE_BYTES: usize = 96 * 1024;
 
 /// A native webview exists for this widget — the `!view` check the original
@@ -355,6 +362,7 @@ fn is_created(id: usize) -> bool {
 
 /// The GTK-side counterpart of `resolveBrowserAgentAction` — the eval
 /// callback lands here, then wakes the blocked caller.
+#[cfg(slate_browser)]
 fn resolve_eval(request_id: u64, result: Result<String, String>) {
     let sender = lock(&EVAL_PENDING).remove(&request_id);
     if let Some(sender) = sender {
@@ -466,7 +474,7 @@ fn agent_action_inner(
     #[cfg(not(slate_browser))]
     {
         let _ = (widget, action);
-        return Err("browser page is not ready".to_owned());
+        Err("browser page is not ready".to_owned())
     }
     #[cfg(slate_browser)]
     {
@@ -1467,7 +1475,9 @@ mod gtk_thread {
 /// id. The native webview is created once and persists across GPUI render
 /// cycles; its bounds follow whatever rect the layout hands it.
 pub struct WebView {
+    #[cfg_attr(not(slate_browser), allow(dead_code))]
     id: usize,
+    #[cfg_attr(not(slate_browser), allow(dead_code))]
     content: WebViewContent,
     zoom: f32,
     /// Window-space clip rect — the canvas content region the caller knows

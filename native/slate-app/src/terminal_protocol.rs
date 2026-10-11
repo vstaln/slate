@@ -259,9 +259,12 @@ mod tests {
     #[test]
     fn string_payloads_do_not_change_terminal_modes() {
         let mut parser = Decoder::default();
-        assert!(parser
-            .advance(b"\x1bPtext ?12h\x1b\\\x1b]0;title ?12h\x07")
-            .is_empty());
+        // `?12h` inside a DCS or OSC payload is text, not a mode change —
+        // the only control out is the OSC 0 title capture.
+        assert_eq!(
+            parser.advance(b"\x1bPtext ?12h\x1b\\\x1b]0;title ?12h\x07"),
+            vec![Control::Title("title ?12h".to_owned())]
+        );
         assert_eq!(parser.advance(b"\x1bc"), vec![Control::Reset]);
     }
 

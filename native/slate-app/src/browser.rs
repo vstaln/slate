@@ -101,11 +101,10 @@ fn local_path_to_file_url(raw: &str) -> Option<String> {
         && bytes[1] == b':'
         && (bytes[2] == b'\\' || bytes[2] == b'/');
     let is_unc = raw.starts_with("\\\\") && bytes.get(2).is_some_and(|b| *b != b'\\' && *b != b'/');
-    // POSIX absolute paths only resolve where POSIX paths exist. Mirrors the
-    // original's `!IS_WINDOWS && /^\/[^\s]*[/.][^\s]*$/` — a `/` or `.` must
-    // appear after the leading slash so `/word` stays a search.
-    let is_posix = !cfg!(windows)
-        && bytes.first() == Some(&b'/')
+    // A leading `/` reads as a local path on every platform — a Windows
+    // user can still open a file copied from a POSIX path. A `/` or `.`
+    // must follow so `/word` stays a search.
+    let is_posix = bytes.first() == Some(&b'/')
         && bytes[1..].iter().any(|b| *b == b'/' || *b == b'.')
         && !raw.contains(char::is_whitespace);
     if !is_drive && !is_unc && !is_posix {

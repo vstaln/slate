@@ -526,6 +526,13 @@ pub(crate) fn tiling_wm() -> bool {
         .any(|word| TILING.contains(&word))
 }
 
+/// macOS never reports a tiling session — window controls are absent
+/// there anyway, but call sites shared with Linux still ask.
+#[cfg(target_os = "macos")]
+pub(crate) fn tiling_wm() -> bool {
+    false
+}
+
 /// `jr` — a window-control cell: `h-10 w-[46px]`, glyph centred, the
 /// faint-on-raised hover; `danger` paints the shell's red close hover.
 #[cfg(not(target_os = "macos"))]
