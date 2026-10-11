@@ -4023,6 +4023,41 @@ impl CanvasView {
                     );
                 }
             }
+            // fix-panes2: the links, timer and kanban panes' writes. Each is a
+            // REST call that journals its entry and then applies it, the way
+            // the notes ops above do.
+            Some("link_add") => {
+                // No text input on the canvas yet, so `+` adds the same stub
+                // row the pane always did — now journaled as `link.create`.
+                self.control_post(
+                    "POST",
+                    &format!("/links/{id}"),
+                    Some(json!({ "title": "New link", "url": "https://example.com" })),
+                );
+            }
+            Some("link_remove") => {
+                if let Some(link) = action.get("id").and_then(Value::as_str) {
+                    self.control_post("DELETE", &format!("/links/{id}/{link}"), None);
+                }
+            }
+            Some("timer_toggle") => {
+                self.control_post("POST", &format!("/timers/{id}/toggle"), None);
+            }
+            Some("timer_reset") => {
+                self.control_post("POST", &format!("/timers/{id}/reset"), None);
+            }
+            Some("kanban_move") => {
+                if let (Some(item), Some(status)) = (
+                    action.get("id").and_then(Value::as_str),
+                    action.get("status").and_then(Value::as_str),
+                ) {
+                    self.control_post(
+                        "PATCH",
+                        &format!("/planner/{item}"),
+                        Some(json!({ "status": status })),
+                    );
+                }
+            }
             _ => {}
         }
         cx.notify();

@@ -135,12 +135,13 @@ fn card_view<'a>(
                 .child(project.clone()),
         );
     }
-    // Click advances the card Todo → Doing → Done → Todo — a real journaled
-    // `plan.update` status patch, exactly what `slate plan update` writes, so
-    // the planner pane and any other reader fold to the same column.
+    // Click advances the card Todo → Doing → Done → Todo — a journaled
+    // `plan.update` status patch (`PATCH /planner/{id}`), the same entry
+    // `slate plan update` writes, so the planner pane and any other reader
+    // fold to the same column. fix-panes2: via `kanban_move`, the REST route.
     let widget_id = widget_id.to_owned();
     let card_id = card.id.clone();
-    let move_action = json!({ "op": "plan_move", "id": card_id, "status": card.column.next().key() });
+    let move_action = json!({ "op": "kanban_move", "id": card_id, "status": card.column.next().key() });
     el.on_mouse_down(
         MouseButton::Left,
         cx.listener(move |this, _event, _window, cx| {

@@ -1027,6 +1027,8 @@ fn route_domains(request: &Request, deps: &mut RouteDeps<'_>) -> Option<Response
         Some("git") => Some(git_route(request, &segments, deps)),
         Some("planner") => Some(planner_route(request, &segments, deps)),
         Some("note" | "notes") => Some(notes_route(request, &segments, deps)),
+        Some("links") => Some(links_route(request, &segments, deps)),
+        Some("timers") => Some(timers_route(request, &segments, deps)),
         Some("widgets") => Some(widgets_route(request, &segments, deps)),
         Some("browser") => Some(browser_route(request, &segments, deps)),
         Some("media") if method == "GET" => Some(media_route(request, &segments, deps)),
@@ -4272,6 +4274,372 @@ fn notes_route(request: &Request, segments: &[String], deps: &mut RouteDeps<'_>)
     }
 }
 
+// fix-panes2: the links and timer panes' writes. Each POST/DELETE journals
+// its `link.*` / `timer.*` entry first, then applies it to the file the pane
+// reads — the same order `notes_route` uses.
+
+// --- links: `workspace-links.json`, one list per links widget ---------------
+
+/// The links document: the scoped `{widgetId: [...]}` object, or the bare
+/// `[...]` the links pane's reader also accepts.
+fn links_document(data_dir: &std::path::Path) -> Value {
+    crate::ipc::read_store_recovered(&data_dir.join("workspace-links.json"))
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .filter(|document| document.is_object() || document.is_array())
+        .unwrap_or_else(|| json!({}))
+}
+
+fn links_write(data_dir: &std::path::Path, document: &Value) -> Result<(), CommandError> {
+    let path = data_dir.join("workspace-links.json");
+    let bytes = crate::jsjson::to_js_json_pretty(document, 2).into_bytes();
+    crate::ipc::write_file_atomic(&path, &bytes)
+        .map_err(|e| CommandError::new(ErrorCode::Failed, format!("links write: {e}")))
+}
+
+/// The list one widget edits: `document[widget]` in the scoped form, the root
+/// array itself in the bare form.
+fn links_entries<'a>(document: &'a mut Value, widget: &str) -> &'a mut Vec<Value> {
+    if document.is_array() {
+        return document.as_array_mut().expect("checked above");
+    }
+    if !document.is_object() {
+        *document = json!({});
+    }
+    let entry = &mut document[widget];
+    if !entry.is_array() {
+        *entry = json!([]);
+    }
+    entry.as_array_mut().expect("normalized above")
+}
+
+/// `looksDangerous`: control/space-stripped, lowercased prefix sniff —
+/// catches `java\tscript:` tricks and plain `javascript:`/`data:`/`vbscript:`.
+fn looks_dangerous(value: &str) -> bool {
+    let compact: String = value
+        .chars()
+        .filter(|c| !c.is_ascii_control() && !c.is_whitespace() && *c != '\u{7f}')
+        .collect::<String>()
+        .to_lowercase();
+    compact.starts_with("javascript:")
+        || compact.starts_with("data:")
+        || compact.starts_with("vbscript:")
+}
+
+/// Percent-decode for the second sniff pass (the original tried
+/// `decodeURIComponent` then `decodeURI` before comparing). Non-UTF8 and
+/// truncated escapes fall back to the raw text.
+fn decoded_for_sniff(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = |b: u8| -> Option<u8> {
+                match b {
+                    b'0'..=b'9' => Some(b - b'0'),
+                    b'a'..=b'f' => Some(b - b'a' + 10),
+                    b'A'..=b'F' => Some(b - b'A' + 10),
+                    _ => None,
+                }
+            };
+            if let (Some(hi), Some(lo)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push(hi * 16 + lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| raw.to_owned())
+}
+
+/// The scheme run the original's `normalizeProtocol` extracted:
+/// `^[a-zA-Z][a-zA-Z0-9+.-]*\s*:` → lowercased `name:`.
+pub fn scheme_of(value: &str) -> Option<String> {
+    let mut chars = value.trim_start().chars().peekable();
+    if !chars.peek().is_some_and(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    let mut name = String::new();
+    for c in chars.by_ref() {
+        if c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-') || c.is_whitespace() {
+            name.push(c);
+            continue;
+        }
+        if c == ':' {
+            let name: String = name.chars().filter(|c| !c.is_whitespace()).collect();
+            if name.is_empty() {
+                return None;
+            }
+            return Some(format!("{}:", name.to_lowercase()));
+        }
+        return None;
+    }
+    None
+}
+
+/// `isSafeUrl` (sanitizeUrl.ts): `javascript:`/`data:`/`vbscript:`/`file:`/
+/// `blob:` and any other scheme outside `http:`/`https:`/`mailto:`/`tel:` is
+/// rejected; relative addresses (`/`, `./`, `../`, `#`, or no scheme) pass —
+/// `allowRelative` held true in the widget's renderer.
+pub fn is_safe_url(url: &str) -> bool {
+    let trimmed: String = url
+        .trim()
+        .chars()
+        .filter(|c| !c.is_ascii_control() && *c != '\u{7f}')
+        .collect();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if looks_dangerous(&trimmed) || looks_dangerous(&decoded_for_sniff(&trimmed)) {
+        return false;
+    }
+    if trimmed.starts_with('#')
+        || trimmed.starts_with('/')
+        || trimmed.starts_with("./")
+        || trimmed.starts_with("../")
+    {
+        return true;
+    }
+    // `file%3a/etc/passwd` has no raw scheme and would pass as relative — the
+    // original re-extracted the scheme from the *decoded* string and checked
+    // it against BLOCKED_PROTOCOLS, which is what catches it.
+    if let Some(decoded) = scheme_of(&decoded_for_sniff(&trimmed)) {
+        if matches!(
+            decoded.as_str(),
+            "javascript:" | "data:" | "vbscript:" | "file:" | "blob:"
+        ) || looks_dangerous(&decoded)
+        {
+            return false;
+        }
+    }
+    match scheme_of(&trimmed).as_deref() {
+        // No scheme at all → a plain relative path/name.
+        None => true,
+        Some(proto) => matches!(proto, "http:" | "https:" | "mailto:" | "tel:"),
+    }
+}
+
+fn links_route(request: &Request, segments: &[String], deps: &mut RouteDeps<'_>) -> Response {
+    let method = request.method.as_str();
+    let widget = segments.get(1).map(String::as_str);
+    let link = segments.get(2).map(String::as_str);
+    let now = deps.now;
+    let data_dir = match environment(deps, "/links", "links persist in the app's data dir") {
+        Ok(env) => env.data_dir(),
+        Err(response) => return response,
+    };
+    let mut payload = request.body.clone();
+    if !payload.is_object() {
+        payload = json!({});
+    }
+    if let Some(map) = payload.as_object_mut() {
+        map.remove("agentId");
+    }
+    let Some(widget) = widget else {
+        return not_found("no such links route");
+    };
+    match (method, link) {
+        ("GET", None) => {
+            let document = links_document(&data_dir);
+            let items = match document.get(widget).and_then(Value::as_array) {
+                Some(items) => items.clone(),
+                None => document.as_array().cloned().unwrap_or_default(),
+            };
+            Response::json(200, json!({ "items": items }))
+        }
+        ("POST", None) => {
+            let title: String = payload
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .chars()
+                .take(200)
+                .collect();
+            let url = payload
+                .get("url")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_owned();
+            if title.is_empty() {
+                return invalid("title is required");
+            }
+            if url.is_empty() || !is_safe_url(&url) {
+                return invalid("url is required and must not use an unsafe scheme");
+            }
+            let id = payload
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("link-{now}"));
+            let item = json!({ "id": id, "title": title, "url": url });
+            submitted(
+                deps,
+                request,
+                "link.create",
+                &format!("widget:{widget}"),
+                json!({ "widget": widget, "link": item.clone() }),
+                "POST /links/{widget}",
+                201,
+                |_, _| {
+                    let mut document = links_document(&data_dir);
+                    links_entries(&mut document, widget).push(item.clone());
+                    links_write(&data_dir, &document)
+                        .map(|()| item.clone())
+                        .map_err(|error| Response::from_error(&error))
+                },
+            )
+        }
+        ("DELETE", Some(id)) => {
+            let mut document = links_document(&data_dir);
+            let exists = links_entries(&mut document, widget)
+                .iter()
+                .any(|item| item.get("id").and_then(Value::as_str) == Some(id));
+            if !exists {
+                return not_found("link not found");
+            }
+            submitted(
+                deps,
+                request,
+                "link.delete",
+                &format!("widget:{widget}"),
+                json!({ "widget": widget, "id": id }),
+                "DELETE /links/{widget}/{id}",
+                200,
+                |_, _| {
+                    links_entries(&mut document, widget)
+                        .retain(|item| item.get("id").and_then(Value::as_str) != Some(id));
+                    links_write(&data_dir, &document)
+                        .map(|()| json!({ "id": id }))
+                        .map_err(|error| Response::from_error(&error))
+                },
+            )
+        }
+        _ => not_found("no such links route"),
+    }
+}
+
+// --- timers: `workspace-timers.json`, one entry per timer widget ------------
+
+/// The countdown a fresh timer starts from — 25 minutes, the original's boot.
+pub const DEFAULT_TIMER_TOTAL_MS: i64 = 25 * 60_000;
+
+/// Serializes the timer read-modify-write: the file holds one map for every
+/// timer widget, so an unlocked RMW can drop a sibling's concurrent update.
+static TIMERS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn timers_document(data_dir: &std::path::Path) -> Value {
+    crate::ipc::read_store_recovered(&data_dir.join("workspace-timers.json"))
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}))
+}
+
+/// The Electron widget's start/pause toggle: pausing banks `deadline − now`
+/// into `remaining`; starting arms a fresh `deadline` — a finished or idle
+/// timer restarts from `totalMs` rather than resuming a negative remainder.
+fn toggle_timer(entry: &mut serde_json::Map<String, Value>, now: f64) {
+    let total = entry
+        .get("totalMs")
+        .and_then(Value::as_f64)
+        .unwrap_or(DEFAULT_TIMER_TOTAL_MS as f64);
+    let running = entry
+        .get("running")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    entry.insert("totalMs".into(), json!(total));
+    if running {
+        let deadline = entry.get("deadline").and_then(Value::as_f64).unwrap_or(now);
+        entry.insert("remaining".into(), json!(deadline - now));
+        entry.insert("running".into(), json!(false));
+    } else {
+        let remaining = entry
+            .get("remaining")
+            .and_then(Value::as_f64)
+            .unwrap_or(total);
+        let remaining = if remaining <= 0.0 { total } else { remaining };
+        entry.insert("remaining".into(), json!(remaining));
+        entry.insert("deadline".into(), json!(now + remaining));
+        entry.insert("running".into(), json!(true));
+        entry.insert("rang".into(), json!(false));
+    }
+}
+
+/// The original's reset: stopped, full `remaining`, no deadline, `rang`
+/// cleared so the next finish notifies again.
+fn reset_timer_entry(entry: &mut serde_json::Map<String, Value>) {
+    let total = entry
+        .get("totalMs")
+        .and_then(Value::as_f64)
+        .unwrap_or(DEFAULT_TIMER_TOTAL_MS as f64);
+    entry.insert("totalMs".into(), json!(total));
+    entry.insert("remaining".into(), json!(total));
+    entry.insert("deadline".into(), json!(0.0));
+    entry.insert("running".into(), json!(false));
+    entry.insert("rang".into(), json!(false));
+}
+
+fn timers_route(request: &Request, segments: &[String], deps: &mut RouteDeps<'_>) -> Response {
+    let method = request.method.as_str();
+    let widget = segments.get(1).map(String::as_str);
+    let action = segments.get(2).map(String::as_str);
+    let now = deps.now as f64;
+    let data_dir = match environment(deps, "/timers", "timers persist in the app's data dir") {
+        Ok(env) => env.data_dir(),
+        Err(response) => return response,
+    };
+    match (method, widget, action) {
+        ("POST", Some(widget), Some(action @ ("toggle" | "reset"))) => {
+            let entry_type = if action == "toggle" {
+                "timer.toggle"
+            } else {
+                "timer.reset"
+            };
+            submitted(
+                deps,
+                request,
+                entry_type,
+                &format!("widget:{widget}"),
+                json!({ "widget": widget, "at": now }),
+                "POST /timers/{widget}/{action}",
+                200,
+                |_, _| {
+                    let _guard = TIMERS_LOCK
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner());
+                    let mut document = timers_document(&data_dir);
+                    let mut timer = document
+                        .get(widget)
+                        .and_then(Value::as_object)
+                        .cloned()
+                        .unwrap_or_default();
+                    if action == "toggle" {
+                        toggle_timer(&mut timer, now);
+                    } else {
+                        reset_timer_entry(&mut timer);
+                    }
+                    document[widget] = Value::Object(timer.clone());
+                    let bytes = crate::jsjson::to_js_json_pretty(&document, 2).into_bytes();
+                    crate::ipc::write_file_atomic(&data_dir.join("workspace-timers.json"), &bytes)
+                        .map(|()| Value::Object(timer))
+                        .map_err(|error| {
+                            Response::from_error(&CommandError::new(
+                                ErrorCode::Failed,
+                                format!("timers write: {error}"),
+                            ))
+                        })
+                },
+            )
+        }
+        _ => not_found("no such timers route"),
+    }
+}
+
 // --- locks ------------------------------------------------------------------
 
 /// `registerHttpAgent` without the actor table — the native server has no
@@ -4914,6 +5282,8 @@ const COMMAND_TYPES: &[&str] = &[
     "git.create-branch",
     "git.log",
     "git.refresh",
+    "link.create",
+    "link.delete",
     "note.create",
     "note.delete",
     "note.recolor",
@@ -4935,6 +5305,8 @@ const COMMAND_TYPES: &[&str] = &[
     "terminal.resize",
     "terminal.spawn",
     "terminal.write",
+    "timer.reset",
+    "timer.toggle",
     "widget.create",
     "widget.remove",
     "widget.update",

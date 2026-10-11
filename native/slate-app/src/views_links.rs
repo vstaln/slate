@@ -9,13 +9,15 @@
 //!
 //! Rows are title + display host/path, marked `↗` for the absolute schemes
 //! `safeHref` could open (http/https/mailto/tel) and `·` for the relative
-//! paths the original listed but could not browse to. The pane writes the
-//! file directly: `+` appends a new entry, `×` removes one, and clicking a
-//! row hands http/https URLs to `xdg-open`.
+//! paths the original listed but could not browse to. `+` and `×` are
+//! journaled writes: `CanvasView::widget_command` posts to `/links/{widget}`
+//! (`links_route` in http.rs), which journals `link.*` and then writes the
+//! file. Clicking a row hands http/https URLs to `xdg-open`.
 
 use gpui::prelude::FluentBuilder;
 use gpui::*;
-use serde_json::{json, Value};
+use serde_json::json;
+use slate_app::http::{is_safe_url, scheme_of};
 use slate_app::theme;
 
 pub struct LinkRow {
@@ -24,184 +26,6 @@ pub struct LinkRow {
     pub url: String,
     /// http(s) — the original's `isSafeUrl` gate for the click-through path.
     pub web: bool,
-}
-
-fn links_path() -> std::path::PathBuf {
-    slate_app::ipc::user_data_dir().join("workspace-links.json")
-}
-
-fn now_ms_f() -> f64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0.0, |elapsed| elapsed.as_millis() as f64)
-}
-
-/// The document on disk — either the scoped `{widgetId: [...]}` object or
-/// the bare `[...]` the reader also accepts.
-fn read_document() -> Option<Value> {
-    let document = slate_app::ipc::read_store_recovered(&links_path())
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())?;
-    if document.is_object() || document.is_array() {
-        Some(document)
-    } else {
-        None
-    }
-}
-
-/// `writeAtomic` — temp, fsync, .bak of the previous good copy, rename.
-fn write_document(document: &Value) -> Result<(), String> {
-    let path = links_path();
-    let bytes = slate_app::jsjson::to_js_json_pretty(document, 2).into_bytes();
-    slate_app::ipc::write_file_atomic(&path, &bytes).map_err(|e| e.to_string())
-}
-
-/// The list this widget edits: `document[widget_id]` in the scoped form,
-/// the root array itself for the bare form.
-fn widget_entries<'a>(document: &'a mut Value, widget_id: &str) -> &'a mut Vec<Value> {
-    if document.is_array() {
-        return document.as_array_mut().expect("checked above");
-    }
-    if !document.is_object() {
-        *document = json!({});
-    }
-    let entry = &mut document[widget_id];
-    if !entry.is_array() {
-        *entry = json!([]);
-    }
-    entry.as_array_mut().expect("normalized above")
-}
-
-/// Append a placeholder link — the Electron widget's add form needed a
-/// title and URL; the canvas has no text input, so the new row is a stub
-/// that is one file edit (or a future `link.update`) away from real.
-fn add_link(widget_id: &str) -> Result<(), String> {
-    let mut document = read_document().unwrap_or_else(|| json!({}));
-    let id = format!("link-{}", now_ms_f() as u64);
-    widget_entries(&mut document, widget_id).push(json!({
-        "id": id,
-        "title": "New link",
-        "url": "https://example.com",
-    }));
-    write_document(&document)
-}
-
-fn remove_link(widget_id: &str, id: &str) -> Result<(), String> {
-    let Some(mut document) = read_document() else {
-        return Ok(());
-    };
-    widget_entries(&mut document, widget_id)
-        .retain(|entry| entry.get("id").and_then(Value::as_str) != Some(id));
-    write_document(&document)
-}
-
-/// `looksDangerous`: control/space-stripped, lowercased prefix sniff —
-/// catches `java\tscript:` tricks and plain `javascript:`/`data:`/`vbscript:`.
-fn looks_dangerous(value: &str) -> bool {
-    let compact: String = value
-        .chars()
-        .filter(|c| !c.is_ascii_control() && !c.is_whitespace() && *c != '\u{7f}')
-        .collect::<String>()
-        .to_lowercase();
-    compact.starts_with("javascript:")
-        || compact.starts_with("data:")
-        || compact.starts_with("vbscript:")
-}
-
-/// Percent-decode for the second sniff pass (the original tried
-/// `decodeURIComponent` then `decodeURI` before comparing). Non-UTF8 and
-/// truncated escapes fall back to the raw text.
-fn decoded_for_sniff(raw: &str) -> String {
-    let bytes = raw.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            let hex = |b: u8| -> Option<u8> {
-                match b {
-                    b'0'..=b'9' => Some(b - b'0'),
-                    b'a'..=b'f' => Some(b - b'a' + 10),
-                    b'A'..=b'F' => Some(b - b'A' + 10),
-                    _ => None,
-                }
-            };
-            if let (Some(hi), Some(lo)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
-                out.push(hi * 16 + lo);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8(out).unwrap_or_else(|_| raw.to_owned())
-}
-
-/// The scheme run the original's `normalizeProtocol` extracted:
-/// `^[a-zA-Z][a-zA-Z0-9+.-]*\s*:` → lowercased `name:`.
-fn scheme_of(value: &str) -> Option<String> {
-    let mut chars = value.trim_start().chars().peekable();
-    if !chars.peek().is_some_and(|c| c.is_ascii_alphabetic()) {
-        return None;
-    }
-    let mut name = String::new();
-    for c in chars.by_ref() {
-        if c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-') || c.is_whitespace() {
-            name.push(c);
-            continue;
-        }
-        if c == ':' {
-            let name: String = name.chars().filter(|c| !c.is_whitespace()).collect();
-            if name.is_empty() {
-                return None;
-            }
-            return Some(format!("{}:", name.to_lowercase()));
-        }
-        return None;
-    }
-    None
-}
-
-/// `isSafeUrl` (sanitizeUrl.ts): `javascript:`/`data:`/`vbscript:`/`file:`/
-/// `blob:` and any other scheme outside `http:`/`https:`/`mailto:`/`tel:` is
-/// rejected; relative addresses (`/`, `./`, `../`, `#`, or no scheme) pass —
-/// `allowRelative` held true in the widget's renderer. Rows that fail are
-/// dropped, not shown-disabled, exactly like `readLinks`.
-fn is_safe_url(url: &str) -> bool {
-    let trimmed: String = url
-        .trim()
-        .chars()
-        .filter(|c| !c.is_ascii_control() && *c != '\u{7f}')
-        .collect();
-    if trimmed.is_empty() {
-        return false;
-    }
-    if looks_dangerous(&trimmed) || looks_dangerous(&decoded_for_sniff(&trimmed)) {
-        return false;
-    }
-    if trimmed.starts_with('#')
-        || trimmed.starts_with('/')
-        || trimmed.starts_with("./")
-        || trimmed.starts_with("../")
-    {
-        return true;
-    }
-    // `file%3a/etc/passwd` has no raw scheme and would pass as relative — the
-    // original re-extracted the scheme from the *decoded* string and checked
-    // it against BLOCKED_PROTOCOLS, which is what catches it.
-    if let Some(decoded) = scheme_of(&decoded_for_sniff(&trimmed)) {
-        if matches!(
-            decoded.as_str(),
-            "javascript:" | "data:" | "vbscript:" | "file:" | "blob:"
-        ) || looks_dangerous(&decoded)
-        {
-            return false;
-        }
-    }
-    match scheme_of(&trimmed).as_deref() {
-        // No scheme at all → a plain relative path/name.
-        None => true,
-        Some(proto) => matches!(proto, "http:" | "https:" | "mailto:" | "tel:"),
-    }
 }
 
 /// `displayUrl` from the widget: `hostname + pathname` with a bare `/`
@@ -349,12 +173,16 @@ fn link_row<'a>(
                 .child("×")
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(move |_this, _event, _window, cx| {
+                    cx.listener(move |this, _event, _window, cx| {
                         // Keep the row's open handler from also firing on
                         // the same press.
                         cx.stop_propagation();
-                        let _ = remove_link(&wid, &link_id);
-                        cx.notify();
+                        // fix-panes2: journaled `DELETE /links/{widget}/{id}`.
+                        this.widget_command(
+                            &wid,
+                            json!({ "op": "link_remove", "id": link_id }),
+                            cx,
+                        );
                     }),
                 ),
         )
@@ -396,9 +224,9 @@ pub fn links_pane(
                         .child("+")
                         .on_mouse_down(
                             MouseButton::Left,
-                            cx.listener(move |_this, _event, _window, cx| {
-                                let _ = add_link(&wid);
-                                cx.notify();
+                            cx.listener(move |this, _event, _window, cx| {
+                                // fix-panes2: journaled `POST /links/{widget}`.
+                                this.widget_command(&wid, json!({ "op": "link_add" }), cx);
                             }),
                         ),
                 ),

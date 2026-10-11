@@ -7,19 +7,18 @@
 //! mirror of that store is `workspace-timers.json` in the user data dir:
 //! `{ "<widgetId>": {totalMs, remaining, running, deadline, rang} }`.
 //!
-//! The pane's buttons write that file directly — Start/Pause flips
-//! `running` and recomputes `deadline`/`remaining` against `Date.now()`,
-//! Reset returns to `totalMs` — the same fields the Electron widget's
-//! `timerPersist` patched. While a state is absent the face shows the idle
+//! The pane's buttons are journaled writes: Start/Pause posts
+//! `POST /timers/{widget}/toggle` and Reset posts `.../reset`
+//! (`timers_route` in http.rs), which journals `timer.*` and then recomputes
+//! `running`/`deadline`/`remaining` against the clock, the same fields the
+//! Electron widget's `timerPersist` patched. While a state is absent the face shows the idle
 //! 25:00 the original booted into, and Start creates the entry. The canvas
 //! re-renders on a 250ms tick, which is what makes the countdown move.
 
 use gpui::*;
-use serde_json::{json, Value};
+use serde_json::json;
+use slate_app::http::DEFAULT_TIMER_TOTAL_MS as DEFAULT_TOTAL_MS;
 use slate_app::theme;
-
-/// The duration the Electron widget armed itself with on first paint.
-const DEFAULT_TOTAL_MS: i64 = 25 * 60_000;
 
 /// The persisted shape, trimmed to what a read-only face needs.
 #[derive(Debug, Clone, Copy)]
@@ -43,82 +42,6 @@ fn now_ms() -> f64 {
 
 fn timers_path() -> std::path::PathBuf {
     slate_app::ipc::user_data_dir().join("workspace-timers.json")
-}
-
-/// Serializes the read-modify-write below: the file holds one map for every
-/// timer widget, so an unlocked RMW can drop a sibling's concurrent update.
-static TIMERS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// Read-modify-write this widget's timer entry, preserving every other
-/// widget's state and any fields the pane does not model (the original's
-/// `isCustom`, `label`, …). Temp-file rename keeps a concurrent reader from
-/// meeting a truncated file.
-fn mutate_entry(widget_id: &str, mutate: impl FnOnce(&mut serde_json::Map<String, Value>, f64)) {
-    let _guard = TIMERS_LOCK
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
-    let path = timers_path();
-    let mut document = slate_app::ipc::read_store_recovered(&path)
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .filter(Value::is_object)
-        .unwrap_or_else(|| json!({}));
-    let mut entry = document
-        .get(widget_id)
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    mutate(&mut entry, now_ms());
-    document[widget_id] = Value::Object(entry);
-    let bytes = slate_app::jsjson::to_js_json_pretty(&document, 2).into_bytes();
-    let _ = slate_app::ipc::write_file_atomic(&path, &bytes);
-}
-
-/// The Electron widget's start/pause toggle: pausing banks `deadline − now`
-/// into `remaining`; starting arms a fresh `deadline` — a finished or idle
-/// timer restarts from `totalMs` rather than resuming a negative remainder.
-fn toggle_running(widget_id: &str) {
-    mutate_entry(widget_id, |entry, now| {
-        let total = entry
-            .get("totalMs")
-            .and_then(Value::as_f64)
-            .unwrap_or(DEFAULT_TOTAL_MS as f64);
-        let running = entry
-            .get("running")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        entry.insert("totalMs".into(), json!(total));
-        if running {
-            let deadline = entry.get("deadline").and_then(Value::as_f64).unwrap_or(now);
-            entry.insert("remaining".into(), json!(deadline - now));
-            entry.insert("running".into(), json!(false));
-        } else {
-            let remaining = entry
-                .get("remaining")
-                .and_then(Value::as_f64)
-                .unwrap_or(total);
-            let remaining = if remaining <= 0.0 { total } else { remaining };
-            entry.insert("remaining".into(), json!(remaining));
-            entry.insert("deadline".into(), json!(now + remaining));
-            entry.insert("running".into(), json!(true));
-            entry.insert("rang".into(), json!(false));
-        }
-    });
-}
-
-/// The original's reset: stopped, full `remaining`, no deadline, `rang`
-/// cleared so the next finish notifies again.
-fn reset_timer(widget_id: &str) {
-    mutate_entry(widget_id, |entry, _now| {
-        let total = entry
-            .get("totalMs")
-            .and_then(Value::as_f64)
-            .unwrap_or(DEFAULT_TOTAL_MS as f64);
-        entry.insert("totalMs".into(), json!(total));
-        entry.insert("remaining".into(), json!(total));
-        entry.insert("deadline".into(), json!(0.0));
-        entry.insert("running".into(), json!(false));
-        entry.insert("rang".into(), json!(false));
-    });
 }
 
 /// One bordered pill button — the Start/Pause/Reset controls share it.
@@ -286,8 +209,9 @@ pub fn timer_pane(
             .child(status),
     );
 
-    // Start/Pause + Reset — the Electron widget's footer controls, writing
-    // `workspace-timers.json` so the state survives a restart.
+    // Start/Pause + Reset — the Electron widget's footer controls. fix-panes2:
+    // each is a journaled write through `widget_command`, which posts to
+    // `/timers/{widget}/…`; the state survives a restart in the timers file.
     let wid = widget_id.to_owned();
     let wid_reset = widget_id.to_owned();
     col = col.child(
@@ -298,16 +222,14 @@ pub fn timer_pane(
             .gap_2()
             .child(timer_button(
                 if running { "Pause" } else { "Start" },
-                cx.listener(move |_this, _event, _window, cx| {
-                    toggle_running(&wid);
-                    cx.notify();
+                cx.listener(move |this, _event, _window, cx| {
+                    this.widget_command(&wid, json!({ "op": "timer_toggle" }), cx);
                 }),
             ))
             .child(timer_button(
                 "Reset",
-                cx.listener(move |_this, _event, _window, cx| {
-                    reset_timer(&wid_reset);
-                    cx.notify();
+                cx.listener(move |this, _event, _window, cx| {
+                    this.widget_command(&wid_reset, json!({ "op": "timer_reset" }), cx);
                 }),
             )),
     );
