@@ -45,7 +45,7 @@ desktop.ini
 # ignored while the Cursor/Grok/Gemini/agents copies stayed tracked, which put
 # a live token in the repository.
 .mcp.json
-opencode.json
+/opencode.json
 .agents/
 .cursor/
 .gemini/
