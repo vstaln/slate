@@ -166,3 +166,36 @@ rename-widget, open-media), `renderer-state:*`.
 - Iteration: `cargo build -p slate-app` (dev, deps cached in shared build-dir) — release only for installs.
 - **Headless mode**: `slate --headless` (or `SLATE_HEADLESS=1`) runs the full app on gpui's `HeadlessClient` — control socket, journal, workspace, PTYs all live, no X11 window. Arg dispatch treats args that are only `--gui`/`--headless` as app mode, so `slate --headless <verb>` still runs the CLI. `--engine` remains the stdin/stdout PTY pump (different thing). Caveat: `slate screenshot` can't capture headless. Verified: PTY spawn + `tell` + `read` round-trip.
 - **Journal multi-writer race fixed**: `JournalLog::commit` holds an exclusive `flock` on `<journal>.lock` across reload-tail + append (the TOCTOU hole produced duplicate seq 164 + chain break). Journal repaired; `entries=174 max_seq=174 dup_seqs=[] chain_breaks=0` after a rapid create/close barrage.
+
+## 10. Canvas removed — fixed pane strip shell
+
+- The infinite canvas is gone as the interaction model. `CanvasState` survives
+  purely as the journal/projection owner (widgets, workspace, `command:` queue,
+  `pending_spawn`); camera zoom is pinned to 1.0 and never mutated by input.
+- `CanvasView::render` no longer paints wallpaper/strokes/connections/marquee/
+  snap guides. The work area shows ONE widget full-size in a fixed rect
+  (`pane_rect`: below a new 30px tab strip, right of the sidebar rail, up to
+  CODE_MAX_WIDTH). A `slate-pane-strip` tab row (z-ordered chips, × on the
+  active tab) replaces world navigation; Tab / Ctrl+Tab / Ctrl+Shift+Tab cycle,
+  numpad +/- / Ctrl+O spawn `shell`/`finder`/`editor` panes.
+- Close confirmation (`×` / Delete on a focused frame) now hard-requires the
+  `confirm` arg — `dangerouslySkipConfirm` honored.
+- Mouse: strokes of gesture machinery deleted; remaining handlers only do
+  click-to-show, drag-move (rewrites x/y so journals stay sane), header/corner
+  resize, browser/files/planner input, marquee-drop gone. `on_key` lost all
+  canvas/draw/select/camera keys; Ctrl+wheel is a no-op; plain wheel scrolls
+  the hovered pane.
+- `commit_camera`, `fit_canvas`/`f`, `key_up` all removed; camera requests
+  resolve to "activate the pane". `set_layout`/`cycle_arrange` still move
+  widgets but the strip is the real navigation.
+- Titlebar canvas tab → "PANES"; settings canvas section → "PANES: tab strip +
+  fixed work area" (gesture bullets removed); sidebar empty state lost the
+  "draw on the canvas" hint; command-bar `/f`-fit hint gone from the widget list.
+- AGENTS.md (repo root + `.claude/CLAUDE.md` + `.agents/AGENTS.md` mirrors)
+  rewritten to describe the pane-strip app; native AGENTS.md updated.
+- CLI/journal surface unchanged — `slate canvas *`, `/canvas/*` routes still
+  work against the journaled store (compat layer), they just no longer drive a
+  visible infinite world.
+- Verified: `cargo check` clean; full `cargo test` green (incl. http_routes
+  agentId fixtures, WriteRequest Option<Value> asserts, file-URL space
+  encoding, transport `x-agent-id`).
